@@ -10,10 +10,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # --- Config ---
 export DATABASE_URL_OWNER="postgres://owner:owner@localhost:5432/svc_notifier_test"
-export DATABASE_URL="postgres://app:app@localhost:5432/svc_notifier_test"
+export DATABASE_URL="postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test"
+export DATABASE_URL_INGEST="postgres://svc_notifier_ingest:svc_notifier_ingest@localhost:5432/svc_notifier_test"
 export NATS_URL="nats://localhost:4222"
 export PORT=8010
-export APP_ROLE=app
 
 PASS=0
 FAIL=0

@@ -43,19 +43,32 @@ async fn main() {
         .await
         .expect("failed to connect to database for migrations");
 
+    // Precondition: roles svc_notifier_app and svc_notifier_ingest must be
+    // provisioned before first startup. See scripts/init-db.sql for reference.
     sqlx::migrate!("./migrations")
         .run(&migration_pool)
         .await
         .expect("failed to run migrations");
 
-    // Grant access to app role (non-fatal if role doesn't exist yet).
-    let app_role = std::env::var("APP_ROLE").unwrap_or_else(|_| "app".to_string());
-    if let Err(e) = br_service_core::grant_app_access(&migration_pool, &app_role).await {
-        tracing::warn!(error = %e, "failed to grant app access");
+    // Grant access to svc_notifier_app role (non-fatal if role doesn't exist yet).
+    if let Err(e) =
+        br_service_core::grant_app_access(&migration_pool, "svc_notifier_app").await
+    {
+        tracing::warn!(error = %e, "failed to grant svc_notifier_app access");
+    }
+
+    // Grant minimal access to svc_notifier_ingest: only INSERT + SELECT on notifications.
+    for sql in [
+        "GRANT USAGE ON SCHEMA public TO svc_notifier_ingest",
+        "GRANT INSERT, SELECT ON TABLE notifications TO svc_notifier_ingest",
+    ] {
+        if let Err(e) = sqlx::query(sql).execute(&migration_pool).await {
+            tracing::warn!(error = %e, "failed to grant svc_notifier_ingest access");
+        }
     }
     migration_pool.close().await;
 
-    // 2. App pool (app role) — subject to RLS, used for runtime.
+    // 2. App pool (svc_notifier_app) — subject to user-scoped RLS, used by GraphQL.
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
         .max_connections(20)
@@ -71,6 +84,15 @@ async fn main() {
 
     // NATS consumer (optional — graceful degradation)
     if let Some(nats_url) = nats_url {
+        // 3. Ingest pool (svc_notifier_ingest) — only created when NATS intake is enabled.
+        let ingest_url = std::env::var("DATABASE_URL_INGEST")
+            .expect("DATABASE_URL_INGEST must be set when NATS_URL is provided");
+        let ingest_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&ingest_url)
+            .await
+            .expect("failed to connect ingest pool");
+
         let nats_user = std::env::var("NATS_USER").ok();
         let nats_password = std::env::var("NATS_PASSWORD").ok();
 
@@ -85,7 +107,7 @@ async fn main() {
         match nats_connect_result {
             Ok(nats_client) => {
                 let jetstream = async_nats::jetstream::new(nats_client);
-                let consumer_pool = pool.clone();
+                let consumer_pool = ingest_pool;
                 let consumer_channels = channels.clone();
                 tokio::spawn(async move {
                     nats::run_consumer(jetstream, consumer_pool, consumer_channels).await;
