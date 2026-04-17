@@ -1,12 +1,14 @@
 use std::net::SocketAddr;
 
 use async_graphql::http::GraphiQLSource;
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse, GraphQLSubscription};
+use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::Router;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -127,7 +129,6 @@ async fn main() {
     let graphql_routes = Router::new()
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
-        .route_service("/graphql/ws", GraphQLSubscription::new(schema.clone()))
         .layer(axum::middleware::from_fn(
             br_service_core::passport_header_middleware,
         ));
@@ -150,13 +151,35 @@ async fn main() {
 async fn graphql_handler(
     State(schema): State<AppSchema>,
     passport: Option<axum::Extension<br_service_core::Passport>>,
+    headers: HeaderMap,
     req: GraphQLRequest,
-) -> GraphQLResponse {
+) -> Response {
     let mut request = req.into_inner();
     if let Some(axum::Extension(p)) = passport {
         request = request.data(p);
     }
-    schema.execute(request).await.into()
+
+    // SSE subscriptions: gateway sends subscription operations as HTTP POST
+    // with Accept: text/event-stream.
+    let wants_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.contains("text/event-stream"));
+
+    if wants_sse {
+        let stream = schema.execute_stream(request);
+        let sse = stream.map(|resp| {
+            let json = serde_json::to_string(&resp).unwrap_or_default();
+            Ok::<_, std::convert::Infallible>(Event::default().event("next").data(json))
+        });
+        return Sse::new(sse)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    // Queries/mutations: keep standard async-graphql-axum behavior.
+    let resp: GraphQLResponse = schema.execute(request).await.into();
+    resp.into_response()
 }
 
 async fn graphql_playground() -> impl IntoResponse {
