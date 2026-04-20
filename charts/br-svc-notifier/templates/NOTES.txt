@@ -1,0 +1,28 @@
+br-svc-notifier {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+
+Service: {{ include "br-svc-notifier.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.port }}
+
+Endpoints (in-cluster):
+  POST   http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/graphql
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/graphql/playground
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/schema
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/health
+
+Postgres DSNs must exist in Secret "{{ .Values.postgres.existingSecret }}" under keys:
+  {{ .Values.postgres.keys.databaseUrl }}        (svc_notifier_app)
+  {{ .Values.postgres.keys.databaseUrlOwner }}  (owner — for migrations/grants)
+{{- if .Values.nats.url }}
+  {{ .Values.postgres.keys.databaseUrlIngest }} (svc_notifier_ingest — required because nats.url is set)
+{{- else }}
+  (DATABASE_URL_INGEST is not required: nats.url is empty, so no consumer runs)
+{{- end }}
+
+The chart does NOT create Secrets. Provision them via your secret-management
+tool (ExternalSecrets, Sealed Secrets, kubectl, etc.).
+
+{{- if not .Values.nats.url }}
+
+NOTE: nats.url is empty — svc-notifier will start without NATS intake. The
+GraphQL API and SSE subscriptions still work, but inbound notifications
+published on notify.deliver will be ignored.
+{{- end }}

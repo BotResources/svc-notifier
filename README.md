@@ -62,3 +62,33 @@ Duplicate delivery is safe -- the `(source_event_id, recipient_id)` unique const
 | `/graphql/ws`          | WS     | GraphQL subscriptions|
 | `/health`              | GET    | Health check         |
 | `/schema`              | GET    | GraphQL SDL          |
+
+## Release
+
+Version is sourced from `Cargo.toml`. Artifacts:
+
+- Image: `ghcr.io/botresources/br-svc-notifier:{version}` (linux/amd64 + linux/arm64)
+- Chart: `oci://ghcr.io/botresources/charts/br-svc-notifier:{version}`
+
+Flow:
+
+1. Bump `version` in `Cargo.toml`.
+2. Add a `## {version}` heading (Keep a Changelog) to `CHANGELOG.md`.
+3. Merge to `main`. CI runs `check` + `integration` + `audit`; on success, `auto-tag` pushes `v{version}`.
+4. CD is triggered by the tag: cross-compiles both arches, publishes image + chart.
+
+No manual tagging; no manual image/chart push.
+
+## Local CI
+
+- `./scripts/publish.sh --check-only` — fmt, clippy, unit tests, helm lint.
+- `./scripts/publish.sh --local-image` — build a runnable image for the host arch (no push).
+- `./scripts/publish.sh --dry-run` — native release build only, no Docker, no push.
+- `./scripts/publish.sh` — full publish. Requires `GHCR_TOKEN` and a tag matching `Cargo.toml` already on `main`.
+
+Integration tests (`tests/p1_*..p4_*`) need Postgres + NATS JetStream:
+
+```sh
+docker compose -f docker-compose.test.yml up -d
+cargo test --tests
+```

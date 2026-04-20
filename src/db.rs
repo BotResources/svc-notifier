@@ -66,9 +66,7 @@ pub async fn list_notifications(
     }
 }
 
-pub async fn unread_count(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-) -> Result<i64, sqlx::Error> {
+pub async fn unread_count(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM notifications WHERE read_at IS NULL")
         .fetch_one(&mut **tx)
         .await?;

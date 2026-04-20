@@ -44,9 +44,7 @@ impl MutationRoot {
             .await
             .map_err(|e| AppError::from(e).extend())?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::from(e).extend())?;
+        tx.commit().await.map_err(|e| AppError::from(e).extend())?;
 
         Ok(true)
     }
@@ -73,9 +71,7 @@ impl MutationRoot {
             .await
             .map_err(|e| AppError::from(e).extend())?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::from(e).extend())?;
+        tx.commit().await.map_err(|e| AppError::from(e).extend())?;
 
         Ok(true)
     }
@@ -106,9 +102,7 @@ impl MutationRoot {
             .await
             .map_err(|e| AppError::from(e).extend())?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::from(e).extend())?;
+        tx.commit().await.map_err(|e| AppError::from(e).extend())?;
 
         if !deleted {
             return Err(AppError::NotFound("Notification not found".to_string()).extend());
