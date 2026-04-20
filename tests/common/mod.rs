@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use async_nats::jetstream;
-use br_service_core::passport::Passport;
-use br_service_core::passport_header::PassportHeader;
+use br_core_auth::Passport;
+use br_core_auth::PassportHeader;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;

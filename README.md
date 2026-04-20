@@ -6,7 +6,7 @@ Standalone notification service. Receives events via NATS JetStream, persists no
 
 - **NATS intake** -- Consumes `notify.deliver` messages from the `NOTIFY` JetStream stream, inserts notifications, and pushes to active WebSocket subscribers.
 - **GraphQL API** -- Queries (list, unread count), mutations (mark read, delete), and subscriptions (real-time push).
-- **RLS** -- All GraphQL resolvers use transaction-local RLS via `br-service-core`. Users can only access their own notifications.
+- **RLS** -- All GraphQL resolvers use transaction-local RLS via `br-util-postgres`. Users can only access their own notifications.
 
 ## Environment variables
 
