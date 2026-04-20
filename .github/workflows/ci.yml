@@ -121,12 +121,16 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Ignores: upstream transitive advisories not actionable from this
-          # crate. Revisit whenever async-nats bumps its rustls-webpki.
+          # crate. Revisit whenever async-nats bumps its rustls-webpki or
+          # sqlx-postgres migrates off the `rsa` crate.
+          #   RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel; no patch
+          #     available. Pulled transitively by sqlx-postgres for SCRAM
+          #     auth. svc-auth ignores the same advisory.
           #   RUSTSEC-2026-0049/0098/0099 — rustls-webpki 0.102.x pulled by
           #     async-nats 0.46; needs upstream bump to 0.103.12+.
           #   RUSTSEC-2026-0097 — rand unsound under custom-logger + ThreadRng
           #     reseed scenario we do not hit.
-          ignore: RUSTSEC-2026-0049,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0097
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0049,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0097
 
   # ---------------------------------------------------------------------------
   # Auto-tag: on push to main (not PR), if Cargo.toml version has no matching
