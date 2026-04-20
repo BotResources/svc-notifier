@@ -18,7 +18,7 @@ impl QueryRoot {
     ) -> GqlResult<NotificationConnection> {
         let state = ctx.data::<AppState>()?;
         let passport = ctx
-            .data::<br_service_core::Passport>()
+            .data::<br_core_auth::Passport>()
             .map_err(|_| AppError::Unauthenticated.extend())?;
 
         let limit = first.clamp(1, 100) as i64;
@@ -28,7 +28,7 @@ impl QueryRoot {
             .begin()
             .await
             .map_err(|e| AppError::from(e).extend())?;
-        br_service_core::set_rls_context(&mut tx, passport)
+        br_util_postgres::set_rls_context(&mut tx, passport)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to set RLS context");
@@ -59,7 +59,7 @@ impl QueryRoot {
     async fn notifier_unread_count(&self, ctx: &Context<'_>) -> GqlResult<i64> {
         let state = ctx.data::<AppState>()?;
         let passport = ctx
-            .data::<br_service_core::Passport>()
+            .data::<br_core_auth::Passport>()
             .map_err(|_| AppError::Unauthenticated.extend())?;
 
         let mut tx = state
@@ -67,7 +67,7 @@ impl QueryRoot {
             .begin()
             .await
             .map_err(|e| AppError::from(e).extend())?;
-        br_service_core::set_rls_context(&mut tx, passport)
+        br_util_postgres::set_rls_context(&mut tx, passport)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to set RLS context");

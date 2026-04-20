@@ -16,7 +16,7 @@ impl MutationRoot {
     ) -> GqlResult<bool> {
         let state = ctx.data::<AppState>()?;
         let passport = ctx
-            .data::<br_service_core::Passport>()
+            .data::<br_core_auth::Passport>()
             .map_err(|_| AppError::Unauthenticated.extend())?;
 
         let mut tx = state
@@ -24,7 +24,7 @@ impl MutationRoot {
             .begin()
             .await
             .map_err(|e| AppError::from(e).extend())?;
-        br_service_core::set_rls_context(&mut tx, passport)
+        br_util_postgres::set_rls_context(&mut tx, passport)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to set RLS context");
@@ -54,7 +54,7 @@ impl MutationRoot {
     async fn notifier_mark_all_as_read(&self, ctx: &Context<'_>) -> GqlResult<bool> {
         let state = ctx.data::<AppState>()?;
         let passport = ctx
-            .data::<br_service_core::Passport>()
+            .data::<br_core_auth::Passport>()
             .map_err(|_| AppError::Unauthenticated.extend())?;
 
         let mut tx = state
@@ -62,7 +62,7 @@ impl MutationRoot {
             .begin()
             .await
             .map_err(|e| AppError::from(e).extend())?;
-        br_service_core::set_rls_context(&mut tx, passport)
+        br_util_postgres::set_rls_context(&mut tx, passport)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to set RLS context");
@@ -87,7 +87,7 @@ impl MutationRoot {
     ) -> GqlResult<bool> {
         let state = ctx.data::<AppState>()?;
         let passport = ctx
-            .data::<br_service_core::Passport>()
+            .data::<br_core_auth::Passport>()
             .map_err(|_| AppError::Unauthenticated.extend())?;
 
         let mut tx = state
@@ -95,7 +95,7 @@ impl MutationRoot {
             .begin()
             .await
             .map_err(|e| AppError::from(e).extend())?;
-        br_service_core::set_rls_context(&mut tx, passport)
+        br_util_postgres::set_rls_context(&mut tx, passport)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "failed to set RLS context");

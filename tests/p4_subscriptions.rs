@@ -1,6 +1,6 @@
 mod common;
 
-use br_service_core::passport_header::PassportHeader;
+use br_core_auth::PassportHeader;
 use serde_json::json;
 use uuid::Uuid;
 

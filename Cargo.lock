@@ -370,26 +370,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "br-service-core"
-version = "0.2.0"
-source = "git+ssh://git@github.com/BotResources/br-service-core?tag=v0.2.0#3752932fe0549ba3d27ef4af2de211a6bc7afd75"
+name = "br-core-auth"
+version = "0.3.0"
+source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.3.0#24a03af264d908bc080cc8c3949e88e056127633"
 dependencies = [
- "async-nats",
- "async-trait",
- "axum",
  "base64",
- "chrono",
- "dotenvy",
- "futures",
- "rand 0.9.4",
  "serde",
  "serde_json",
- "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "br-util-axum-auth"
+version = "0.3.0"
+source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.3.0#24a03af264d908bc080cc8c3949e88e056127633"
+dependencies = [
+ "axum",
+ "br-core-auth",
+]
+
+[[package]]
+name = "br-util-postgres"
+version = "0.3.0"
+source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.3.0#24a03af264d908bc080cc8c3949e88e056127633"
+dependencies = [
+ "br-core-auth",
  "sqlx",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2888,7 +2897,9 @@ dependencies = [
  "async-graphql-axum",
  "async-nats",
  "axum",
- "br-service-core",
+ "br-core-auth",
+ "br-util-axum-auth",
+ "br-util-postgres",
  "bytes",
  "chrono",
  "clap",

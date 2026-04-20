@@ -54,7 +54,7 @@ async fn main() {
 
     // Grant access to svc_notifier_app role (non-fatal if role doesn't exist yet).
     if let Err(e) =
-        br_service_core::grant_app_access(&migration_pool, "svc_notifier_app").await
+        br_util_postgres::grant_app_access(&migration_pool, "svc_notifier_app").await
     {
         tracing::warn!(error = %e, "failed to grant svc_notifier_app access");
     }
@@ -130,7 +130,7 @@ async fn main() {
         .route("/graphql", post(graphql_handler))
         .route("/graphql/playground", get(graphql_playground))
         .layer(axum::middleware::from_fn(
-            br_service_core::passport_header_middleware,
+            br_util_axum_auth::passport_header_middleware,
         ));
 
     let app = Router::new()
@@ -150,7 +150,7 @@ async fn main() {
 
 async fn graphql_handler(
     State(schema): State<AppSchema>,
-    passport: Option<axum::Extension<br_service_core::Passport>>,
+    passport: Option<axum::Extension<br_core_auth::Passport>>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Response {

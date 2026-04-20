@@ -7,7 +7,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
-use br_service_core::Passport;
+use br_core_auth::Passport;
 
 use crate::AppState;
 use crate::graphql::types::NotificationGql;
