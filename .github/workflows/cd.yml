@@ -1,0 +1,77 @@
+name: CD
+
+# Triggered by pushing a version tag: v{version}.
+# Runs the same publish.sh script as local — cross-compiles for amd64+arm64,
+# packages Docker images, pushes to GHCR with a multi-arch manifest, then
+# packages + pushes the Helm chart to the OCI chart registry.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.BR_COMMON_DEPLOY_KEY }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      # QEMU emulators for building linux/arm64 images on amd64 runners.
+      # Without this, `docker build --platform linux/arm64` fails at the first
+      # RUN instruction with "exec format error".
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Log in to GHCR (Docker)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image + chart
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        # CROSS_CONTAINER_OPTS forwards the ssh-agent socket into cross's
+        # build containers so `cargo fetch` can reach the private
+        # br-rust-common repo over SSH. We build it here with shell
+        # expansion instead of in the step-level `env:` block so that
+        # SSH_AUTH_SOCK — set by webfactory/ssh-agent via $GITHUB_ENV —
+        # is resolved at runtime rather than at expression-evaluation
+        # time, which would substitute an empty string.
+        run: |
+          : "${SSH_AUTH_SOCK:?ssh-agent did not export SSH_AUTH_SOCK}"
+          export CROSS_CONTAINER_OPTS="-v ${SSH_AUTH_SOCK}:/tmp/ssh-agent -e SSH_AUTH_SOCK=/tmp/ssh-agent -e CARGO_NET_GIT_FETCH_WITH_CLI=true"
+          ./scripts/publish.sh --skip-checks

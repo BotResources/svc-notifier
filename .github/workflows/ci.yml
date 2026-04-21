@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.BR_COMMON_DEPLOY_KEY }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: helm lint chart
+        run: helm lint charts/br-svc-notifier
+
+      - name: helm template dry-run
+        run: helm template ci charts/br-svc-notifier --debug > /dev/null
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: svc_notifier_test
+          POSTGRES_USER: owner
+          POSTGRES_PASSWORD: owner
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U owner -d svc_notifier_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.BR_COMMON_DEPLOY_KEY }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The `services:` block does not let us pass custom args, and NATS
+      # JetStream requires `--jetstream`. Run it inline on the host network.
+      - name: Start NATS JetStream
+        run: |
+          docker run -d --name nats --network host nats:2.12 --jetstream
+          for i in {1..20}; do
+            if nc -z localhost 4222; then echo "NATS up"; exit 0; fi
+            sleep 1
+          done
+          echo "NATS failed to start" >&2
+          docker logs nats
+          exit 1
+
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Provision Postgres roles
+        env:
+          PGPASSWORD: owner
+        run: psql -h localhost -U owner -d svc_notifier_test -f scripts/init-db.sql
+
+      - name: Integration tests
+        env:
+          DATABASE_URL_OWNER: postgres://owner:owner@localhost:5432/svc_notifier_test
+          DATABASE_URL: postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test
+          DATABASE_URL_INGEST: postgres://svc_notifier_ingest:svc_notifier_ingest@localhost:5432/svc_notifier_test
+          NATS_URL: nats://localhost:4222
+          PORT: "8010"
+          RUST_LOG: info
+        run: cargo test --tests
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Ignores: upstream transitive advisories not actionable from this
+          # crate. Revisit whenever async-nats bumps its rustls-webpki or
+          # sqlx-postgres migrates off the `rsa` crate.
+          #   RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel; no patch
+          #     available. Pulled transitively by sqlx-postgres for SCRAM
+          #     auth. svc-auth ignores the same advisory.
+          #   RUSTSEC-2026-0049/0098/0099 — rustls-webpki 0.102.x pulled by
+          #     async-nats 0.46; needs upstream bump to 0.103.12+.
+          #   RUSTSEC-2026-0097 — rand unsound under custom-logger + ThreadRng
+          #     reseed scenario we do not hit.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0049,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0097
+
+  # ---------------------------------------------------------------------------
+  # Auto-tag: on push to main (not PR), if Cargo.toml version has no matching
+  # git tag, create it. This triggers cd.yml which publishes the image + chart.
+  # ---------------------------------------------------------------------------
+  auto-tag:
+    name: Auto-tag on version bump
+    needs: [check, integration, audit]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create tag if version bumped
+        run: |
+          version="$(grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          [ -n "$version" ] || { echo "ERROR: no version in Cargo.toml"; exit 1; }
+
+          tag="v${version}"
+
+          if git tag -l "$tag" | grep -q .; then
+            echo "Tag $tag already exists — nothing to do"
+            exit 0
+          fi
+
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::warning::CHANGELOG.md missing — skipping tag"
+            exit 0
+          fi
+          if ! grep -qE "^## ${version}( |$)" CHANGELOG.md; then
+            echo "::warning::CHANGELOG.md has no '## $version' heading — skipping tag"
+            exit 0
+          fi
+
+          echo "Creating tag $tag"
+          git tag "$tag"
+          git push origin "$tag"

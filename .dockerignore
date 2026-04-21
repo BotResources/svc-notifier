@@ -1,0 +1,21 @@
+# The binary is pre-compiled outside Docker (by scripts/publish.sh), so the
+# target/ directory must be available in the build context. We only exclude
+# development noise and explicitly keep `target/` out of the default-ignore set.
+# `migrations/` is NOT ignored — the Dockerfile copies it into the image.
+
+.git/
+.env
+.env.test
+README.md
+LICENSE
+CHANGELOG.md
+.gitignore
+.dockerignore
+.github/
+.githooks/
+scripts/
+tests/
+docker-compose.test.yml
+src/
+Cargo.lock
+Cargo.toml

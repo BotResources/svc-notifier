@@ -1,0 +1,97 @@
+# Default values for br-svc-notifier.
+# Consuming projects override only what differs from these defaults.
+
+image:
+  repository: ghcr.io/botresources/br-svc-notifier
+  # Defaults to the chart's appVersion (set in Chart.yaml, kept in lockstep
+  # with the Rust crate version). Override to pin a different tag.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+# Port exposed by the container and Service. Must match the PORT env var
+# (defaults to 8010 in svc-notifier).
+port: 8010
+
+# Postgres connection URLs. All three DSNs (owner, app, ingest) are read
+# from an existing Kubernetes Secret — the chart never generates it.
+#
+# Roles expected by svc-notifier (see scripts/init-db.sql for provisioning):
+#   owner               — migrations + grants (not used at runtime after boot)
+#   svc_notifier_app    — GraphQL user-facing, subject to user-scoped RLS
+#   svc_notifier_ingest — NATS consumer, INSERT+SELECT on notifications only
+postgres:
+  existingSecret: "br-svc-notifier-postgres"
+  # Keys inside the Secret. Values must be full postgres:// DSNs.
+  keys:
+    databaseUrl: "DATABASE_URL"              # svc_notifier_app DSN
+    databaseUrlOwner: "DATABASE_URL_OWNER"   # owner DSN (migrations + grants)
+    databaseUrlIngest: "DATABASE_URL_INGEST" # svc_notifier_ingest DSN
+
+# NATS connection. Optional — if url is empty, svc-notifier starts without
+# NATS intake (graceful degradation: GraphQL API + SSE still work).
+nats:
+  # URL of the NATS server reachable from within the cluster. Leave blank
+  # to disable intake.
+  url: "nats://nats:4222"
+  # Optional credentials, read from an existing Secret if set.
+  existingSecret: ""
+  keys:
+    user: "NATS_USER"
+    password: "NATS_PASSWORD"
+
+# Log filter (tracing_subscriber env filter syntax).
+logLevel: "info"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Probes hit the /health endpoint. Liveness uses a TCP port check so
+# transient Postgres/NATS outages do not restart the pod.
+probes:
+  readiness:
+    path: /health
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # If create=false, the pod uses this existing ServiceAccount name.
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

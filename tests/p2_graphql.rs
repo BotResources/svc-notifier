@@ -128,10 +128,7 @@ async fn pagination_cursor() {
         .as_array()
         .unwrap();
     assert_eq!(nodes2.len(), 2);
-    assert_eq!(
-        resp2["data"]["notifierNotifications"]["hasNextPage"],
-        false
-    );
+    assert_eq!(resp2["data"]["notifierNotifications"]["hasNextPage"], false);
 }
 
 // ── Mutations ─────────────────────────────────────────────────────────
@@ -211,11 +208,7 @@ async fn mark_all_as_read() {
     tokio::time::sleep(CONSUME_WAIT).await;
 
     let resp = ctx
-        .graphql_query(
-            &passport,
-            "mutation { notifierMarkAllAsRead }",
-            json!({}),
-        )
+        .graphql_query(&passport, "mutation { notifierMarkAllAsRead }", json!({}))
         .await;
     assert_eq!(resp["data"]["notifierMarkAllAsRead"], true);
 
@@ -381,12 +374,11 @@ async fn cross_user_cannot_delete_others_notification() {
     tokio::time::sleep(CONSUME_WAIT).await;
 
     // Get Alice's notification ID via owner pool
-    let row: (Uuid,) =
-        sqlx::query_as("SELECT id FROM notifications WHERE recipient_id = $1")
-            .bind(alice)
-            .fetch_one(&ctx.owner_pool)
-            .await
-            .unwrap();
+    let row: (Uuid,) = sqlx::query_as("SELECT id FROM notifications WHERE recipient_id = $1")
+        .bind(alice)
+        .fetch_one(&ctx.owner_pool)
+        .await
+        .unwrap();
     let alice_notif_id = row.0;
 
     // Bob tries to delete Alice's notification — NOT_FOUND (RLS hides it)

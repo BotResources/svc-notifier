@@ -39,9 +39,7 @@ impl QueryRoot {
             .await
             .map_err(|e| AppError::from(e).extend())?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::from(e).extend())?;
+        tx.commit().await.map_err(|e| AppError::from(e).extend())?;
 
         let has_next_page = rows.len() as i64 > limit;
         let nodes: Vec<NotificationGql> = rows
@@ -78,9 +76,7 @@ impl QueryRoot {
             .await
             .map_err(|e| AppError::from(e).extend())?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::from(e).extend())?;
+        tx.commit().await.map_err(|e| AppError::from(e).extend())?;
 
         Ok(count)
     }

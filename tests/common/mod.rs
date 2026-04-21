@@ -1,3 +1,7 @@
+// Each `tests/*.rs` is compiled as a separate binary, so helpers shared here
+// appear dead to clippy from the perspective of binaries that don't use them.
+#![allow(dead_code)]
+
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -7,8 +11,8 @@ use br_core_auth::Passport;
 use br_core_auth::PassportHeader;
 use reqwest::StatusCode;
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(9100);
@@ -35,10 +39,10 @@ impl TestContext {
 
         let owner_url = std::env::var("DATABASE_URL_OWNER")
             .unwrap_or_else(|_| "postgres://owner:owner@localhost:5432/svc_notifier_test".into());
-        let app_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test".into());
-        let nats_url = std::env::var("NATS_URL")
-            .unwrap_or_else(|_| "nats://localhost:4222".into());
+        let app_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test".into()
+        });
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".into());
         let ingest_url = std::env::var("DATABASE_URL_INGEST")
             .unwrap_or_else(|_| "postgres://svc_notifier_ingest:svc_notifier_ingest@localhost:5432/svc_notifier_test".into());
 
@@ -108,22 +112,17 @@ impl TestContext {
                     STARTUP_TIMEOUT, self.port
                 );
             }
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() {
-                    return;
-                }
+            if let Ok(resp) = client.get(&url).send().await
+                && resp.status().is_success()
+            {
+                return;
             }
             tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
         }
     }
 
     /// Send an authenticated GraphQL query.
-    pub async fn graphql_query(
-        &self,
-        passport: &Passport,
-        query: &str,
-        vars: Value,
-    ) -> Value {
+    pub async fn graphql_query(&self, passport: &Passport, query: &str, vars: Value) -> Value {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -140,7 +139,9 @@ impl TestContext {
             .await
             .expect("GraphQL request failed");
 
-        resp.json::<Value>().await.expect("failed to parse GraphQL response")
+        resp.json::<Value>()
+            .await
+            .expect("failed to parse GraphQL response")
     }
 
     /// Send an unauthenticated request to the GraphQL endpoint.

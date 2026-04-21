@@ -53,9 +53,7 @@ async fn main() {
         .expect("failed to run migrations");
 
     // Grant access to svc_notifier_app role (non-fatal if role doesn't exist yet).
-    if let Err(e) =
-        br_util_postgres::grant_app_access(&migration_pool, "svc_notifier_app").await
-    {
+    if let Err(e) = br_util_postgres::grant_app_access(&migration_pool, "svc_notifier_app").await {
         tracing::warn!(error = %e, "failed to grant svc_notifier_app access");
     }
 

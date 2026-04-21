@@ -154,11 +154,8 @@ async fn malformed_message_is_acked() {
     ctx.reset_notifications().await;
 
     // Missing required fields — malformed
-    ctx.nats_publish(
-        "notify.deliver",
-        &json!({"garbage": true}),
-    )
-    .await;
+    ctx.nats_publish("notify.deliver", &json!({"garbage": true}))
+        .await;
 
     tokio::time::sleep(CONSUME_WAIT).await;
 

@@ -46,12 +46,11 @@ async fn read_next_sse_event(
                 }
             }
 
-            if event_type.as_deref() == Some("next") {
-                if let Some(data_str) = data {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data_str) {
-                        return Some(parsed);
-                    }
-                }
+            if event_type.as_deref() == Some("next")
+                && let Some(data_str) = data
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data_str)
+            {
+                return Some(parsed);
             }
         }
     }
@@ -79,7 +78,11 @@ async fn sse_subscription_receives_notification() {
         .await
         .expect("SSE request failed");
 
-    assert!(resp.status().is_success(), "SSE request returned {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "SSE request returned {}",
+        resp.status()
+    );
 
     let stream = resp.bytes_stream();
 
@@ -154,7 +157,10 @@ async fn sse_subscription_user_isolation() {
 
     // Alice should NOT receive anything (timeout)
     let event: Option<serde_json::Value> = read_next_sse_event(stream).await;
-    assert!(event.is_none(), "Alice received an event meant for Bob: {event:?}");
+    assert!(
+        event.is_none(),
+        "Alice received an event meant for Bob: {event:?}"
+    );
 }
 
 #[tokio::test]
