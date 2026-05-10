@@ -8,6 +8,9 @@ Standalone notification service. Receives events via NATS JetStream, persists no
 - **GraphQL API** -- Queries (list, unread count), mutations (mark read, delete), and subscriptions (real-time push).
 - **RLS** -- All GraphQL resolvers use transaction-local RLS via `br-util-postgres`. Users can only access their own notifications.
 
+See [`docs/domain.md`](docs/domain.md) for the notification lifecycle, the
+business-rule inventory, and the planned move to a hexagonal layout.
+
 ## Environment variables
 
 | Variable             | Required | Default | Description                                   |
