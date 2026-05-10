@@ -11,15 +11,15 @@ repository = "https://github.com/BotResources/svc-notifier"
 # All three crates share one git source (single repo-wide `tag`) so Cargo
 # deduplicates the transitive `br-core-auth`. Per-crate tags resolve to
 # different commits and would produce distinct sources.
-br-core-auth      = { git = "ssh://git@github.com/BotResources/br-rust-common", package = "br-core-auth",      tag = "v0.3.0" }
-br-util-postgres  = { git = "ssh://git@github.com/BotResources/br-rust-common", package = "br-util-postgres",  tag = "v0.3.0" }
-br-util-axum-auth = { git = "ssh://git@github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.3.0" }
+br-core-auth      = { git = "ssh://git@github.com/BotResources/br-rust-common", package = "br-core-auth",      tag = "v0.4.0" }
+br-util-postgres  = { git = "ssh://git@github.com/BotResources/br-rust-common", package = "br-util-postgres",  tag = "v0.4.0" }
+br-util-axum-auth = { git = "ssh://git@github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.4.0" }
 
 axum = "0.8"
 async-graphql = { version = "7", features = ["uuid", "chrono"] }
 async-graphql-axum = "7"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "json", "uuid", "chrono", "macros", "migrate"] }
-async-nats = "0.46"
+async-nats = "0.48"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
