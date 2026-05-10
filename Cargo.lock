@@ -371,8 +371,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-auth"
-version = "0.3.0"
-source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.3.0#24a03af264d908bc080cc8c3949e88e056127633"
+version = "0.4.0"
+source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
 dependencies = [
  "base64",
  "serde",
@@ -383,8 +383,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-axum-auth"
-version = "0.3.0"
-source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.3.0#24a03af264d908bc080cc8c3949e88e056127633"
+version = "0.4.0"
+source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
 dependencies = [
  "axum",
  "br-core-auth",
@@ -392,8 +392,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-postgres"
-version = "0.3.0"
-source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.3.0#24a03af264d908bc080cc8c3949e88e056127633"
+version = "0.4.0"
+source = "git+ssh://git@github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
 dependencies = [
  "br-core-auth",
  "sqlx",
