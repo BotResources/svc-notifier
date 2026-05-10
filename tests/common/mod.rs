@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use async_nats::jetstream;
-use br_core_auth::Passport;
 use br_core_auth::PassportHeader;
+use br_core_auth::{AuthMethod, Passport};
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -267,6 +267,8 @@ impl TestContext {
             is_super_admin,
             is_active: true,
             claims: serde_json::json!({}),
+            auth_method: AuthMethod::Jwt,
+            impersonator: None,
         }
     }
 }
