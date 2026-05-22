@@ -18,40 +18,59 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   publish:
     name: Publish
+    # The arc-ubuntu runner pool already runs on
+    # `ghcr.io/botresources/br-arc-runner:stable`, which ships rust +
+    # docker-cli + helm + the basic build toolchain. No `container:`
+    # block needed.
     runs-on: arc-ubuntu
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.BR_COMMON_DEPLOY_KEY }}
-
+      # Static-musl cross-compile via cargo-zigbuild (Zig as the C
+      # compiler). Two reasons we are here and not on `*-unknown-linux-gnu`:
+      #   1. A glibc-linked binary's runtime libc must stay >= the libc the
+      #      binary was built against. The runner image's GLIBC has bumped
+      #      past debian:bookworm-slim's GLIBC_2.36 in the past, shipping
+      #      CrashLoop releases (see br-graphql-gateway#29).
+      #   2. Static-musl decouples the binary from the runtime image's libc
+      #      *entirely* — a future runner bump cannot reintroduce the skew
+      #      because the binary no longer depends on the runtime libc at all.
+      # Why zigbuild and not the system musl-gcc + aarch64-linux-musl-gcc
+      # cross toolchains: Zig ships a working musl-aarch64 C cross compiler
+      # that handles `ring` + `aws-lc-sys` (pulled transitively by rustls
+      # via reqwest/jsonwebtoken/async-nats) cleanly. The musl-cross apt
+      # path on aarch64 is notoriously brittle for those crates.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.16.2
-
-      # QEMU emulators for building linux/arm64 images on amd64 runners.
-      # Without this, `docker build --platform linux/arm64` fails at the first
-      # RUN instruction with "exec format error".
-      - uses: docker/setup-qemu-action@v3
+      # buildx is needed for `docker build --provenance=false` in publish.sh.
+      # NO `setup-qemu-action`: the Dockerfile has no `RUN` instructions, so
+      # buildx never has to exec foreign-arch code. Both binaries are static
+      # musl built natively above (Rust target = musl, Zig as C linker), and
+      # `COPY ${BIN_PATH}` is a layer op the builder does natively. → arm64
+      # docker build is now I/O-bound, not CPU-bound.
       - uses: docker/setup-buildx-action@v3
-
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Log in to GHCR (Docker)
         uses: docker/login-action@v3
@@ -64,14 +83,4 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
-        # CROSS_CONTAINER_OPTS forwards the ssh-agent socket into cross's
-        # build containers so `cargo fetch` can reach the private
-        # br-rust-common repo over SSH. We build it here with shell
-        # expansion instead of in the step-level `env:` block so that
-        # SSH_AUTH_SOCK — set by webfactory/ssh-agent via $GITHUB_ENV —
-        # is resolved at runtime rather than at expression-evaluation
-        # time, which would substitute an empty string.
-        run: |
-          : "${SSH_AUTH_SOCK:?ssh-agent did not export SSH_AUTH_SOCK}"
-          export CROSS_CONTAINER_OPTS="-v ${SSH_AUTH_SOCK}:/tmp/ssh-agent -e SSH_AUTH_SOCK=/tmp/ssh-agent -e CARGO_NET_GIT_FETCH_WITH_CLI=true"
-          ./scripts/publish.sh --skip-checks
+        run: ./scripts/publish.sh --skip-checks
