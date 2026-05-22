@@ -68,11 +68,11 @@ if [ "$MODE" = "local-image" ]; then
     case "$(uname -m)" in
         arm64|aarch64)
             PLATFORM="linux/arm64"
-            TARGET_TRIPLE="aarch64-unknown-linux-gnu"
+            TARGET_TRIPLE="aarch64-unknown-linux-musl"
             ;;
         x86_64|amd64)
             PLATFORM="linux/amd64"
-            TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+            TARGET_TRIPLE="x86_64-unknown-linux-musl"
             ;;
         *)
             error "Unsupported host arch: $(uname -m). Use --dry-run + manual docker build."
@@ -84,8 +84,8 @@ if [ "$MODE" = "local-image" ]; then
     info "${CRATE_NAME} ${VERSION} → ${LOCAL_TAG} (${PLATFORM})"
 
     cd "$REPO_ROOT"
-    info "Cross-compiling for $TARGET_TRIPLE"
-    cross build --release --target "$TARGET_TRIPLE"
+    info "Static-musl cross-compiling for $TARGET_TRIPLE"
+    cargo zigbuild --release --locked --target "$TARGET_TRIPLE"
 
     info "Packaging $PLATFORM image"
     docker build \
@@ -171,7 +171,7 @@ if [ "$MODE" != "dry-run" ]; then
     docker build \
         --provenance=false \
         --platform linux/amd64 \
-        --build-arg BIN_PATH="target/x86_64-unknown-linux-gnu/release/${CRATE_NAME}" \
+        --build-arg BIN_PATH="target/x86_64-unknown-linux-musl/release/${CRATE_NAME}" \
         --tag "${IMAGE_NAME}:${VERSION}-amd64" \
         "$REPO_ROOT"
 
@@ -179,7 +179,7 @@ if [ "$MODE" != "dry-run" ]; then
     docker build \
         --provenance=false \
         --platform linux/arm64 \
-        --build-arg BIN_PATH="target/aarch64-unknown-linux-gnu/release/${CRATE_NAME}" \
+        --build-arg BIN_PATH="target/aarch64-unknown-linux-musl/release/${CRATE_NAME}" \
         --tag "${IMAGE_NAME}:${VERSION}-arm64" \
         "$REPO_ROOT"
 fi

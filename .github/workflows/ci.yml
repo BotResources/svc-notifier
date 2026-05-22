@@ -9,7 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 permissions:
   contents: read
@@ -20,10 +19,6 @@ jobs:
     runs-on: arc-ubuntu
     steps:
       - uses: actions/checkout@v4
-
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.BR_COMMON_DEPLOY_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,10 +64,6 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.BR_COMMON_DEPLOY_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
 
