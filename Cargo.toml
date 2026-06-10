@@ -11,11 +11,25 @@ license = "MIT"
 description = "Standalone notification service — NATS intake, GraphQL API, RLS, real-time subscriptions"
 repository = "https://github.com/BotResources/svc-notifier"
 
-# The implementation has been deliberately removed: this crate is a stub.
-# The README and the e2e scenario suite (tests/) are the contract to build.
-# Runtime dependencies are the implementer's choice; the [dev-dependencies]
-# below belong to the test harness, not to the future implementation.
 [dependencies]
+br-notifier-contract = { path = "br-notifier-contract" }
+br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.4.0" }
+br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.4.0" }
+br-util-postgres = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-postgres", tag = "v0.4.0" }
+async-graphql = { version = "7", features = ["chrono", "uuid"] }
+async-nats = "0.48"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "json", "uuid", "chrono", "macros", "migrate"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 br-notifier-contract = { path = "br-notifier-contract" }
