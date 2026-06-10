@@ -252,9 +252,16 @@ cargo run -- schema                                # print the GraphQL SDL and e
 | `NATS_PASSWORD`       | no                        | NATS password                                          |
 | `RUST_LOG`            | no (default `info`)       | Tracing filter (structured JSON logs)                  |
 
-The two runtime roles must exist before first startup;
+The roles must exist before first startup;
 [`scripts/init-db.sql`](scripts/init-db.sql) is the reference bootstrap (the test
-compose mounts it automatically). Migrations run at service startup.
+compose mounts it automatically). Migrations run at service startup. The role
+model mirrors production: the migration owner role (`DATABASE_URL_OWNER`) is
+**migration-only** — RLS-exempt (`BYPASSRLS`) so migrations and future data
+backfills always work, and never used by any runtime path; runtime access goes
+through the `svc_notifier_app` / `svc_notifier_ingest` roles only. In the test
+harness the service under test runs with exactly these roles
+(`DATABASE_URL_SERVICE_OWNER` in `.env.test`); the compose superuser is
+harness-only and is never handed to the service.
 
 | Path                  | Method | Description                                          |
 |-----------------------|--------|------------------------------------------------------|
