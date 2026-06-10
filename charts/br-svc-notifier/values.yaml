@@ -29,11 +29,12 @@ port: 8010
 # from an existing Kubernetes Secret — the chart never generates it.
 #
 # Roles expected by svc-notifier (see scripts/init-db.sql for provisioning):
-#   owner               — runs migrations + grants at boot (that pool then
-#                          closes), and backs the LISTEN/NOTIFY listener, which
-#                          re-reads committed rows across recipients to build
-#                          push events
-#   svc_notifier_app    — GraphQL user-facing, subject to user-scoped RLS
+#   owner               — runs migrations + grants at boot only (that pool then
+#                          closes); RLS-exempt, never used by any runtime path
+#   svc_notifier_app    — GraphQL user-facing AND the LISTEN/NOTIFY listener,
+#                          both subject to user-scoped RLS; the listener
+#                          re-reads each signalled row under the recipient's
+#                          own scope, never across recipients
 #   svc_notifier_ingest — NATS consumer, INSERT+SELECT on notifications only
 postgres:
   existingSecret: "br-svc-notifier-postgres"
@@ -42,6 +43,21 @@ postgres:
     databaseUrl: "DATABASE_URL"              # svc_notifier_app DSN
     databaseUrlOwner: "DATABASE_URL_OWNER"   # owner DSN (migrations + grants)
     databaseUrlIngest: "DATABASE_URL_INGEST" # svc_notifier_ingest DSN
+  # Deliberate per-host plaintext opt-out for the DB connection. The shared
+  # br-util-postgres lib refuses to boot on a plaintext DSN to any remote
+  # (non-loopback) host unless that host is declared here — it trusts the
+  # network segment, not transport TLS. The platform runs CloudNativePG
+  # intra-namespace over plaintext behind a default-deny NetworkPolicy, so the
+  # CNPG service host (e.g. "my-db-rw.my-ns.svc") must be listed here for the
+  # service to start. When non-empty, rendered as the comma-joined
+  # TRUSTED_NETWORK_HOSTS env var. Default empty = TLS required for any remote
+  # host (sslmode=require/verify-ca/verify-full in the DSN).
+  trustedNetworkHosts: []
+
+# Generic escape hatch: extra environment entries rendered verbatim into the
+# container (list of {name, value} or any valid Kubernetes EnvVar — e.g. a
+# valueFrom). Use for anything the chart does not expose a dedicated knob for.
+extraEnv: []
 
 # NATS connection. Optional — if url is empty, svc-notifier starts without
 # NATS intake (graceful degradation: GraphQL API + SSE still work).

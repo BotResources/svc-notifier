@@ -300,12 +300,13 @@ dependencies = [
 
 [[package]]
 name = "br-core-auth"
-version = "0.4.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
+version = "0.6.2"
+source = "git+https://github.com/BotResources/br-rust-common?tag=br-util-postgres-v0.7.0#c5e3239ce90bb98f72a0d93d7c7f58e87e6cc1d0"
 dependencies = [
  "base64",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -323,22 +324,25 @@ dependencies = [
 
 [[package]]
 name = "br-util-axum-auth"
-version = "0.4.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
+version = "0.4.2"
+source = "git+https://github.com/BotResources/br-rust-common?tag=br-util-postgres-v0.7.0#c5e3239ce90bb98f72a0d93d7c7f58e87e6cc1d0"
 dependencies = [
  "axum",
  "br-core-auth",
+ "tracing",
 ]
 
 [[package]]
 name = "br-util-postgres"
-version = "0.4.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
+version = "0.7.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=br-util-postgres-v0.7.0#c5e3239ce90bb98f72a0d93d7c7f58e87e6cc1d0"
 dependencies = [
  "br-core-auth",
  "sqlx",
  "thiserror",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2726,7 +2730,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svc-notifier"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-graphql",
  "async-nats",

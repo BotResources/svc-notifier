@@ -259,6 +259,18 @@ cargo run -- schema                                # print the GraphQL SDL and e
 | `NATS_USER`           | no                        | NATS username                                          |
 | `NATS_PASSWORD`       | no                        | NATS password                                          |
 | `RUST_LOG`            | no (default `info`)       | Tracing filter (structured JSON logs)                  |
+| `TRUSTED_NETWORK_HOSTS` | per remote plaintext DB host | Comma-separated DB hosts reachable over plaintext (see below) |
+
+**Database TLS.** The shared `br-util-postgres` lib is strict by default: a
+plaintext DSN to any remote (non-loopback) host is **refused at startup** unless
+that host is declared in `TRUSTED_NETWORK_HOSTS`, or the DSN itself enforces TLS
+(`sslmode=require` / `verify-ca` / `verify-full`). The platform runs
+CloudNativePG intra-namespace over plaintext behind a default-deny
+`NetworkPolicy`, so a K3s/Kubernetes deployment lists the CNPG service host in
+`TRUSTED_NETWORK_HOSTS` (chart key `postgres.trustedNetworkHosts`) — a
+deliberate per-host opt-out that trusts the network segment, not transport TLS.
+Loopback hosts always pass with no declaration. (There is no `ALLOW_INSECURE_DATABASE`
+blanket bypass and no environment mode — strictness is unconditional.)
 
 The roles must exist before first startup;
 [`scripts/init-db.sql`](scripts/init-db.sql) is the reference bootstrap (the test
@@ -276,7 +288,7 @@ harness-only and is never handed to the service.
 | `/graphql`            | POST   | GraphQL endpoint; SSE subscriptions via `Accept: text/event-stream` |
 | `/graphql/playground` | GET    | GraphiQL UI                                          |
 | `/health`             | GET    | Health check                                         |
-| `/schema`             | GET    | GraphQL SDL                                          |
+| `/sdl`                | GET    | GraphQL SDL (the gateway composer polls this path)   |
 
 ## Tests
 

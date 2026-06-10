@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.0
+
+A scoped pre-deployment fix: align the SDL route with the gateway composer's
+hard contract and pull in the strict-by-default database-TLS posture from the
+shared lib.
+
+### Changed (BREAKING)
+- **SDL route renamed `/schema` → `/sdl`.** The GraphQL gateway composer polls
+  every subgraph at `GET {base_url}/sdl`; serving the SDL elsewhere gets the
+  subgraph rejected at composition. There is no alias — one route, one truth. A
+  new e2e scenario (`s05_sdl_route_serves_the_schema_for_the_gateway_composer`)
+  pins it: `GET /sdl` returns the SDL and `GET /schema` is now 404.
+- **Shared-lib bump `v0.4.0` → br-core-auth 0.6.2 / br-util-axum-auth 0.4.2 /
+  br-util-postgres 0.7.0.** Database-TLS validation is now **unconditionally
+  strict**: the `Environment` enum and the `allow_insecure` /
+  `ALLOW_INSECURE_DATABASE` blanket bypass are gone. A plaintext DSN to any
+  remote (non-loopback) host is refused at startup unless the host is declared
+  in `TRUSTED_NETWORK_HOSTS` (the deliberate per-host opt-out for an
+  intra-namespace, network-isolated CNPG database) or the DSN enforces TLS
+  (`sslmode=require`/`verify-ca`/`verify-full`). `svc-notifier` dropped all
+  environment-mode logic from `main.rs` accordingly. br-core-auth 0.6.x also
+  tightens `Passport` deserialization (strict serde); the valid wire format is
+  byte-identical, so no behavior change for well-formed passports.
+
+### Added
+- **Chart: `postgres.trustedNetworkHosts`** — a list of DB hosts allowed over
+  plaintext, rendered as the `TRUSTED_NETWORK_HOSTS` env var when non-empty
+  (default empty = TLS required for any remote host). This is what lets a K3s
+  deployment boot against intra-namespace CNPG over plaintext under the 0.7.0
+  lib.
+- **Chart: `extraEnv`** — a generic escape hatch for extra container env entries
+  rendered verbatim.
+
+### Fixed
+- **Chart comment corrected to match the code** (doc-must-match-code). The
+  `values.yaml` Postgres-roles comment claimed the owner role "backs the
+  LISTEN/NOTIFY listener, which re-reads committed rows across recipients" —
+  the pre-review behavior. In reality the listener runs on the
+  `svc_notifier_app` pool and re-reads each signalled row under the recipient's
+  own RLS scope; the owner role is used for migrations + grants at boot only and
+  never at runtime.
+
 ## 0.3.0
 
 The from-scratch rebuild: the service is reimplemented against the README

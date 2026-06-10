@@ -5,7 +5,7 @@ Service: {{ include "br-svc-notifier.fullname" . }}.{{ .Release.Namespace }}.svc
 Endpoints (in-cluster):
   POST   http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/graphql
   GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/graphql/playground
-  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/schema
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/sdl
   GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/health
 
 Postgres DSNs must exist in Secret "{{ .Values.postgres.existingSecret }}" under keys:
