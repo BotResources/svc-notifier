@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::process::{Child, Command};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
@@ -16,7 +17,21 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(9100);
+// TEST_PORT_BASE lets several checkouts run the suite on one machine
+// without their spawned instances colliding (default base: 9100).
+static PORT_COUNTER: OnceLock<AtomicU16> = OnceLock::new();
+
+fn next_port() -> u16 {
+    PORT_COUNTER
+        .get_or_init(|| {
+            let base = std::env::var("TEST_PORT_BASE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(9100);
+            AtomicU16::new(base)
+        })
+        .fetch_add(1, Ordering::SeqCst)
+}
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -111,7 +126,7 @@ impl TestStack {
     /// instance without intake (serving GraphQL only) — used to prove pushes
     /// derive from committed PG state, not from the consuming process.
     pub async fn spawn_instance(&self, with_nats: bool) -> ServiceInstance {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = next_port();
         let base_url = format!("http://localhost:{port}");
 
         let bin_path = env!("CARGO_BIN_EXE_svc-notifier");
@@ -511,8 +526,15 @@ impl Drop for PausedPostgres {
 }
 
 fn find_postgres_container() -> String {
+    let port = postgres_host_port();
     let output = Command::new("docker")
-        .args(["ps", "--format", "{{.Names}}\t{{.Image}}"])
+        .args([
+            "ps",
+            "--filter",
+            &format!("publish={port}"),
+            "--format",
+            "{{.Names}}\t{{.Image}}",
+        ])
         .output()
         .expect("docker ps failed — the outage scenarios need the docker CLI");
     let listing = String::from_utf8_lossy(&output.stdout);
@@ -520,7 +542,23 @@ fn find_postgres_container() -> String {
         .lines()
         .find(|line| line.contains("postgres"))
         .map(|line| line.split('\t').next().unwrap_or_default().to_string())
-        .expect("no running postgres container found — start docker-compose.test.yml first")
+        .unwrap_or_else(|| {
+            panic!(
+                "no running postgres container publishing port {port} — start docker-compose.test.yml first"
+            )
+        })
+}
+
+fn postgres_host_port() -> String {
+    let _ = dotenvy::from_filename(".env.test");
+    std::env::var("DATABASE_URL_OWNER")
+        .ok()
+        .and_then(|url| {
+            let authority = url.rsplit('@').next()?.to_string();
+            let port = authority.split('/').next()?.split(':').nth(1)?.to_string();
+            (!port.is_empty()).then_some(port)
+        })
+        .unwrap_or_else(|| "5432".to_string())
 }
 
 fn run_docker(args: &[&str]) {

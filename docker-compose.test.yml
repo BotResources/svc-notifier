@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: owner
       POSTGRES_PASSWORD: owner
     ports:
-      - "5432:5432"
+      - "${PG_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U owner -d svc_notifier_test"]
       interval: 2s
@@ -19,7 +19,7 @@ services:
     image: nats:2.12
     command: ["--jetstream"]
     ports:
-      - "4222:4222"
+      - "${NATS_PORT:-4222}:4222"
     healthcheck:
       test: ["CMD-SHELL", "nats-server --help > /dev/null 2>&1 || exit 1"]
       interval: 2s
