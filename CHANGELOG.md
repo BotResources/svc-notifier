@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- `br-notifier-contract` 0.1.0 — the service's published language, as a sibling
+  workspace crate with its own version, changelog and (upcoming) tag line. Producers
+  depend on it instead of hand-rolling the deliver payload. The service does not
+  consume it yet — that lands with the subject migration. See
+  `br-notifier-contract/CHANGELOG.md`.
+
+### Changed
+- Repository converted to a two-crate Cargo workspace (`svc-notifier` +
+  `br-notifier-contract`). The service crate is unchanged; root-level cargo
+  commands cover both crates via `default-members`.
+- README rewritten as the service's contract: target-state sections are explicitly
+  marked `[target]` until the implementation lands (subject migration, `link`,
+  subscription event union, bulk delete, LISTEN/NOTIFY realtime).
+- README now matches the code where it previously did not: subscriptions are served
+  over SSE on `POST /graphql` (there is no `/graphql/ws` WebSocket route), the
+  required `DATABASE_URL_INGEST` variable is documented, and the unread `APP_ROLE`
+  variable is gone (role names are fixed: `svc_notifier_app`, `svc_notifier_ingest`).
+
+### Removed
+- `docs/domain.md` — its staged hexagonal plan is superseded; the notification
+  lifecycle and behavior inventory it carried are absorbed into the README (its
+  open questions on delete semantics and template allow-listing survive there).
+
 ## 0.2.0
 
 ### Added

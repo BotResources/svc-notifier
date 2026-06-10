@@ -1,3 +1,7 @@
+[workspace]
+members = ["br-notifier-contract"]
+default-members = [".", "br-notifier-contract"]
+
 [package]
 name = "svc-notifier"
 version = "0.2.0"

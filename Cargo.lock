@@ -381,6 +381,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "br-notifier-contract"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "br-util-axum-auth"
 version = "0.4.0"
 source = "git+https://github.com/BotResources/br-rust-common?tag=v0.4.0#2cb7695d62018f015912dae972d1ff9d77f76b7d"
