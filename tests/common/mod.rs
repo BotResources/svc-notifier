@@ -51,7 +51,7 @@ pub struct TestStack {
     pub owner_pool: PgPool,
     pub nats_client: async_nats::Client,
     pub jetstream: jetstream::Context,
-    owner_url: String,
+    service_owner_url: String,
     app_url: String,
     ingest_url: String,
     nats_url: String,
@@ -74,8 +74,17 @@ impl TestStack {
     pub async fn up() -> Self {
         let _ = dotenvy::from_filename(".env.test");
 
+        // The superuser DSN is HARNESS-ONLY (assertion connection, state
+        // reset). The service under test gets `service_owner_url` — a
+        // non-superuser migration role mirroring the production posture, so
+        // any service code path reading through the owner pool is subject to
+        // FORCE RLS in tests exactly as it would be in production.
         let owner_url = std::env::var("DATABASE_URL_OWNER")
             .unwrap_or_else(|_| "postgres://owner:owner@localhost:5432/svc_notifier_test".into());
+        let service_owner_url = std::env::var("DATABASE_URL_SERVICE_OWNER").unwrap_or_else(|_| {
+            "postgres://svc_notifier_owner:svc_notifier_owner@localhost:5432/svc_notifier_test"
+                .into()
+        });
         let app_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test".into()
         });
@@ -115,7 +124,7 @@ impl TestStack {
             owner_pool,
             nats_client,
             jetstream,
-            owner_url,
+            service_owner_url,
             app_url,
             ingest_url,
             nats_url,
@@ -133,7 +142,7 @@ impl TestStack {
         let mut command = Command::new(bin_path);
         command
             .env("PORT", port.to_string())
-            .env("DATABASE_URL_OWNER", &self.owner_url)
+            .env("DATABASE_URL_OWNER", &self.service_owner_url)
             .env("DATABASE_URL", &self.app_url)
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::null())
