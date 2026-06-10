@@ -536,14 +536,24 @@ impl Drop for PausedPostgres {
 
 fn find_postgres_container() -> String {
     let port = postgres_host_port();
+    // Published-port filter disambiguates between several local stacks; a
+    // host-networked container (the CI shape) publishes nothing, so fall
+    // back to the name/image scan — unambiguous on a single-stack runner.
+    docker_ps_first_postgres(&["--filter", &format!("publish={port}")])
+        .or_else(|| docker_ps_first_postgres(&[]))
+        .unwrap_or_else(|| {
+            panic!(
+                "no running postgres container found (looked for published port {port}, then any) — start docker-compose.test.yml first"
+            )
+        })
+}
+
+fn docker_ps_first_postgres(filters: &[&str]) -> Option<String> {
+    let mut args = vec!["ps"];
+    args.extend_from_slice(filters);
+    args.extend_from_slice(&["--format", "{{.Names}}\t{{.Image}}"]);
     let output = Command::new("docker")
-        .args([
-            "ps",
-            "--filter",
-            &format!("publish={port}"),
-            "--format",
-            "{{.Names}}\t{{.Image}}",
-        ])
+        .args(&args)
         .output()
         .expect("docker ps failed — the outage scenarios need the docker CLI");
     let listing = String::from_utf8_lossy(&output.stdout);
@@ -551,11 +561,6 @@ fn find_postgres_container() -> String {
         .lines()
         .find(|line| line.contains("postgres"))
         .map(|line| line.split('\t').next().unwrap_or_default().to_string())
-        .unwrap_or_else(|| {
-            panic!(
-                "no running postgres container publishing port {port} — start docker-compose.test.yml first"
-            )
-        })
 }
 
 fn postgres_host_port() -> String {
