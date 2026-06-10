@@ -8,7 +8,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 run_crate_checks() {
-    cd "$REPO_ROOT"
+    cd "$REPO_ROOT" || exit 1
 
     info "Running crate checks"
 

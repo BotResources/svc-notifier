@@ -9,10 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `br-notifier-contract` 0.1.0 — the service's published language, as a sibling
-  workspace crate with its own version, changelog and (upcoming) tag line. Producers
+  workspace crate with its own version, changelog and tag line. Producers
   depend on it instead of hand-rolling the deliver payload. The service does not
   consume it yet — that lands with the subject migration. See
   `br-notifier-contract/CHANGELOG.md`.
+- The e2e suite is rewritten as named behavior scenarios
+  (`tests/scenarios_*.rs`), each pinning the three external envelopes (NATS
+  ack/NAK/redelivery + consumer state, exact PG rows via a dedicated assertion
+  connection, the GraphQL view of a forged Passport). New coverage: dedup
+  first-wins as contract, fail-closed link rejection, legacy-subject
+  retirement, DB-outage NAK/recovery/exhaustion, partial-redelivery
+  idempotence, cross-session read/delete propagation, single bulk event for
+  `markAllAsRead`, bulk delete RLS semantics, reconnect
+  (subscribe-then-snapshot), and a two-instance scenario proving pushes derive
+  from committed PG state. Scenarios pinning target behavior fail red until
+  the implementation lands (spec-first).
+- `deny.toml` + cargo-deny, cargo-machete, cargo-semver-checks (contract
+  crate), per-crate changelog check, shellcheck and trufflehog jobs in CI,
+  aligned with the platform CI standard.
+- `scripts/setup-branch-protection.sh` — declarative required-checks
+  management for `main`; the e2e job is a required check.
+
+### Changed
+- CI triggers on `pull_request` only (plus `workflow_dispatch`), with a
+  `cargo fmt` auto-fix gate fronting every Rust job — no more double runs,
+  no CI on pushes to `main`.
+- CD is restructured image-first/tag-after: `detect-bump` (per crate) →
+  publish image + chart → create `{crate}/v{version}` tag + GitHub Release.
+  The auto-tag job moves out of CI into CD; `publish.sh` no longer requires a
+  pre-existing tag (the tag is created after a successful publish, never
+  before). The contract crate is released as a tag only.
+- Direct-SQL test seeding is removed: every scenario seeds through the real
+  NATS intake.
+- `scripts/lib/*.sh` pass shellcheck (`cd` failure guards, exported
+  `CRATE_NAME`).
 
 ### Changed
 - Repository converted to a two-crate Cargo workspace (`svc-notifier` +

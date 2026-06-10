@@ -2907,6 +2907,7 @@ dependencies = [
  "async-nats",
  "axum",
  "br-core-auth",
+ "br-notifier-contract",
  "br-util-axum-auth",
  "br-util-postgres",
  "bytes",

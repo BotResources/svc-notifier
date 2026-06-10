@@ -264,20 +264,29 @@ compose mounts it automatically). Migrations run at service startup.
 
 - **Unit tests** live next to the code; the contract crate's tests are its spec
   (`cargo test -p br-notifier-contract`).
-- **End-to-end tests** run against real Postgres and real NATS JetStream — no infra
-  mocks. Bring the harness up first:
+- **End-to-end tests are the specification.** Named behavior scenarios
+  (`tests/scenarios_*.rs`), each pinning the three external envelopes — what
+  happens on NATS (ack/NAK/redelivery, consumer state), in PostgreSQL (exact
+  rows, asserted through a dedicated assertion connection, never through the
+  app), and on the GraphQL surface (what a recipient's session observes:
+  query, unread count, subscription push). They cover cross-session event
+  propagation, reconnect, redelivery idempotence, fail-closed link rejection,
+  DB-outage NAK/recovery/exhaustion, and a two-instance scenario proving
+  pushes derive from committed PG state. All seeding goes through the real
+  intake — there is no direct-SQL seeding path.
+- The suite runs against real Postgres and real NATS JetStream — no infra
+  mocks. The outage scenarios additionally need the `docker` CLI (they pause
+  the Postgres container). Bring the harness up first:
 
 ```sh
 docker compose -f docker-compose.test.yml up -d
-cargo test --tests
+cargo test --tests --no-fail-fast
 ```
 
-**[target]** The e2e suite is being rewritten as named behavior scenarios, each
-pinning the three external envelopes — what happens on NATS (ack/NAK/redelivery),
-in PostgreSQL (exact rows, asserted through a dedicated connection), and on the
-GraphQL surface (what a recipient's session observes) — including cross-session
-event propagation, reconnect, redelivery idempotence, and a two-instance scenario
-proving pushes derive from committed PG state.
+**[target]** Scenarios pinning target behavior fail red until the
+implementation lands — red is the expected state of this suite between the
+spec and the implementation; making it green is the implementation's
+definition of done.
 
 ## Versioning & release
 
@@ -289,10 +298,22 @@ Two independently versioned crates:
 - `br-notifier-contract` — the published language, consumed by producers as a git
   dependency. A change here is a contract change and follows semver strictly.
 
-Release flow: bump the crate's version in its `Cargo.toml`, add the matching
-heading to its `CHANGELOG.md` (Keep a Changelog), merge to `main`. CI gates
-(fmt, clippy, unit + integration tests, audit) then tags automatically — the
-service tag `v{version}` today, **[target]** per-crate tags `{crate}/v{version}`.
+Release flow — image-first, tag-after, per crate:
+
+1. Bump the crate's version in its `Cargo.toml` and add the matching heading
+   to its `CHANGELOG.md` (Keep a Changelog) in the same PR.
+2. CI gates the PR (`pull_request` is the only CI trigger): fmt auto-fix gate,
+   clippy + unit tests, the e2e scenario suite, cargo-audit, cargo-deny,
+   cargo-machete, semver-checks on the contract crate, per-crate changelog
+   presence, shellcheck, secret scan. All of them are required checks on
+   `main`, managed declaratively by
+   [`scripts/setup-branch-protection.sh`](scripts/setup-branch-protection.sh).
+3. On merge, CD detects the version bump per crate, publishes the service
+   image + chart **first**, then creates the tag `{crate}/v{version}` and the
+   GitHub Release — a tag is a receipt that the version shipped, never a
+   promise. The contract crate has no artifact: its release *is* the
+   `br-notifier-contract/v{version}` tag.
+
 No manual tagging, no manual image/chart push.
 
 Local pipeline: `./scripts/publish.sh --check-only` (fmt, clippy, unit tests, helm

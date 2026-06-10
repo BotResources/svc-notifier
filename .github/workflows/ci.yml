@@ -1,37 +1,77 @@
 name: CI
 
+# CI gates the PR, not the commit: `pull_request` is the only trigger
+# (plus manual re-runs). CD owns pushes to main.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 permissions:
   contents: read
 
 jobs:
+  fmt:
+    name: cargo fmt (auto-fix)
+    runs-on: arc-ubuntu
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --all
+        run: cargo fmt --all
+
+      - name: check + auto-fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "Already formatted."
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "::error::Code is not formatted. Run 'cargo fmt --all' locally."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: cargo fmt (auto-fix)"
+          git push
+          echo "::error::Code was auto-formatted and pushed. Please re-run CI."
+          exit 1
+
   check:
-    name: Checks
+    name: cargo clippy + test
+    needs: fmt
     runs-on: arc-ubuntu
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.2
-
-      - name: cargo fmt
-        run: cargo fmt --check
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -46,28 +86,34 @@ jobs:
         run: helm template ci charts/br-svc-notifier --debug > /dev/null
 
   integration:
-    name: Integration tests
+    name: integration (e2e)
+    needs: fmt
     runs-on: arc-ubuntu
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_DB: svc_notifier_test
-          POSTGRES_USER: owner
-          POSTGRES_PASSWORD: owner
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U owner -d svc_notifier_test"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Postgres runs as a plain container (not a `services:` block) so the
+      # DB-outage scenarios can `docker pause` it by name.
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres --network host \
+            -e POSTGRES_DB=svc_notifier_test \
+            -e POSTGRES_USER=owner \
+            -e POSTGRES_PASSWORD=owner \
+            postgres:17
+          for i in {1..30}; do
+            if docker exec postgres pg_isready -U owner -d svc_notifier_test >/dev/null 2>&1; then
+              echo "Postgres up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres failed to start" >&2
+          docker logs postgres
+          exit 1
 
       # The `services:` block does not let us pass custom args, and NATS
       # JetStream requires `--jetstream`. Run it inline on the host network.
@@ -82,15 +128,10 @@ jobs:
           docker logs nats
           exit 1
 
-      - name: Install psql client
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
-
       - name: Provision Postgres roles
-        env:
-          PGPASSWORD: owner
-        run: psql -h localhost -U owner -d svc_notifier_test -f scripts/init-db.sql
+        run: docker exec -i postgres psql -U owner -d svc_notifier_test < scripts/init-db.sql
 
-      - name: Integration tests
+      - name: Behavior scenarios (e2e)
         env:
           DATABASE_URL_OWNER: postgres://owner:owner@localhost:5432/svc_notifier_test
           DATABASE_URL: postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test
@@ -98,10 +139,11 @@ jobs:
           NATS_URL: nats://localhost:4222
           PORT: "8010"
           RUST_LOG: info
-        run: cargo test --tests
+        run: cargo test --tests --no-fail-fast
 
   audit:
-    name: Security audit
+    name: cargo audit (RustSec)
+    needs: fmt
     runs-on: arc-ubuntu
     permissions:
       contents: read
@@ -121,44 +163,100 @@ jobs:
           #     reseed scenario we do not hit.
           ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0097
 
-  # ---------------------------------------------------------------------------
-  # Auto-tag: on push to main (not PR), if Cargo.toml version has no matching
-  # git tag, create it. This triggers cd.yml which publishes the image + chart.
-  # ---------------------------------------------------------------------------
-  auto-tag:
-    name: Auto-tag on version bump
-    needs: [check, integration, audit]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  deny:
+    name: cargo-deny check
+    needs: fmt
     runs-on: arc-ubuntu
-    permissions:
-      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  machete:
+    name: cargo-machete (unused deps)
+    needs: fmt
+    runs-on: arc-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - run: cargo machete
+
+  semver:
+    name: cargo semver-checks (contract)
+    needs: fmt
+    runs-on: arc-ubuntu
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Create tag if version bumped
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: semver-check br-notifier-contract against its latest release
         run: |
-          version="$(grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
-          [ -n "$version" ] || { echo "ERROR: no version in Cargo.toml"; exit 1; }
-
-          tag="v${version}"
-
-          if git tag -l "$tag" | grep -q .; then
-            echo "Tag $tag already exists — nothing to do"
+          baseline="$(git tag -l 'br-notifier-contract/v*' --sort=-v:refname | head -1)"
+          if [ -z "$baseline" ]; then
+            echo "No br-notifier-contract release tag yet — nothing to compare against."
             exit 0
           fi
+          echo "Baseline: $baseline"
+          cargo semver-checks check-release -p br-notifier-contract --baseline-rev "$baseline"
 
-          if [ ! -f CHANGELOG.md ]; then
-            echo "::warning::CHANGELOG.md missing — skipping tag"
+  changelog:
+    name: changelog entry present (per crate)
+    runs-on: arc-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: each touched crate must update its CHANGELOG
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "Not a pull request — nothing to check."
             exit 0
           fi
-          if ! grep -qE "^## ${version}( |$)" CHANGELOG.md; then
-            echo "::warning::CHANGELOG.md has no '## $version' heading — skipping tag"
-            exit 0
-          fi
+          git fetch origin "${{ github.base_ref }}" --quiet
+          changed="$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)"
+          echo "$changed"
 
-          echo "Creating tag $tag"
-          git tag "$tag"
-          git push origin "$tag"
+          fail=0
+          if echo "$changed" | grep -qE '^(src/|migrations/|charts/|Cargo\.toml|Dockerfile)' \
+            && ! echo "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "::error::svc-notifier code changed without a CHANGELOG.md entry"
+            fail=1
+          fi
+          if echo "$changed" | grep -qE '^br-notifier-contract/(src/|Cargo\.toml)' \
+            && ! echo "$changed" | grep -qx 'br-notifier-contract/CHANGELOG.md'; then
+            echo "::error::br-notifier-contract changed without a CHANGELOG.md entry"
+            fail=1
+          fi
+          exit $fail
+
+  shellcheck:
+    name: shellcheck
+    runs-on: arc-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # --severity=warning: SC1091 (info) fires on every variable-based
+      # `source` path and cannot be resolved statically — pure noise here.
+      - run: shellcheck --severity=warning scripts/*.sh scripts/lib/*.sh
+
+  secrets:
+    name: trufflehog (secret scan)
+    runs-on: arc-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --results=verified,unknown

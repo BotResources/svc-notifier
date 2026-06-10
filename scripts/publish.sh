@@ -2,11 +2,12 @@
 # publish.sh — check, build, and publish the svc-notifier container image
 # + Helm chart to GHCR.
 #
-# Source of truth for publishing is a git tag: v{version} matching Cargo.toml.
-# No tag = no publish.
+# Image-first, tag-after: the version comes from Cargo.toml and the image is
+# published BEFORE any git tag exists. CD creates the svc-notifier/v{version}
+# tag only after this script succeeds — a tag is a receipt, not a trigger.
 #
 # Modes:
-#   (default)      — full publish: tag required, checks + build + push to GHCR
+#   (default)      — full publish: checks + build + push to GHCR (no tag needed)
 #   --dry-run      — checks + native build, NO docker, NO push, NO tag required
 #   --local-image  — build a runnable Docker image for the host arch, NO push,
 #                    NO tag required, NO main-branch required, checks skipped.
@@ -56,7 +57,6 @@ done
 
 VERSION="$(crate_version)"
 IMAGE_NAME="$(crate_image)"
-TAG="v${VERSION}"
 
 # ---------------------------------------------------------------------------
 # --local-image — fast path for local iteration. Cross-compile for the host
@@ -102,24 +102,15 @@ if [ "$MODE" = "local-image" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 0: publish-only guards. The main-branch requirement and tag-existence
-# check apply only to the actual publish path. --check-only and --dry-run
-# are explicitly designed for local iteration on feature branches.
+# Step 0: publish-only guards. The main-branch requirement applies only to
+# the actual publish path (--check-only and --dry-run are for local iteration
+# on feature branches). No tag requirement: CD tags AFTER a successful
+# publish, never before (image-first, tag-after).
 # ---------------------------------------------------------------------------
 if [ "$MODE" = "publish" ]; then
     ensure_main
 
-    if ! git tag -l "$TAG" | grep -q .; then
-        error "Tag '$TAG' does not exist. Create it with: git tag $TAG && git push origin $TAG"
-    fi
-
-    # Tag must be on main
-    TAG_COMMIT="$(git rev-list -n1 "$TAG")"
-    if ! git merge-base --is-ancestor "$TAG_COMMIT" HEAD; then
-        error "Tag '$TAG' points to a commit not on main"
-    fi
-
-    # Already published?
+    # Already published? (idempotence — safe to re-run)
     if docker manifest inspect "${IMAGE_NAME}:${VERSION}" >/dev/null 2>&1; then
         info "${IMAGE_NAME}:${VERSION} already on GHCR — nothing to do"
         exit 0
