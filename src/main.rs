@@ -15,7 +15,6 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use br_core_auth::Passport;
 use br_util_axum_auth::passport_header_middleware;
-use br_util_postgres::Environment;
 use futures::StreamExt;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
@@ -42,13 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let environment = Environment::Prod;
-    let allow_insecure = false;
-
-    run_migrations(environment, allow_insecure).await?;
+    run_migrations().await?;
 
     let app_url = std::env::var("DATABASE_URL")?;
-    let app_pool = br_util_postgres::init_pool(&app_url, environment, allow_insecure).await?;
+    let app_pool = br_util_postgres::init_pool(&app_url).await?;
 
     let subscribers = Subscribers::default();
     tokio::spawn(run_listener(app_pool.clone(), subscribers.clone()));
@@ -56,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(nats_url) = std::env::var("NATS_URL") {
         let ingest_url = std::env::var("DATABASE_URL_INGEST")
             .map_err(|_| "DATABASE_URL_INGEST is required when NATS_URL is set")?;
-        let ingest_pool = ingest_pool(&ingest_url, environment, allow_insecure).await?;
+        let ingest_pool = ingest_pool(&ingest_url).await?;
         let jetstream = connect_jetstream(&nats_url).await?;
         tokio::spawn(async move {
             if let Err(error) = intake::run(jetstream, ingest_pool).await {
@@ -75,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = HttpState { schema };
     let app = Router::new()
         .route("/health", get(health))
-        .route("/schema", get(schema_sdl))
+        .route("/sdl", get(schema_sdl))
         .route("/graphql/playground", get(playground))
         .route(
             "/graphql",
@@ -96,12 +92,8 @@ fn schema_builder() -> SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> 
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
 }
 
-async fn ingest_pool(
-    url: &str,
-    environment: Environment,
-    allow_insecure: bool,
-) -> Result<PgPool, Box<dyn std::error::Error>> {
-    br_util_postgres::validate_database_tls(url, environment, allow_insecure)?;
+async fn ingest_pool(url: &str) -> Result<PgPool, Box<dyn std::error::Error>> {
+    br_util_postgres::validate_database_tls(url)?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(Duration::from_secs(3))
@@ -116,11 +108,8 @@ async fn ingest_pool(
     Ok(pool)
 }
 
-async fn run_migrations(
-    environment: Environment,
-    allow_insecure: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let owner_pool = br_util_postgres::init_migration_pool(environment, allow_insecure).await?;
+async fn run_migrations() -> Result<(), Box<dyn std::error::Error>> {
+    let owner_pool = br_util_postgres::init_migration_pool().await?;
     sqlx::migrate!("./migrations").run(&owner_pool).await?;
     owner_pool.close().await;
     Ok(())

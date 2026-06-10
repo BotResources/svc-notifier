@@ -367,6 +367,23 @@ impl ServiceInstance {
         }
     }
 
+    /// Raw GET on an arbitrary path (no Passport) — used to pin unauthenticated
+    /// HTTP-surface routes like `/sdl` and `/health`.
+    pub async fn get(&self, path: &str) -> (reqwest::StatusCode, String) {
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("{}{path}", self.base_url))
+            .send()
+            .await
+            .expect("GET request failed");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        (status, body)
+    }
+
     pub fn unread_count(value: &Value) -> i64 {
         value["data"]["notifierUnreadCount"]
             .as_i64()

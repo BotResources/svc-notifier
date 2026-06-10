@@ -51,6 +51,17 @@ spec:
               value: {{ .Values.port | quote }}
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.postgres.trustedNetworkHosts }}
+            # Per-host plaintext opt-out (see values.yaml): the lib refuses a
+            # plaintext DSN to a remote host unless its host is listed here. The
+            # CNPG service host must be declared for an intra-namespace,
+            # network-isolated, plaintext Postgres connection.
+            - name: TRUSTED_NETWORK_HOSTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

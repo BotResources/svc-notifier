@@ -30,6 +30,37 @@ async fn seed_one(ctx: &TestContext, recipient: Uuid, template: &str) -> Uuid {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn s05_sdl_route_serves_the_schema_for_the_gateway_composer() {
+    // The gateway composer polls GET {base_url}/sdl on every subgraph; serving
+    // the SDL anywhere else gets the subgraph rejected at composition. This
+    // pins the route name so a rename goes red here, not in deployment.
+    let ctx = TestContext::setup().await;
+
+    let (status, body) = ctx.instance.get("/sdl").await;
+    assert!(
+        status.is_success(),
+        "GET /sdl must return 2xx, got {status}"
+    );
+    assert!(!body.trim().is_empty(), "the SDL body must not be empty");
+    assert!(
+        body.contains("type Query") && body.contains("type Subscription"),
+        "the SDL must expose the Query and Subscription roots: {body}"
+    );
+    assert!(
+        body.contains("notifierNotificationEvents"),
+        "the SDL must carry this service's root fields: {body}"
+    );
+
+    let (legacy_status, _) = ctx.instance.get("/schema").await;
+    assert_eq!(
+        legacy_status,
+        reqwest::StatusCode::NOT_FOUND,
+        "the old /schema route is gone — one route, one truth"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn s06_rls_isolates_recipients_on_query_count_and_stream() {
     let ctx = TestContext::setup().await;
     let (owner, intruder) = (Uuid::now_v7(), Uuid::now_v7());
