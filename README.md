@@ -5,16 +5,6 @@ JetStream; svc-notifier persists one notification per recipient in PostgreSQL un
 row-level security and serves recipients through a GraphQL subgraph — list and unread
 count, ack-only mutations, and a real-time subscription stream.
 
-> **Spec status.** The service implementation has been **deliberately removed**
-> (spec-first rebuild): this repository currently ships the published-language
-> crate, this README, and a red end-to-end scenario suite — `src/main.rs` is a
-> stub. **Everything below describes the contract to build**, and the scenario
-> suite is its executable form; nothing is implemented until that suite is
-> green. `**[target]**` markers survive only as hints of where the contract
-> differs from the pre-rebuild implementation. The markers and this banner
-> disappear when the implementation lands — a README claim that silently
-> diverges from the code is treated as a bug, not a detail.
-
 ## Architecture
 
 ```
@@ -23,24 +13,24 @@ producers ──notifier.cmd.notification.deliver.v1──▶ NATS JetStream
                                                         ▼
                                                   PostgreSQL (RLS)  ◀── the single
                                                         │               source of truth
-                                          [target] pg_notify on commit
+                                                   pg_notify on commit
                                                         ▼
 recipients ◀──GraphQL: queries / mutations / subscription stream──┘
 ```
 
 - **Intake (NATS JetStream)** — a durable pull consumer (`consumer.messages()`, no
-  polling) fans each deliver command out to one row per recipient. It consumes the
-  subject `notify.deliver` today; **[target]** it consumes
-  `notifier.cmd.notification.deliver.v1` only, and nothing listens on the legacy
-  subject. The consumer currently creates the `NOTIFY` stream if it is absent; treat
-  the stream as deployment-provisioned infrastructure regardless.
+  polling) fans each deliver command out to one row per recipient. It consumes
+  `notifier.cmd.notification.deliver.v1` only; nothing listens on the legacy
+  `notify.deliver` subject. The `NOTIFY` stream is treated as
+  deployment-provisioned infrastructure — the service binds to it and never
+  creates it.
 - **Truth (PostgreSQL)** — notifications live in one table, deduplicated by
   `(source_event_id, recipient_id)`, protected by forced row-level security.
 - **Surface (GraphQL subgraph)** — recipient-facing, composed behind a gateway.
   Root fields are prefixed `notifier*`.
-- **Realtime** — today the NATS consumer pushes new notifications to in-process
-  subscriber channels. **[target]** All pushes derive from committed PostgreSQL state
-  via `LISTEN/NOTIFY` (see "Realtime architecture").
+- **Realtime** — every push derives from committed PostgreSQL state via
+  `LISTEN/NOTIFY` (see "Realtime architecture"); no in-process broadcast from the
+  writer.
 
 ## The published language — `br-notifier-contract`
 
@@ -49,8 +39,8 @@ This repository is a two-crate workspace: the `svc-notifier` service and
 The contract crate is owned by the receiver (this service), versioned and tagged
 independently, and is what producers depend on — never on the service crate.
 
-- Subject: `DELIVER_SUBJECT` = `notifier.cmd.notification.deliver.v1` **[target:
-  the service still consumes `notify.deliver` today]**.
+- Subject: `DELIVER_SUBJECT` = `notifier.cmd.notification.deliver.v1` — the only
+  subject the service consumes.
 - Command: `DeliverNotification { source_event_id, recipient_ids, template, payload,
   link: Option<RelativeLink> }`. Producers serialize it with serde and publish it on
   the subject — no helper needed, and the contract crate stays free of any NATS
@@ -84,12 +74,17 @@ Wire format (pinned by a round-trip test in the contract crate):
 - **Empty `recipient_ids`**: a no-op; the message is acked.
 - **Malformed message** (not valid JSON for the command): acked with an error log —
   never NAKed, so a poison message cannot cause a redelivery storm. Nothing is persisted.
-- **[target] Invalid `link`**: the whole message is rejected fail-closed — acked with
-  an error log, zero rows persisted (no partial fan-out), nothing reaches any recipient.
+- **Invalid `link`**: the whole message is rejected fail-closed — the command fails to
+  deserialize (the contract's `RelativeLink` rejects an unsafe link), so it takes the
+  malformed-message path: acked with an error log, zero rows persisted (no partial
+  fan-out), nothing reaches any recipient.
 - **Database failure mid-batch**: the message is NAKed and redelivered (up to the
   consumer's `max_deliver`, currently 5). Redelivery completes the remaining
   recipients; already-inserted recipients are not duplicated (the dedup constraint
-  makes the fan-out idempotent).
+  makes the fan-out idempotent). The final delivery the budget allows is the
+  give-up slot: it is terminated without a further write attempt, so an exhausted
+  command is cleanly dropped — no late write lands after recovery, and the
+  documented recovery is the producer re-emitting the same `source_event_id`.
 
 `template` is a routing/rendering key and `payload` is producer data. The service
 validates neither against an allowed list or schema today (see "Open questions");
@@ -108,8 +103,8 @@ only ever see or touch their own notifications.
   newest-first pagination (`nodes`, `hasNextPage`).
 - `notifierUnreadCount: Int!`
 
-The notification type carries `id`, `template`, `payload`, `readAt`, `createdAt`
-**[target: plus `link`]**.
+The notification type carries `id`, `template`, `payload`, `link`, `readAt`,
+`createdAt`.
 
 ### Mutations — ack-only
 
@@ -124,17 +119,15 @@ into its snapshot instead of refetching.
 - `notifierDeleteNotification(notificationId: ID!): Boolean!` — hard delete today
   (hard vs soft is an open question — see "Open questions"; the bulk variant below
   inherits whatever is decided); `NOT_FOUND` under the same rule as above.
-- **[target]** `notifierDeleteNotifications(ids: [ID!]!): Boolean!` — bulk delete.
+- `notifierDeleteNotifications(ids: [ID!]!): Boolean!` — bulk delete.
   Ids not owned by the caller are invisible to it, hence untouched — contractually:
   they are silently skipped, the mutation acks, and they are absent from the emitted
   event. Foreign ids can never be probed through this mutation.
 
 ### Subscription
 
-- Today: `notifierNotificationAdded: Notification!` — new notifications only. A
-  change made in one session (e.g. mark-as-read) does **not** reach other sessions.
-- **[target]** `notifierNotificationEvents: NotifierNotificationEvent!` — the full
-  notification event union, bulk-shaped, replacing `notifierNotificationAdded`:
+- `notifierNotificationEvents: NotifierNotificationEvent!` — the full notification
+  event union, bulk-shaped:
 
   ```graphql
   union NotifierNotificationEvent =
@@ -169,7 +162,7 @@ This is not an edge case: every deploy restarts the single service instance
 (`Recreate` strategy), so every live subscription drops and reconnects on every
 release. Frontends must implement this protocol, not treat reconnection as an error.
 
-## Realtime architecture **[target]**
+## Realtime architecture
 
 PostgreSQL is the single source of truth; the subscription stream is **fed by PG
 `LISTEN/NOTIFY`**, never by an in-process broadcast from the writer:
@@ -209,7 +202,7 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
 - **`template` and `payload` are untrusted producer data.** Render them as data —
   never HTML-interpolate them, never treat `template` as a path or a format string.
 - **`link` is the only navigable field** and is constrained by `RelativeLink` to a
-  same-domain relative URL, validated fail-closed at intake **[target]** and at the
+  same-domain relative URL, validated fail-closed at intake and at the
   type level in the contract crate. Frontends should still bind it to router
   navigation, not to raw `href` interpolation.
 - **One-shot secrets do not exist here**: notifications must never carry secrets;
@@ -286,10 +279,8 @@ docker compose -f docker-compose.test.yml up -d
 cargo test --tests --no-fail-fast
 ```
 
-**[target]** Scenarios pinning target behavior fail red until the
-implementation lands — red is the expected state of this suite between the
-spec and the implementation; making it green is the implementation's
-definition of done.
+The scenario suite is the service's definition of done: it passes green
+against the real harness.
 
 ## Versioning & release
 

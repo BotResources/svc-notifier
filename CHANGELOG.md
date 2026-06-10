@@ -5,66 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.3.0
+
+The from-scratch rebuild: the service is reimplemented against the README
+contract and the e2e scenario suite, which now passes green against real
+Postgres and real NATS JetStream. Built in the single-crate "fatty" manner —
+capability files (`notification`, `intake`, `graphql`, `realtime`) with types,
+SQL, resolvers and IO inline, no hexagonal layering.
 
 ### Added
 - `br-notifier-contract` 0.1.0 — the service's published language, as a sibling
   workspace crate with its own version, changelog and tag line. Producers
-  depend on it instead of hand-rolling the deliver payload. The service does not
-  consume it yet — that lands with the subject migration. See
-  `br-notifier-contract/CHANGELOG.md`.
-- The e2e suite is rewritten as named behavior scenarios
-  (`tests/scenarios_*.rs`), each pinning the three external envelopes (NATS
-  ack/NAK/redelivery + consumer state, exact PG rows via a dedicated assertion
-  connection, the GraphQL view of a forged Passport). New coverage: dedup
-  first-wins as contract, fail-closed link rejection, legacy-subject
-  retirement, DB-outage NAK/recovery/exhaustion, partial-redelivery
-  idempotence, cross-session read/delete propagation, single bulk event for
-  `markAllAsRead`, bulk delete RLS semantics, reconnect
-  (subscribe-then-snapshot), and a two-instance scenario proving pushes derive
-  from committed PG state. Scenarios pinning target behavior fail red until
-  the implementation lands (spec-first).
+  depend on it instead of hand-rolling the deliver payload. The service now
+  consumes it: intake deserializes `DeliverNotification` straight from the
+  contract type. See `br-notifier-contract/CHANGELOG.md`.
+- **Intake** — a durable JetStream pull consumer (`consumer.messages()`, no
+  polling) bound to the deployment-provisioned `NOTIFY` stream, filtering the
+  contract subject `notifier.cmd.notification.deliver.v1` only. One command
+  fans out one row per recipient in a single transaction; dedup is
+  first-wins on `(source_event_id, recipient_id)` via `ON CONFLICT DO NOTHING`.
+  A malformed message — including a command whose `link` the contract rejects
+  fail-closed — is acked with an error log and never persisted. A database
+  failure NAKs for redelivery (`max_deliver` 5); the budget's final slot is
+  terminated without a write attempt, so an exhausted command is cleanly
+  dropped and no late write lands after recovery.
+- **GraphQL surface** — `notifier`-prefixed root fields: `notifierNotifications`
+  (newest-first pagination), `notifierUnreadCount`, ack-only mutations
+  (`notifierMarkAsRead`, `notifierMarkAllAsRead`, `notifierDeleteNotification`,
+  `notifierDeleteNotifications`), and the `notifierNotificationEvents`
+  subscription (the `NotifierNotificationEvent` union: `NotificationAdded`,
+  `NotificationsRead`, `NotificationsDeleted`). Mutations return verdicts, never
+  state; `NOT_FOUND`/`FORBIDDEN`/`BAD_REQUEST` carry a stable `code` extension.
+  Served over SSE on `POST /graphql` with `Accept: text/event-stream`.
+- **Realtime via PG `LISTEN/NOTIFY`** — every write emits `pg_notify` in the
+  same transaction as the state it announces; a per-instance listener re-reads
+  committed rows and routes typed events to that recipient's in-process
+  subscriptions. Correctness is replica-count-independent (proven by the
+  two-instance scenario).
+- **Authorization** — Passport middleware (401 on missing/malformed header);
+  resolvers open a transaction-local RLS context (`br_util_postgres`) so a
+  recipient only ever sees or touches their own rows; `FORCE`d RLS with two
+  least-privilege roles (`svc_notifier_app` user-scoped, `svc_notifier_ingest`
+  insert + RETURNING). Service passports are refused (never a recipient).
+- **Migrations** run at startup under the owner role, which then closes; the
+  migration grants the two runtime roles their least-privilege access.
 - `deny.toml` + cargo-deny, cargo-machete, cargo-semver-checks (contract
   crate), per-crate changelog check, shellcheck and trufflehog jobs in CI,
   aligned with the platform CI standard.
 - `scripts/setup-branch-protection.sh` — declarative required-checks
   management for `main`; the e2e job is a required check.
+- The e2e suite is rewritten as named behavior scenarios
+  (`tests/scenarios_*.rs`), each pinning the three external envelopes (NATS
+  ack/NAK/redelivery + consumer state, exact PG rows via a dedicated assertion
+  connection, the GraphQL view of a forged Passport). Coverage: dedup
+  first-wins as contract, fail-closed link rejection, legacy-subject
+  retirement, DB-outage NAK/recovery/exhaustion, partial-redelivery
+  idempotence, cross-session read/delete propagation, single bulk event for
+  `markAllAsRead`, bulk delete RLS semantics, reconnect
+  (subscribe-then-snapshot), and a two-instance scenario proving pushes derive
+  from committed PG state.
 
 ### Changed
+- Repository converted to a two-crate Cargo workspace (`svc-notifier` +
+  `br-notifier-contract`); root-level cargo commands cover both via
+  `default-members`.
+- sqlx uses the `tls-rustls` backend, dropping the `rsa`/`native-tls` chain.
+- Chart `br-svc-notifier`: declares `strategy.type: Recreate`, ships default
+  `node.kubernetes.io/unreachable` and `node.kubernetes.io/not-ready`
+  tolerations (NoExecute, 30s) for a fast reschedule, and keeps `replicaCount`
+  a knob defaulting to 1. `appVersion`/`version` bumped to 0.3.0.
+- README rewritten as the service's contract, with every `[target]` marker and
+  the spec-status banner removed now that the implementation matches: SSE on
+  `POST /graphql` (no WebSocket route), `DATABASE_URL_INGEST` documented, fixed
+  role names, the `link` field, the subscription event union, bulk delete and
+  `LISTEN/NOTIFY` realtime are all live.
 - CI triggers on `pull_request` only (plus `workflow_dispatch`), with a
-  `cargo fmt` auto-fix gate fronting every Rust job — no more double runs,
-  no CI on pushes to `main`.
+  `cargo fmt` auto-fix gate fronting every Rust job.
 - CD is restructured image-first/tag-after: `detect-bump` (per crate) →
   publish image + chart → create `{crate}/v{version}` tag + GitHub Release.
-  The auto-tag job moves out of CI into CD; `publish.sh` no longer requires a
-  pre-existing tag (the tag is created after a successful publish, never
-  before). The contract crate is released as a tag only.
+  The contract crate is released as a tag only.
 - Direct-SQL test seeding is removed: every scenario seeds through the real
   NATS intake.
 - `scripts/lib/*.sh` pass shellcheck (`cd` failure guards, exported
   `CRATE_NAME`).
 
-### Changed
-- Repository converted to a two-crate Cargo workspace (`svc-notifier` +
-  `br-notifier-contract`). The service crate is unchanged; root-level cargo
-  commands cover both crates via `default-members`.
-- README rewritten as the service's contract: target-state sections are explicitly
-  marked `[target]` until the implementation lands (subject migration, `link`,
-  subscription event union, bulk delete, LISTEN/NOTIFY realtime).
-- README now matches the code where it previously did not: subscriptions are served
-  over SSE on `POST /graphql` (there is no `/graphql/ws` WebSocket route), the
-  required `DATABASE_URL_INGEST` variable is documented, and the unread `APP_ROLE`
-  variable is gone (role names are fixed: `svc_notifier_app`, `svc_notifier_ingest`).
-
 ### Removed
 - `docs/domain.md` — its staged hexagonal plan is superseded; the notification
   lifecycle and behavior inventory it carried are absorbed into the README (its
   open questions on delete semantics and template allow-listing survive there).
-- **The entire service implementation** (`src/`, `migrations/`) — deliberately:
-  the repository becomes a spec-first playground for a from-scratch rebuild.
-  The README and the red e2e scenario suite are the contract; `src/main.rs` is
-  a stub that exits non-zero. Runtime dependencies were cleared with it — the
-  test harness keeps its own dev-dependencies.
 
 ## 0.2.0
 
