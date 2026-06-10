@@ -4,40 +4,30 @@ default-members = [".", "br-notifier-contract"]
 
 [package]
 name = "svc-notifier"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 description = "Standalone notification service — NATS intake, GraphQL API, RLS, real-time subscriptions"
 repository = "https://github.com/BotResources/svc-notifier"
 
+# The implementation has been deliberately removed: this crate is a stub.
+# The README and the e2e scenario suite (tests/) are the contract to build.
+# Runtime dependencies are the implementer's choice; the [dev-dependencies]
+# below belong to the test harness, not to the future implementation.
 [dependencies]
-# All three crates share one git source (single repo-wide `tag`) so Cargo
-# deduplicates the transitive `br-core-auth`. Per-crate tags resolve to
-# different commits and would produce distinct sources.
-br-core-auth      = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth",      tag = "v0.4.0" }
-br-util-postgres  = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-postgres",  tag = "v0.4.0" }
-br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.4.0" }
-
-axum = "0.8"
-async-graphql = { version = "7", features = ["uuid", "chrono"] }
-async-graphql-axum = "7"
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "json", "uuid", "chrono", "macros", "migrate"] }
-async-nats = "0.48"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v7"] }
-chrono = { version = "0.4", features = ["serde"] }
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dotenvy = "0.15"
-futures = "0.3"
-tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 br-notifier-contract = { path = "br-notifier-contract" }
-reqwest = { version = "0.12", features = ["json", "stream"] }
-serial_test = "3"
+br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.4.0" }
+async-nats = "0.48"
 bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde_json = "1"
+serial_test = "3"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "json", "uuid", "chrono", "macros", "migrate"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v7"] }

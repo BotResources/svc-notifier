@@ -60,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/domain.md` — its staged hexagonal plan is superseded; the notification
   lifecycle and behavior inventory it carried are absorbed into the README (its
   open questions on delete semantics and template allow-listing survive there).
+- **The entire service implementation** (`src/`, `migrations/`) — deliberately:
+  the repository becomes a spec-first playground for a from-scratch rebuild.
+  The README and the red e2e scenario suite are the contract; `src/main.rs` is
+  a stub that exits non-zero. Runtime dependencies were cleared with it — the
+  test harness keeps its own dev-dependencies.
 
 ## 0.2.0
 

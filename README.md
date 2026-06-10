@@ -5,12 +5,15 @@ JetStream; svc-notifier persists one notification per recipient in PostgreSQL un
 row-level security and serves recipients through a GraphQL subgraph — list and unread
 count, ack-only mutations, and a real-time subscription stream.
 
-> **Spec status.** This README is the service's contract, parts of it written ahead of
-> the code on purpose: the work is sequenced contract → failing end-to-end specs →
-> implementation. Anything marked **[target]** is specified but **not implemented yet**;
-> unmarked statements describe current behavior. The markers disappear as the
-> implementation lands — a README claim that silently diverges from the code is
-> treated as a bug, not a detail.
+> **Spec status.** The service implementation has been **deliberately removed**
+> (spec-first rebuild): this repository currently ships the published-language
+> crate, this README, and a red end-to-end scenario suite — `src/main.rs` is a
+> stub. **Everything below describes the contract to build**, and the scenario
+> suite is its executable form; nothing is implemented until that suite is
+> green. `**[target]**` markers survive only as hints of where the contract
+> differs from the pre-rebuild implementation. The markers and this banner
+> disappear when the implementation lands — a README claim that silently
+> diverges from the code is treated as a bug, not a detail.
 
 ## Architecture
 
