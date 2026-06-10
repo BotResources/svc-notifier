@@ -118,8 +118,9 @@ into its snapshot instead of refetching.
   already-read notification acks `true`. An id that does not exist *for the caller*
   (foreign or unknown — RLS makes them indistinguishable) is a `NOT_FOUND` error.
 - `notifierMarkAllAsRead: Boolean!`
-- `notifierDeleteNotification(notificationId: ID!): Boolean!` — hard delete;
-  `NOT_FOUND` under the same rule as above.
+- `notifierDeleteNotification(notificationId: ID!): Boolean!` — hard delete today
+  (hard vs soft is an open question — see "Open questions"; the bulk variant below
+  inherits whatever is decided); `NOT_FOUND` under the same rule as above.
 - **[target]** `notifierDeleteNotifications(ids: [ID!]!): Boolean!` — bulk delete.
   Ids not owned by the caller are invisible to it, hence untouched — contractually:
   they are silently skipped, the mutation acks, and they are absent from the emitted
