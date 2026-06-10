@@ -6,6 +6,10 @@ metadata:
     {{- include "br-svc-notifier.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "br-svc-notifier.selectorLabels" . | nindent 6 }}
@@ -60,7 +64,8 @@ spec:
             {{- if .Values.nats.url }}
             # DATABASE_URL_INGEST, NATS_URL and the NATS_USER/NATS_PASSWORD
             # credentials are only consumed by the NATS intake path
-            # (src/main.rs guards them behind `if let Some(nats_url)`).
+            # (src/main.rs spawns intake only when NATS_URL is set, and reads
+            # DATABASE_URL_INGEST inside that branch).
             # Keep the whole block under a single nats.url gate so that a
             # GraphQL-only deployment (nats.url empty) never references
             # the ingest Postgres key or a NATS credentials Secret —

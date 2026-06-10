@@ -23,6 +23,6 @@ tool (ExternalSecrets, Sealed Secrets, kubectl, etc.).
 {{- if not .Values.nats.url }}
 
 NOTE: nats.url is empty — svc-notifier will start without NATS intake. The
-GraphQL API and SSE subscriptions still work, but inbound notifications
-published on notify.deliver will be ignored.
+GraphQL API and SSE subscriptions still work, but inbound deliver commands
+published on notifier.cmd.notification.deliver.v1 will be ignored.
 {{- end }}
