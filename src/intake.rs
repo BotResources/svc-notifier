@@ -11,18 +11,9 @@ use crate::notification::insert_notification;
 const STREAM_NAME: &str = "NOTIFY";
 const DURABLE_NAME: &str = "svc-notifier";
 const MAX_DELIVER: i64 = 5;
-/// How long a delivered message may stay unacked before JetStream redelivers
-/// it. Kept short so a write blocked on a database outage is retried promptly
-/// and the redelivery budget is spent within a recovery window, not minutes.
 const ACK_WAIT: Duration = Duration::from_secs(5);
-/// Delay before a NAKed message is redelivered — a brief backoff that still
-/// lets the budget run out quickly during a sustained outage.
 const NAK_DELAY: Duration = Duration::from_secs(1);
 
-/// Bind the durable pull consumer to the deployment-provisioned `NOTIFY`
-/// stream — the stream itself is never created here — and run the intake loop
-/// for the lifetime of the process. Returns once the stream or consumer cannot
-/// be obtained, which fails the service loud at startup.
 pub async fn run(jetstream: jetstream::Context, ingest_pool: PgPool) -> Result<(), IntakeError> {
     let stream = jetstream
         .get_stream(STREAM_NAME)
@@ -30,17 +21,14 @@ pub async fn run(jetstream: jetstream::Context, ingest_pool: PgPool) -> Result<(
         .map_err(|e| IntakeError::Stream(e.to_string()))?;
 
     let consumer: PullConsumer = stream
-        .get_or_create_consumer(
-            DURABLE_NAME,
-            jetstream::consumer::pull::Config {
-                durable_name: Some(DURABLE_NAME.to_string()),
-                filter_subject: DELIVER_SUBJECT.to_string(),
-                ack_policy: jetstream::consumer::AckPolicy::Explicit,
-                max_deliver: MAX_DELIVER,
-                ack_wait: ACK_WAIT,
-                ..Default::default()
-            },
-        )
+        .create_consumer_strict(jetstream::consumer::pull::Config {
+            durable_name: Some(DURABLE_NAME.to_string()),
+            filter_subject: DELIVER_SUBJECT.to_string(),
+            ack_policy: jetstream::consumer::AckPolicy::Explicit,
+            max_deliver: MAX_DELIVER,
+            ack_wait: ACK_WAIT,
+            ..Default::default()
+        })
         .await
         .map_err(|e| IntakeError::Consumer(e.to_string()))?;
 
@@ -63,16 +51,6 @@ pub async fn run(jetstream: jetstream::Context, ingest_pool: PgPool) -> Result<(
     Ok(())
 }
 
-/// One message. A command that cannot be decoded (malformed JSON, or an unsafe
-/// link the contract rejects fail-closed) is acked with an error log and never
-/// persisted — a poison message must not trigger a redelivery storm. A valid
-/// command fans out one row per recipient in a single transaction; a database
-/// failure NAKs so the message is redelivered, and the dedup constraint makes
-/// the fan-out idempotent across that redelivery. The final delivery permitted
-/// by `max_deliver` is the budget's last slot: it is terminated without a
-/// write attempt, so an exhausted command is cleanly dropped (recovery is the
-/// producer re-emitting the same `source_event_id`) and no late write can land
-/// after the budget is spent.
 async fn handle(pool: &PgPool, message: &jetstream::Message) {
     let command: DeliverNotification = match serde_json::from_slice(&message.payload) {
         Ok(command) => command,

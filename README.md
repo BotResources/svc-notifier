@@ -23,7 +23,11 @@ recipients ◀──GraphQL: queries / mutations / subscription stream──┘
   `notifier.cmd.notification.deliver.v1` only; nothing listens on the legacy
   `notify.deliver` subject. The `NOTIFY` stream is treated as
   deployment-provisioned infrastructure — the service binds to it and never
-  creates it.
+  creates it. The **durable consumer is declared by the service at boot**, with
+  its delivery contract (`filter_subject`, `max_deliver`, `ack_wait`, explicit
+  ack) reconciled fail-loud: a consumer already present with a *different* config
+  aborts startup rather than running on a silently divergent contract (see "Infra
+  debt" below).
 - **Truth (PostgreSQL)** — notifications live in one table, deduplicated by
   `(source_event_id, recipient_id)`, protected by forced row-level security.
 - **Surface (GraphQL subgraph)** — recipient-facing, composed behind a gateway.
@@ -169,11 +173,18 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
 
 - Every write path (NATS intake, mutations) emits `pg_notify` **in the same
   transaction** as the write. The signal therefore fires on commit only — uncommitted
-  or rolled-back state can never be pushed — and carries only event type, recipient
-  and ids (small, far under the NOTIFY payload limit).
-- Each service instance runs a PG listener, re-reads the affected rows from
-  PostgreSQL to build the client event (what is pushed is what the truth says), and
-  routes it to its local subscription connections.
+  or rolled-back state can never be pushed — and carries event type, recipient,
+  ids, and the `read_at` timestamp on a read fact (small, far under the NOTIFY
+  payload limit). The read fact carries `read_at` directly so the listener never
+  re-reads to learn it.
+- Each service instance runs a PG listener under the `svc_notifier_app` role
+  (the always-present application connection — an instance without NATS still
+  feeds its subscribers from PostgreSQL). For an `Added` fact it re-reads the new
+  row from PostgreSQL to build the client event (what is pushed is what the truth
+  says); the re-read runs in a transaction scoped to the signal's recipient, so it
+  obeys the same row-level-security policy as every user-facing read — the listener
+  has no privileged, RLS-bypassing read path. The event is then routed to that
+  recipient's local subscription connections.
 - The only in-process state is the strictly per-connection registry of open
   subscriptions. Correctness is therefore replica-count-independent: a write handled
   by one instance reaches subscribers connected to any instance.
@@ -192,10 +203,14 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
   table owner cannot bypass it.
 - **Two runtime PostgreSQL roles, least privilege**:
-  - `svc_notifier_app` — GraphQL resolvers; user-scoped by the RLS policies above.
+  - `svc_notifier_app` — GraphQL resolvers *and* the realtime listener's row
+    re-reads; user-scoped by the RLS policies above. The listener scopes its
+    re-read to the signal's recipient, so it reads exactly the rows that recipient
+    could read — no role bypasses RLS at runtime.
   - `svc_notifier_ingest` — the NATS consumer (a system component, not a user);
     INSERT plus the SELECT needed for `RETURNING`, no user-scoped read path.
-  - Migrations run at startup under a separate owner role, then that pool closes.
+  - Migrations run at startup under a separate owner role, then that pool closes;
+    the owner role is never used for a runtime read.
 
 ## Security notes
 
@@ -312,6 +327,19 @@ No manual tagging, no manual image/chart push.
 
 Local pipeline: `./scripts/publish.sh --check-only` (fmt, clippy, unit tests, helm
 lint), `--local-image`, `--dry-run` — see the script header.
+
+## Infra debt
+
+- **The durable consumer is declared by the service, not by the deployment.**
+  Doctrine prefers declared-by-deployment infrastructure with the service binding
+  fail-loud (`get_consumer`). Today the service still creates the consumer at boot,
+  because the test harness recreates the stream per scenario and does not declare a
+  consumer. The mitigation is that creation is **declarative and reconciled**:
+  `create_consumer_strict` either creates the consumer with the exact delivery
+  config or, if one already exists with a *different* config, fails startup — there
+  is no silent config drift. Moving the consumer declaration into the deployment
+  (and flipping the bind to `get_consumer`) is owed; until then this is the
+  defensible middle.
 
 ## Open questions
 

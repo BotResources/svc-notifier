@@ -13,6 +13,35 @@ Postgres and real NATS JetStream. Built in the single-crate "fatty" manner —
 capability files (`notification`, `intake`, `graphql`, `realtime`) with types,
 SQL, resolvers and IO inline, no hexagonal layering.
 
+### Fixed (code review)
+- **Realtime listener now reads under RLS, never via a privileged role.** The
+  listener's row re-reads ran on the migrations owner pool, which under `FORCE`
+  row-level security has no applicable policy — it returned zero rows on any
+  non-superuser owner (i.e. CNPG production), silently dropping every `Added`
+  push. The listener now runs on the `svc_notifier_app` pool and scopes each
+  re-read to the signal's recipient, obeying the same policy as a user-facing
+  read; it works on an instance running without NATS (no ingest role available).
+- **`Read` signal carries `read_at`.** The read fact now ships the exact
+  `read_at` the write committed, eliminating a second listener re-read and the
+  fabricated `Utc::now()` fallback that could push a wrong timestamp.
+- **Durable consumer creation is reconciled fail-loud.** Intake switched from
+  `get_or_create_consumer` (which silently tolerates a divergent delivery config)
+  to `create_consumer_strict`: the consumer is created with the exact config or
+  startup aborts if one exists with a different config. The remaining
+  deployment-vs-service ownership gap is recorded under README "Infra debt".
+- **GraphQL errors speak codes, not language, and never leak sqlx.** Error
+  messages are now the stable code itself (the `code` extension is unchanged);
+  the database-error path logs server-side and returns only `INTERNAL`, no longer
+  interpolating the raw sqlx message (column/constraint names) into the response.
+- **RLS context bound to the resolved caller.** `scoped_tx` sets
+  `app.current_user_id` from the typed `Recipient` resolved at the entry point
+  rather than re-reading the Passport, making "the row touched belongs to the
+  authenticated caller" a fact carried by the type.
+- Removed the SDL-rendering placeholder pool (the `schema` subcommand builds the
+  schema without runtime data) and all source doc-comments (the fatty manner
+  keeps intent in names, types and this README). Migration drops `IF NOT EXISTS`
+  on the objects it owns (table + indexes), keeping `DROP POLICY IF EXISTS`.
+
 ### Added
 - `br-notifier-contract` 0.1.0 — the service's published language, as a sibling
   workspace crate with its own version, changelog and tag line. Producers

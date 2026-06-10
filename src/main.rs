@@ -6,7 +6,7 @@ mod realtime;
 use std::time::Duration;
 
 use async_graphql::http::GraphiQLSource;
-use async_graphql::{Request, Schema};
+use async_graphql::{Request, Schema, SchemaBuilder};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -38,8 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     if std::env::args().nth(1).as_deref() == Some("schema") {
-        let schema = build_schema(placeholder_state());
-        println!("{}", schema.sdl());
+        println!("{}", schema_builder().finish().sdl());
         return Ok(());
     }
 
@@ -51,12 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_url = std::env::var("DATABASE_URL")?;
     let app_pool = br_util_postgres::init_pool(&app_url, environment, allow_insecure).await?;
 
-    let owner_url = std::env::var("DATABASE_URL_OWNER").unwrap_or_else(|_| app_url.clone());
-    let listener_pool =
-        br_util_postgres::init_pool(&owner_url, environment, allow_insecure).await?;
-
     let subscribers = Subscribers::default();
-    tokio::spawn(run_listener(listener_pool, subscribers.clone()));
+    tokio::spawn(run_listener(app_pool.clone(), subscribers.clone()));
 
     if let Ok(nats_url) = std::env::var("NATS_URL") {
         let ingest_url = std::env::var("DATABASE_URL_INGEST")
@@ -70,10 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let schema = build_schema(AppState {
-        app_pool,
-        subscribers,
-    });
+    let schema = schema_builder()
+        .data(AppState {
+            app_pool,
+            subscribers,
+        })
+        .finish();
 
     let state = HttpState { schema };
     let app = Router::new()
@@ -95,28 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn build_schema(state: AppState) -> NotifierSchema {
+fn schema_builder() -> SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
-        .data(state)
-        .finish()
 }
 
-/// State carrying an unconnected pool, used only to render the SDL for the
-/// `schema` subcommand without touching any infrastructure.
-fn placeholder_state() -> AppState {
-    AppState {
-        app_pool: PgPool::connect_lazy("postgres://localhost/_sdl_only")
-            .expect("lazy pool for SDL rendering"),
-        subscribers: Subscribers::default(),
-    }
-}
-
-/// Pool for the NATS consumer. A short acquire timeout plus a per-connection
-/// `statement_timeout` make a write fail fast during a database outage —
-/// whether the connection is unavailable or a query hangs on a frozen server —
-/// so the redelivery budget is spent (and the command dropped or recovered)
-/// within a recovery window, never landing as a late write after the budget is
-/// exhausted.
 async fn ingest_pool(
     url: &str,
     environment: Environment,
@@ -173,10 +152,6 @@ async fn playground() -> Html<String> {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
-/// Queries, mutations and SSE subscriptions on one POST endpoint, behind the
-/// passport middleware. `Accept: text/event-stream` selects the subscription
-/// stream; the Passport extension is injected into the GraphQL request so the
-/// resolvers can authorize and scope RLS.
 async fn graphql_handler(
     State(state): State<HttpState>,
     Extension(passport): Extension<Passport>,

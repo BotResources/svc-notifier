@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS notifications (
+CREATE TABLE notifications (
     id              UUID PRIMARY KEY,
     source_event_id UUID NOT NULL,
     recipient_id    UUID NOT NULL,
@@ -9,10 +9,10 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS notifications_source_recipient_uniq
+CREATE UNIQUE INDEX notifications_source_recipient_uniq
     ON notifications (source_event_id, recipient_id);
 
-CREATE INDEX IF NOT EXISTS notifications_recipient_created_idx
+CREATE INDEX notifications_recipient_created_idx
     ON notifications (recipient_id, created_at DESC, id DESC);
 
 ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;

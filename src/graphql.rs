@@ -8,7 +8,6 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use br_core_auth::Passport;
-use br_util_postgres::set_rls_context;
 
 use crate::notification::{
     Notification, delete_notifications, list_notifications, mark_all_as_read, mark_as_read,
@@ -21,24 +20,22 @@ pub struct AppState {
     pub subscribers: Subscribers,
 }
 
-/// A `Human` caller, the only identity notifications are scoped to. Resolving
-/// it binds every operation to the authenticated recipient before any row is
-/// touched; a `Service` passport (never a recipient) is refused.
 struct Recipient(Uuid);
 
 fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
     match ctx.data::<Passport>()? {
         Passport::Human { user_id, .. } => Ok(Recipient(*user_id)),
-        Passport::Service { .. } => Err(coded("FORBIDDEN", "notifications are recipient-scoped")),
+        Passport::Service { .. } => Err(coded("FORBIDDEN")),
     }
 }
 
-fn coded(code: &str, message: &str) -> Error {
-    Error::new(message.to_string()).extend_with(|_, e| e.set("code", code))
+fn coded(code: &str) -> Error {
+    Error::new(code.to_string()).extend_with(|_, e| e.set("code", code))
 }
 
 fn db_error(error: sqlx::Error) -> Error {
-    coded("INTERNAL", &format!("database error: {error}"))
+    tracing::error!(%error, "database error");
+    coded("INTERNAL")
 }
 
 #[derive(SimpleObject)]
@@ -145,7 +142,7 @@ impl MutationRoot {
                 tx.commit().await.map_err(db_error)?;
                 Ok(true)
             }
-            None => Err(coded("NOT_FOUND", "notification not found")),
+            None => Err(coded("NOT_FOUND")),
         }
     }
 
@@ -171,7 +168,7 @@ impl MutationRoot {
             .await
             .map_err(db_error)?;
         if deleted.is_empty() {
-            return Err(coded("NOT_FOUND", "notification not found"));
+            return Err(coded("NOT_FOUND"));
         }
         tx.commit().await.map_err(db_error)?;
         Ok(true)
@@ -193,9 +190,6 @@ pub struct SubscriptionRoot;
 
 #[Subscription]
 impl SubscriptionRoot {
-    /// Every committed state change of the caller's notifications. A `Service`
-    /// passport (never a recipient) yields an immediately-completing empty
-    /// stream rather than an error — an async-graphql SSE constraint.
     async fn notifier_notification_events(
         &self,
         ctx: &Context<'_>,
@@ -235,12 +229,15 @@ fn into_union(event: ClientEvent) -> NotifierNotificationEvent {
 
 async fn scoped_tx<'a>(
     ctx: &Context<'a>,
-    _caller: &Recipient,
+    caller: &Recipient,
 ) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
     let state = ctx.data::<AppState>()?;
-    let passport = ctx.data::<Passport>()?;
     let mut tx = state.app_pool.begin().await.map_err(db_error)?;
-    set_rls_context(&mut tx, passport).await.map_err(db_error)?;
+    sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+        .bind(caller.0.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
     Ok(tx)
 }
 
@@ -252,5 +249,5 @@ fn parse_id(id: Option<ID>) -> Result<Option<Uuid>> {
 }
 
 fn require_id(id: &ID) -> Result<Uuid> {
-    Uuid::parse_str(id.as_str()).map_err(|_| coded("BAD_REQUEST", "malformed notification id"))
+    Uuid::parse_str(id.as_str()).map_err(|_| coded("BAD_REQUEST"))
 }
