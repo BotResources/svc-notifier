@@ -12,6 +12,15 @@ imagePullSecrets: []
 
 replicaCount: 1
 
+# Rollout strategy. Recreate (not RollingUpdate): the single instance holds
+# only per-connection subscription state, so a deploy drops every live
+# subscription and the frontend reconnects (see the README reconnect
+# protocol). Recreate keeps at most one instance during a release; correctness
+# does not depend on it (pushes derive from committed PG state), but it avoids
+# two instances briefly contending on one PORT/PVC-less deployment.
+strategy:
+  type: Recreate
+
 # Port exposed by the container and Service. Must match the PORT env var
 # (defaults to 8010 in svc-notifier).
 port: 8010
@@ -20,7 +29,10 @@ port: 8010
 # from an existing Kubernetes Secret — the chart never generates it.
 #
 # Roles expected by svc-notifier (see scripts/init-db.sql for provisioning):
-#   owner               — migrations + grants (not used at runtime after boot)
+#   owner               — runs migrations + grants at boot (that pool then
+#                          closes), and backs the LISTEN/NOTIFY listener, which
+#                          re-reads committed rows across recipients to build
+#                          push events
 #   svc_notifier_app    — GraphQL user-facing, subject to user-scoped RLS
 #   svc_notifier_ingest — NATS consumer, INSERT+SELECT on notifications only
 postgres:
@@ -93,5 +105,17 @@ securityContext:
     drop: [ALL]
 
 nodeSelector: {}
-tolerations: []
+# Evict fast on node failure: with a single Recreate replica, a fast reschedule
+# is the HA story (see the mono-pod stance). The default 300s unreachable/
+# not-ready tolerations would strand the only instance for five minutes; 30s
+# brings it back far sooner. Override or clear for multi-replica deployments.
+tolerations:
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
 affinity: {}

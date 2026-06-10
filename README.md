@@ -5,16 +5,6 @@ JetStream; svc-notifier persists one notification per recipient in PostgreSQL un
 row-level security and serves recipients through a GraphQL subgraph — list and unread
 count, ack-only mutations, and a real-time subscription stream.
 
-> **Spec status.** The service implementation has been **deliberately removed**
-> (spec-first rebuild): this repository currently ships the published-language
-> crate, this README, and a red end-to-end scenario suite — `src/main.rs` is a
-> stub. **Everything below describes the contract to build**, and the scenario
-> suite is its executable form; nothing is implemented until that suite is
-> green. `**[target]**` markers survive only as hints of where the contract
-> differs from the pre-rebuild implementation. The markers and this banner
-> disappear when the implementation lands — a README claim that silently
-> diverges from the code is treated as a bug, not a detail.
-
 ## Architecture
 
 ```
@@ -23,24 +13,28 @@ producers ──notifier.cmd.notification.deliver.v1──▶ NATS JetStream
                                                         ▼
                                                   PostgreSQL (RLS)  ◀── the single
                                                         │               source of truth
-                                          [target] pg_notify on commit
+                                                   pg_notify on commit
                                                         ▼
 recipients ◀──GraphQL: queries / mutations / subscription stream──┘
 ```
 
 - **Intake (NATS JetStream)** — a durable pull consumer (`consumer.messages()`, no
-  polling) fans each deliver command out to one row per recipient. It consumes the
-  subject `notify.deliver` today; **[target]** it consumes
-  `notifier.cmd.notification.deliver.v1` only, and nothing listens on the legacy
-  subject. The consumer currently creates the `NOTIFY` stream if it is absent; treat
-  the stream as deployment-provisioned infrastructure regardless.
+  polling) fans each deliver command out to one row per recipient. It consumes
+  `notifier.cmd.notification.deliver.v1` only; nothing listens on the legacy
+  `notify.deliver` subject. The `NOTIFY` stream is treated as
+  deployment-provisioned infrastructure — the service binds to it and never
+  creates it. The **durable consumer is declared by the service at boot**, with
+  its delivery contract (`filter_subject`, `max_deliver`, `ack_wait`, explicit
+  ack) reconciled fail-loud: a consumer already present with a *different* config
+  aborts startup rather than running on a silently divergent contract (see "Infra
+  debt" below).
 - **Truth (PostgreSQL)** — notifications live in one table, deduplicated by
   `(source_event_id, recipient_id)`, protected by forced row-level security.
 - **Surface (GraphQL subgraph)** — recipient-facing, composed behind a gateway.
   Root fields are prefixed `notifier*`.
-- **Realtime** — today the NATS consumer pushes new notifications to in-process
-  subscriber channels. **[target]** All pushes derive from committed PostgreSQL state
-  via `LISTEN/NOTIFY` (see "Realtime architecture").
+- **Realtime** — every push derives from committed PostgreSQL state via
+  `LISTEN/NOTIFY` (see "Realtime architecture"); no in-process broadcast from the
+  writer.
 
 ## The published language — `br-notifier-contract`
 
@@ -49,8 +43,8 @@ This repository is a two-crate workspace: the `svc-notifier` service and
 The contract crate is owned by the receiver (this service), versioned and tagged
 independently, and is what producers depend on — never on the service crate.
 
-- Subject: `DELIVER_SUBJECT` = `notifier.cmd.notification.deliver.v1` **[target:
-  the service still consumes `notify.deliver` today]**.
+- Subject: `DELIVER_SUBJECT` = `notifier.cmd.notification.deliver.v1` — the only
+  subject the service consumes.
 - Command: `DeliverNotification { source_event_id, recipient_ids, template, payload,
   link: Option<RelativeLink> }`. Producers serialize it with serde and publish it on
   the subject — no helper needed, and the contract crate stays free of any NATS
@@ -84,12 +78,17 @@ Wire format (pinned by a round-trip test in the contract crate):
 - **Empty `recipient_ids`**: a no-op; the message is acked.
 - **Malformed message** (not valid JSON for the command): acked with an error log —
   never NAKed, so a poison message cannot cause a redelivery storm. Nothing is persisted.
-- **[target] Invalid `link`**: the whole message is rejected fail-closed — acked with
-  an error log, zero rows persisted (no partial fan-out), nothing reaches any recipient.
+- **Invalid `link`**: the whole message is rejected fail-closed — the command fails to
+  deserialize (the contract's `RelativeLink` rejects an unsafe link), so it takes the
+  malformed-message path: acked with an error log, zero rows persisted (no partial
+  fan-out), nothing reaches any recipient.
 - **Database failure mid-batch**: the message is NAKed and redelivered (up to the
   consumer's `max_deliver`, currently 5). Redelivery completes the remaining
   recipients; already-inserted recipients are not duplicated (the dedup constraint
-  makes the fan-out idempotent).
+  makes the fan-out idempotent). The final delivery the budget allows is the
+  give-up slot: it is terminated without a further write attempt, so an exhausted
+  command is cleanly dropped — no late write lands after recovery, and the
+  documented recovery is the producer re-emitting the same `source_event_id`.
 
 `template` is a routing/rendering key and `payload` is producer data. The service
 validates neither against an allowed list or schema today (see "Open questions");
@@ -108,8 +107,8 @@ only ever see or touch their own notifications.
   newest-first pagination (`nodes`, `hasNextPage`).
 - `notifierUnreadCount: Int!`
 
-The notification type carries `id`, `template`, `payload`, `readAt`, `createdAt`
-**[target: plus `link`]**.
+The notification type carries `id`, `template`, `payload`, `link`, `readAt`,
+`createdAt`.
 
 ### Mutations — ack-only
 
@@ -124,17 +123,15 @@ into its snapshot instead of refetching.
 - `notifierDeleteNotification(notificationId: ID!): Boolean!` — hard delete today
   (hard vs soft is an open question — see "Open questions"; the bulk variant below
   inherits whatever is decided); `NOT_FOUND` under the same rule as above.
-- **[target]** `notifierDeleteNotifications(ids: [ID!]!): Boolean!` — bulk delete.
+- `notifierDeleteNotifications(ids: [ID!]!): Boolean!` — bulk delete.
   Ids not owned by the caller are invisible to it, hence untouched — contractually:
   they are silently skipped, the mutation acks, and they are absent from the emitted
   event. Foreign ids can never be probed through this mutation.
 
 ### Subscription
 
-- Today: `notifierNotificationAdded: Notification!` — new notifications only. A
-  change made in one session (e.g. mark-as-read) does **not** reach other sessions.
-- **[target]** `notifierNotificationEvents: NotifierNotificationEvent!` — the full
-  notification event union, bulk-shaped, replacing `notifierNotificationAdded`:
+- `notifierNotificationEvents: NotifierNotificationEvent!` — the full notification
+  event union, bulk-shaped:
 
   ```graphql
   union NotifierNotificationEvent =
@@ -169,18 +166,25 @@ This is not an edge case: every deploy restarts the single service instance
 (`Recreate` strategy), so every live subscription drops and reconnects on every
 release. Frontends must implement this protocol, not treat reconnection as an error.
 
-## Realtime architecture **[target]**
+## Realtime architecture
 
 PostgreSQL is the single source of truth; the subscription stream is **fed by PG
 `LISTEN/NOTIFY`**, never by an in-process broadcast from the writer:
 
 - Every write path (NATS intake, mutations) emits `pg_notify` **in the same
   transaction** as the write. The signal therefore fires on commit only — uncommitted
-  or rolled-back state can never be pushed — and carries only event type, recipient
-  and ids (small, far under the NOTIFY payload limit).
-- Each service instance runs a PG listener, re-reads the affected rows from
-  PostgreSQL to build the client event (what is pushed is what the truth says), and
-  routes it to its local subscription connections.
+  or rolled-back state can never be pushed — and carries event type, recipient,
+  ids, and the `read_at` timestamp on a read fact (small, far under the NOTIFY
+  payload limit). The read fact carries `read_at` directly so the listener never
+  re-reads to learn it.
+- Each service instance runs a PG listener under the `svc_notifier_app` role
+  (the always-present application connection — an instance without NATS still
+  feeds its subscribers from PostgreSQL). For an `Added` fact it re-reads the new
+  row from PostgreSQL to build the client event (what is pushed is what the truth
+  says); the re-read runs in a transaction scoped to the signal's recipient, so it
+  obeys the same row-level-security policy as every user-facing read — the listener
+  has no privileged, RLS-bypassing read path. The event is then routed to that
+  recipient's local subscription connections.
 - The only in-process state is the strictly per-connection registry of open
   subscriptions. Correctness is therefore replica-count-independent: a write handled
   by one instance reaches subscribers connected to any instance.
@@ -199,17 +203,21 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
   table owner cannot bypass it.
 - **Two runtime PostgreSQL roles, least privilege**:
-  - `svc_notifier_app` — GraphQL resolvers; user-scoped by the RLS policies above.
+  - `svc_notifier_app` — GraphQL resolvers *and* the realtime listener's row
+    re-reads; user-scoped by the RLS policies above. The listener scopes its
+    re-read to the signal's recipient, so it reads exactly the rows that recipient
+    could read — no role bypasses RLS at runtime.
   - `svc_notifier_ingest` — the NATS consumer (a system component, not a user);
     INSERT plus the SELECT needed for `RETURNING`, no user-scoped read path.
-  - Migrations run at startup under a separate owner role, then that pool closes.
+  - Migrations run at startup under a separate owner role, then that pool closes;
+    the owner role is never used for a runtime read.
 
 ## Security notes
 
 - **`template` and `payload` are untrusted producer data.** Render them as data —
   never HTML-interpolate them, never treat `template` as a path or a format string.
 - **`link` is the only navigable field** and is constrained by `RelativeLink` to a
-  same-domain relative URL, validated fail-closed at intake **[target]** and at the
+  same-domain relative URL, validated fail-closed at intake and at the
   type level in the contract crate. Frontends should still bind it to router
   navigation, not to raw `href` interpolation.
 - **One-shot secrets do not exist here**: notifications must never carry secrets;
@@ -293,10 +301,8 @@ docker compose -f docker-compose.test.yml up -d
 cargo test --tests --no-fail-fast
 ```
 
-**[target]** Scenarios pinning target behavior fail red until the
-implementation lands — red is the expected state of this suite between the
-spec and the implementation; making it green is the implementation's
-definition of done.
+The scenario suite is the service's definition of done: it passes green
+against the real harness.
 
 ## Versioning & release
 
@@ -328,6 +334,19 @@ No manual tagging, no manual image/chart push.
 
 Local pipeline: `./scripts/publish.sh --check-only` (fmt, clippy, unit tests, helm
 lint), `--local-image`, `--dry-run` — see the script header.
+
+## Infra debt
+
+- **The durable consumer is declared by the service, not by the deployment.**
+  Doctrine prefers declared-by-deployment infrastructure with the service binding
+  fail-loud (`get_consumer`). Today the service still creates the consumer at boot,
+  because the test harness recreates the stream per scenario and does not declare a
+  consumer. The mitigation is that creation is **declarative and reconciled**:
+  `create_consumer_strict` either creates the consumer with the exact delivery
+  config or, if one already exists with a *different* config, fails startup — there
+  is no silent config drift. Moving the consumer declaration into the deployment
+  (and flipping the bind to `get_consumer`) is owed; until then this is the
+  defensible middle.
 
 ## Open questions
 
