@@ -14,8 +14,8 @@ toml_string() {
 # Repo root — resolved once, available everywhere.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# Crate metadata — single-crate repo, everything lives at the root.
-CRATE_NAME="svc-notifier"
+# Service-crate metadata — the service crate lives at the workspace root.
+export CRATE_NAME="svc-notifier"
 
 crate_version() { toml_string "$REPO_ROOT/Cargo.toml" "version"; }
 
@@ -26,7 +26,7 @@ crate_image()   { echo "${IMAGE:-ghcr.io/botresources/br-svc-notifier}"; }
 # Check we're on main and up to date with origin.
 # In CI (detached HEAD on tag checkout), verify the tag commit is on main.
 ensure_main() {
-    cd "$REPO_ROOT"
+    cd "$REPO_ROOT" || exit 1
     git fetch origin main --tags --quiet
 
     local branch

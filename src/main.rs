@@ -1,196 +1,210 @@
-use std::net::SocketAddr;
+mod graphql;
+mod intake;
+mod notification;
+mod realtime;
+
+use std::time::Duration;
 
 use async_graphql::http::GraphiQLSource;
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::Router;
+use async_graphql::{Request, Schema, SchemaBuilder};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
+use axum::{Extension, Json, Router};
+use br_core_auth::Passport;
+use br_util_axum_auth::passport_header_middleware;
+use br_util_postgres::Environment;
 use futures::StreamExt;
-use sqlx::postgres::PgPoolOptions;
-use tracing_subscriber::EnvFilter;
+use sqlx::PgPool;
+use tokio::net::TcpListener;
 
-use svc_notifier::AppState;
-use svc_notifier::graphql::{self, AppSchema};
-use svc_notifier::nats;
+use graphql::{AppState, MutationRoot, QueryRoot, SubscriptionRoot};
+use realtime::{Subscribers, run_listener};
+
+type NotifierSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+
+#[derive(Clone)]
+struct HttpState {
+    schema: NotifierSchema,
+}
 
 #[tokio::main]
-async fn main() {
-    if std::env::args().nth(1).as_deref() == Some("schema") {
-        print!("{}", graphql::sdl());
-        return;
-    }
-
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .json()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    dotenvy::dotenv().ok();
-
-    let nats_url = std::env::var("NATS_URL").ok();
-    let port: u16 = std::env::var("PORT")
-        .expect("PORT must be set")
-        .parse()
-        .expect("PORT must be a valid u16");
-
-    // 1. Migration pool (owner role) — run migrations, grant access, then drop.
-    let migration_url = std::env::var("DATABASE_URL_OWNER")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("DATABASE_URL_OWNER or DATABASE_URL must be set");
-    let migration_pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&migration_url)
-        .await
-        .expect("failed to connect to database for migrations");
-
-    // Precondition: roles svc_notifier_app and svc_notifier_ingest must be
-    // provisioned before first startup. See scripts/init-db.sql for reference.
-    sqlx::migrate!("./migrations")
-        .run(&migration_pool)
-        .await
-        .expect("failed to run migrations");
-
-    // Grant access to svc_notifier_app role (non-fatal if role doesn't exist yet).
-    if let Err(e) = br_util_postgres::grant_app_access(&migration_pool, "svc_notifier_app").await {
-        tracing::warn!(error = %e, "failed to grant svc_notifier_app access");
+    if std::env::args().nth(1).as_deref() == Some("schema") {
+        println!("{}", schema_builder().finish().sdl());
+        return Ok(());
     }
 
-    // Grant minimal access to svc_notifier_ingest: only INSERT + SELECT on notifications.
-    for sql in [
-        "GRANT USAGE ON SCHEMA public TO svc_notifier_ingest",
-        "GRANT INSERT, SELECT ON TABLE notifications TO svc_notifier_ingest",
-    ] {
-        if let Err(e) = sqlx::query(sql).execute(&migration_pool).await {
-            tracing::warn!(error = %e, "failed to grant svc_notifier_ingest access");
-        }
-    }
-    migration_pool.close().await;
+    let environment = Environment::Prod;
+    let allow_insecure = false;
 
-    // 2. App pool (svc_notifier_app) — subject to user-scoped RLS, used by GraphQL.
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&database_url)
-        .await
-        .expect("failed to connect to database");
+    run_migrations(environment, allow_insecure).await?;
 
-    let channels = nats::new_user_channels();
-    let state = AppState {
-        pool: pool.clone(),
-        channels: channels.clone(),
-    };
+    let app_url = std::env::var("DATABASE_URL")?;
+    let app_pool = br_util_postgres::init_pool(&app_url, environment, allow_insecure).await?;
 
-    // NATS consumer (optional — graceful degradation)
-    if let Some(nats_url) = nats_url {
-        // 3. Ingest pool (svc_notifier_ingest) — only created when NATS intake is enabled.
+    let subscribers = Subscribers::default();
+    tokio::spawn(run_listener(app_pool.clone(), subscribers.clone()));
+
+    if let Ok(nats_url) = std::env::var("NATS_URL") {
         let ingest_url = std::env::var("DATABASE_URL_INGEST")
-            .expect("DATABASE_URL_INGEST must be set when NATS_URL is provided");
-        let ingest_pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&ingest_url)
-            .await
-            .expect("failed to connect ingest pool");
-
-        let nats_user = std::env::var("NATS_USER").ok();
-        let nats_password = std::env::var("NATS_PASSWORD").ok();
-
-        let nats_connect_result = if let (Some(user), Some(pass)) = (nats_user, nats_password) {
-            async_nats::ConnectOptions::with_user_and_password(user, pass)
-                .connect(&nats_url)
-                .await
-        } else {
-            async_nats::connect(&nats_url).await
-        };
-
-        match nats_connect_result {
-            Ok(nats_client) => {
-                let jetstream = async_nats::jetstream::new(nats_client);
-                let consumer_pool = ingest_pool;
-                let consumer_channels = channels.clone();
-                tokio::spawn(async move {
-                    nats::run_consumer(jetstream, consumer_pool, consumer_channels).await;
-                });
-                tracing::info!("NATS consumer started on notify.deliver");
+            .map_err(|_| "DATABASE_URL_INGEST is required when NATS_URL is set")?;
+        let ingest_pool = ingest_pool(&ingest_url, environment, allow_insecure).await?;
+        let jetstream = connect_jetstream(&nats_url).await?;
+        tokio::spawn(async move {
+            if let Err(error) = intake::run(jetstream, ingest_pool).await {
+                tracing::error!(%error, "intake terminated");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to connect to NATS — running without NATS intake");
-            }
-        }
-    } else {
-        tracing::warn!("NATS_URL not set — running without NATS intake");
+        });
     }
 
-    let schema = graphql::build_schema(state.clone());
+    let schema = schema_builder()
+        .data(AppState {
+            app_pool,
+            subscribers,
+        })
+        .finish();
 
-    let graphql_routes = Router::new()
-        .route("/graphql", post(graphql_handler))
-        .route("/graphql/playground", get(graphql_playground))
-        .layer(axum::middleware::from_fn(
-            br_util_axum_auth::passport_header_middleware,
-        ));
-
+    let state = HttpState { schema };
     let app = Router::new()
-        .merge(graphql_routes)
         .route("/health", get(health))
         .route("/schema", get(schema_sdl))
-        .with_state(schema);
+        .route("/graphql/playground", get(playground))
+        .route(
+            "/graphql",
+            get(playground)
+                .post(graphql_handler)
+                .layer(axum::middleware::from_fn(passport_header_middleware)),
+        )
+        .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("svc-notifier listening on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("failed to bind");
-    axum::serve(listener, app).await.expect("server error");
+    let port: u16 = std::env::var("PORT")?.parse()?;
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!(port, "svc-notifier listening");
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
-async fn graphql_handler(
-    State(schema): State<AppSchema>,
-    passport: Option<axum::Extension<br_core_auth::Passport>>,
-    headers: HeaderMap,
-    req: GraphQLRequest,
-) -> Response {
-    let mut request = req.into_inner();
-    if let Some(axum::Extension(p)) = passport {
-        request = request.data(p);
-    }
-
-    // SSE subscriptions: gateway sends subscription operations as HTTP POST
-    // with Accept: text/event-stream.
-    let wants_sse = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.contains("text/event-stream"));
-
-    if wants_sse {
-        let stream = schema.execute_stream(request);
-        let sse = stream.map(|resp| {
-            let json = serde_json::to_string(&resp).unwrap_or_default();
-            Ok::<_, std::convert::Infallible>(Event::default().event("next").data(json))
-        });
-        return Sse::new(sse)
-            .keep_alive(KeepAlive::default())
-            .into_response();
-    }
-
-    // Queries/mutations: keep standard async-graphql-axum behavior.
-    let resp: GraphQLResponse = schema.execute(request).await.into();
-    resp.into_response()
+fn schema_builder() -> SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> {
+    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
 }
 
-async fn graphql_playground() -> impl IntoResponse {
+async fn ingest_pool(
+    url: &str,
+    environment: Environment,
+    allow_insecure: bool,
+) -> Result<PgPool, Box<dyn std::error::Error>> {
+    br_util_postgres::validate_database_tls(url, environment, allow_insecure)?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(3))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, "SET statement_timeout = '3s'").await?;
+                Ok(())
+            })
+        })
+        .connect(url)
+        .await?;
+    Ok(pool)
+}
+
+async fn run_migrations(
+    environment: Environment,
+    allow_insecure: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let owner_pool = br_util_postgres::init_migration_pool(environment, allow_insecure).await?;
+    sqlx::migrate!("./migrations").run(&owner_pool).await?;
+    owner_pool.close().await;
+    Ok(())
+}
+
+async fn connect_jetstream(
+    nats_url: &str,
+) -> Result<async_nats::jetstream::Context, Box<dyn std::error::Error>> {
+    let client = match (std::env::var("NATS_USER"), std::env::var("NATS_PASSWORD")) {
+        (Ok(user), Ok(password)) => {
+            async_nats::ConnectOptions::with_user_and_password(user, password)
+                .connect(nats_url)
+                .await?
+        }
+        _ => async_nats::connect(nats_url).await?,
+    };
+    Ok(async_nats::jetstream::new(client))
+}
+
+async fn health() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn schema_sdl(State(state): State<HttpState>) -> impl IntoResponse {
+    state.schema.sdl()
+}
+
+async fn playground() -> Html<String> {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
-async fn health() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({"status": "ok"})),
-    )
+async fn graphql_handler(
+    State(state): State<HttpState>,
+    Extension(passport): Extension<Passport>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: Request = match serde_json::from_slice::<GraphQLRequestBody>(&body) {
+        Ok(parsed) => parsed.into_request(),
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid request: {error}")).into_response();
+        }
+    };
+    let request = request.data(passport);
+
+    if wants_event_stream(&headers) {
+        let stream = state.schema.execute_stream(request).map(|response| {
+            let json = serde_json::to_string(&response).expect("response serialization");
+            Ok::<Event, std::convert::Infallible>(Event::default().event("next").data(json))
+        });
+        Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response()
+    } else {
+        Json(state.schema.execute(request).await).into_response()
+    }
 }
 
-async fn schema_sdl(State(schema): State<AppSchema>) -> impl IntoResponse {
-    schema.sdl()
+fn wants_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQLRequestBody {
+    query: String,
+    #[serde(default)]
+    operation_name: Option<String>,
+    #[serde(default)]
+    variables: serde_json::Value,
+}
+
+impl GraphQLRequestBody {
+    fn into_request(self) -> Request {
+        let mut request = Request::new(self.query);
+        if let Some(name) = self.operation_name {
+            request = request.operation_name(name);
+        }
+        if !self.variables.is_null() {
+            request = request.variables(async_graphql::Variables::from_json(self.variables));
+        }
+        request
+    }
 }

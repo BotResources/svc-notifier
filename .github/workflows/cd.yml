@@ -1,18 +1,33 @@
 name: CD
 
-# Triggered by pushing a version tag: v{version}.
-# Runs the same publish.sh script as local — cross-compiles for amd64+arm64,
-# packages Docker images, pushes to GHCR with a multi-arch manifest, then
-# packages + pushes the Helm chart to the OCI chart registry.
+# Image-first, tag-after. CD owns pushes to main:
+#   detect-bump → publish (image + chart) → tag + GitHub Release
+# A tag is a receipt that the version shipped — it is created only after the
+# image is on GHCR. The contract crate has no artifact: its release IS the
+# tag (consumers pull it as a git dependency), created when its version bumps.
+#
+# Three entry points, converging on the same publish chain:
+#   - push to main          → detect-bump decides per crate
+#   - push tag svc-notifier/v*  → operator override / recovery, version from the tag
+#   - workflow_dispatch     → recovery, version from input (falls back to Cargo.toml)
 
 on:
   push:
+    branches: [main]
     tags:
-      - "v*"
+      - "svc-notifier/v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Service version to (re)publish (defaults to Cargo.toml)"
+        required: false
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -20,12 +35,92 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  detect-bump:
+    name: detect-bump
+    runs-on: arc-ubuntu
+    outputs:
+      publish_service: ${{ steps.detect.outputs.publish_service }}
+      service_version: ${{ steps.detect.outputs.service_version }}
+      tag_contract: ${{ steps.detect.outputs.tag_contract }}
+      contract_version: ${{ steps.detect.outputs.contract_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Detect version bumps
+        id: detect
+        shell: bash
+        run: |
+          crate_version() {
+            grep -E '^version\s*=' "$1" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+          }
+          is_release() {
+            case "$1" in
+              0.0.0|*-dev|*-rc*|*-pre*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          tag_exists() {
+            git ls-remote --tags origin "refs/tags/$1" | grep -q .
+          }
+
+          # --- service ---------------------------------------------------
+          service_version="$(crate_version Cargo.toml)"
+          publish_service=false
+          case "${GITHUB_REF}" in
+            refs/tags/svc-notifier/v*)
+              service_version="${GITHUB_REF#refs/tags/svc-notifier/v}"
+              publish_service=true
+              echo "Tag trigger — republishing svc-notifier ${service_version}"
+              ;;
+            *)
+              if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+                input_version="${{ inputs.version }}"
+                [ -n "$input_version" ] && service_version="$input_version"
+                publish_service=true
+                echo "Manual dispatch — publishing svc-notifier ${service_version}"
+              elif is_release "$service_version" \
+                && ! tag_exists "svc-notifier/v${service_version}" \
+                && ! tag_exists "v${service_version}"; then
+                if grep -qE "^## ${service_version}( |$)" CHANGELOG.md; then
+                  publish_service=true
+                else
+                  echo "::warning::svc-notifier ${service_version} has no CHANGELOG heading — not publishing"
+                fi
+              else
+                echo "svc-notifier ${service_version}: already released or not a release version"
+              fi
+              ;;
+          esac
+
+          # --- contract (tag-only release, main pushes only) ---------------
+          contract_version="$(crate_version br-notifier-contract/Cargo.toml)"
+          tag_contract=false
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] \
+            && is_release "$contract_version" \
+            && ! tag_exists "br-notifier-contract/v${contract_version}"; then
+            if grep -qE "^## ${contract_version}( |$)" br-notifier-contract/CHANGELOG.md; then
+              tag_contract=true
+            else
+              echo "::warning::br-notifier-contract ${contract_version} has no CHANGELOG heading — not tagging"
+            fi
+          else
+            echo "br-notifier-contract ${contract_version}: already tagged or not applicable"
+          fi
+
+          {
+            echo "publish_service=${publish_service}"
+            echo "service_version=${service_version}"
+            echo "tag_contract=${tag_contract}"
+            echo "contract_version=${contract_version}"
+          } >> "$GITHUB_OUTPUT"
+
   publish:
-    name: Publish
-    # The arc-ubuntu runner pool already runs on
-    # `ghcr.io/botresources/br-arc-runner:stable`, which ships rust +
-    # docker-cli + helm + the basic build toolchain. No `container:`
-    # block needed.
+    name: Publish image + chart
+    needs: detect-bump
+    if: needs.detect-bump.outputs.publish_service == 'true'
     runs-on: arc-ubuntu
     defaults:
       run:
@@ -45,11 +140,6 @@ jobs:
       #   2. Static-musl decouples the binary from the runtime image's libc
       #      *entirely* — a future runner bump cannot reintroduce the skew
       #      because the binary no longer depends on the runtime libc at all.
-      # Why zigbuild and not the system musl-gcc + aarch64-linux-musl-gcc
-      # cross toolchains: Zig ships a working musl-aarch64 C cross compiler
-      # that handles `ring` + `aws-lc-sys` (pulled transitively by rustls
-      # via reqwest/jsonwebtoken/async-nats) cleanly. The musl-cross apt
-      # path on aarch64 is notoriously brittle for those crates.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
@@ -66,10 +156,7 @@ jobs:
 
       # buildx is needed for `docker build --provenance=false` in publish.sh.
       # NO `setup-qemu-action`: the Dockerfile has no `RUN` instructions, so
-      # buildx never has to exec foreign-arch code. Both binaries are static
-      # musl built natively above (Rust target = musl, Zig as C linker), and
-      # `COPY ${BIN_PATH}` is a layer op the builder does natively. → arm64
-      # docker build is now I/O-bound, not CPU-bound.
+      # buildx never has to exec foreign-arch code.
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR (Docker)
@@ -84,3 +171,57 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: ./scripts/publish.sh --skip-checks
+
+  tag-service:
+    name: Tag + Release svc-notifier
+    needs: [detect-bump, publish]
+    if: needs.detect-bump.outputs.publish_service == 'true' && github.ref == 'refs/heads/main'
+    runs-on: arc-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create tag + GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect-bump.outputs.service_version }}
+        run: |
+          tag="svc-notifier/v${VERSION}"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            echo "Tag $tag already exists"
+          else
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
+            --title "$tag" \
+            --notes "See the \`## ${VERSION}\` section of CHANGELOG.md."
+
+  tag-contract:
+    name: Tag + Release br-notifier-contract
+    needs: detect-bump
+    if: needs.detect-bump.outputs.tag_contract == 'true'
+    runs-on: arc-ubuntu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create tag + GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect-bump.outputs.contract_version }}
+        run: |
+          tag="br-notifier-contract/v${VERSION}"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            echo "Tag $tag already exists"
+          else
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
+            --title "$tag" \
+            --notes "See the \`## ${VERSION}\` section of br-notifier-contract/CHANGELOG.md."

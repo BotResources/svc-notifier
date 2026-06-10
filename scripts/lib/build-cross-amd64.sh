@@ -20,7 +20,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 build_cross_amd64() {
     local target="x86_64-unknown-linux-musl"
-    cd "$REPO_ROOT"
+    cd "$REPO_ROOT" || exit 1
 
     info "Static-musl cross-compiling ${CRATE_NAME} for $target"
     cargo zigbuild --release --locked --target "$target"

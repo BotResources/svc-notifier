@@ -9,7 +9,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 run_crate_tests() {
-    cd "$REPO_ROOT"
+    cd "$REPO_ROOT" || exit 1
 
     info "[${CRATE_NAME}] Running unit tests"
     cargo test --lib

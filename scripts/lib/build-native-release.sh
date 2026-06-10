@@ -9,7 +9,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 build_native_release() {
-    cd "$REPO_ROOT"
+    cd "$REPO_ROOT" || exit 1
 
     info "[${CRATE_NAME}] Building release (native)"
     cargo build --release
