@@ -100,6 +100,12 @@ probes:
 service:
   type: ClusterIP
   annotations: {}
+  # Extra labels merged onto the Service's metadata.labels, on top of the
+  # standard chart labels (which are never overridden). Use this when an
+  # external controller discovers this Service by label — e.g. labels matched
+  # by a service-discovery selector such as a federation gateway composer that
+  # enumerates subgraph Services. Default empty = only the standard labels.
+  labels: {}
 
 serviceAccount:
   create: true

@@ -31,7 +31,11 @@ recipients ◀──GraphQL: queries / mutations / subscription stream──┘
 - **Truth (PostgreSQL)** — notifications live in one table, deduplicated by
   `(source_event_id, recipient_id)`, protected by forced row-level security.
 - **Surface (GraphQL subgraph)** — recipient-facing, composed behind a gateway.
-  Root fields are prefixed `notifier*`.
+  Root fields are prefixed `notifier*`. When a gateway composer discovers
+  subgraphs by enumerating Kubernetes Services by label, set the discovery
+  labels via the chart key `service.labels` (a generic map merged onto the
+  Service's `metadata.labels`); the chart never hard-codes any specific
+  selector.
 - **Realtime** — every push derives from committed PostgreSQL state via
   `LISTEN/NOTIFY` (see "Realtime architecture"); no in-process broadcast from the
   writer.

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.1
+
+A chart-only patch: a generic knob for adding labels to the rendered Service,
+so a GitOps consumer no longer has to patch the Service out-of-band. No code,
+contract, or behavior change.
+
+### Added
+- **Chart: `service.labels`** — a map (default `{}`) merged onto the Service's
+  `metadata.labels` on top of the standard chart labels (which are never
+  overridden), rendered with a `with`-block guard like `service.annotations`.
+  This covers the case where an external controller discovers the Service by
+  label — e.g. labels matched by a service-discovery selector such as a
+  federation gateway composer that enumerates subgraph Services. The chart
+  `version`/`appVersion` are bumped to 0.4.1 in lockstep with the crate.
+
 ## 0.4.0
 
 A scoped pre-deployment fix: align the SDL route with the gateway composer's
