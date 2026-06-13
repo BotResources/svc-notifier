@@ -15,6 +15,10 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use br_core_auth::Passport;
 use br_util_axum_auth::passport_header_middleware;
+use br_util_axum_readiness::{ReadinessHandle, readiness_route};
+use br_util_observability::{
+    http_metrics_layer, init_logging, init_metrics, liveness_route, metrics_route,
+};
 use futures::StreamExt;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
@@ -31,15 +35,15 @@ struct HttpState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_logging("svc-notifier");
 
     if std::env::args().nth(1).as_deref() == Some("schema") {
         println!("{}", schema_builder().finish().sdl());
         return Ok(());
     }
+
+    let metrics = init_metrics("svc-notifier")?;
+    let readiness = ReadinessHandle::not_ready("starting up");
 
     run_migrations().await?;
 
@@ -70,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = HttpState { schema };
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/livez", liveness_route())
+        .route("/readyz", readiness_route(readiness.clone()))
+        .route("/metrics", metrics_route(metrics))
         .route("/sdl", get(schema_sdl))
         .route("/graphql/playground", get(playground))
         .route(
@@ -79,10 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .post(graphql_handler)
                 .layer(axum::middleware::from_fn(passport_header_middleware)),
         )
+        .layer(http_metrics_layer())
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")?.parse()?;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    readiness.set_ready();
     tracing::info!(port, "svc-notifier listening");
     axum::serve(listener, app).await?;
     Ok(())
@@ -127,10 +135,6 @@ async fn connect_jetstream(
         _ => async_nats::connect(nats_url).await?,
     };
     Ok(async_nats::jetstream::new(client))
-}
-
-async fn health() -> StatusCode {
-    StatusCode::OK
 }
 
 async fn schema_sdl(State(state): State<HttpState>) -> impl IntoResponse {

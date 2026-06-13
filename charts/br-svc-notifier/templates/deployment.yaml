@@ -111,7 +111,8 @@ spec:
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
               port: http
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}

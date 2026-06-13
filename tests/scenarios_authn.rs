@@ -1,5 +1,3 @@
-// Trust-boundary scenarios: the service authorizes, never authenticates —
-// no Passport means 401 at the middleware, before any resolver runs.
 mod common;
 
 use common::*;
@@ -30,10 +28,10 @@ async fn graphql_with_malformed_passport_returns_401() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn health_is_accessible_without_passport() {
+async fn liveness_is_accessible_without_passport() {
     let ctx = TestContext::setup().await;
     let resp = reqwest::Client::new()
-        .get(format!("{}/health", ctx.instance.base_url))
+        .get(format!("{}/livez", ctx.instance.base_url))
         .send()
         .await
         .unwrap();

@@ -52,7 +52,7 @@ start_service() {
     LOG_FILE=$(mktemp)
     "$PROJECT_DIR/target/debug/svc-notifier" > "$LOG_FILE" 2>&1 &
     SVC_PID=$!
-    if ! wait_for_health "http://localhost:$PORT/health"; then
+    if ! wait_for_health "http://localhost:$PORT/readyz"; then
         echo "ERROR: service did not start within 15s"
         echo "--- service logs ---"
         cat "$LOG_FILE"
@@ -92,18 +92,18 @@ echo ""
 echo "=== P0: Startup and infrastructure ==="
 # ============================================================
 
-# --- P0.1: Health endpoint ---
+# --- P0.1: Liveness endpoint ---
 echo ""
-echo "[P0.1] Service starts and /health returns 200"
+echo "[P0.1] Service starts and /livez returns 200"
 reset_db
 if start_service; then
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/health")
-    BODY=$(curl -s "http://localhost:$PORT/health")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/livez")
+    BODY=$(curl -s "http://localhost:$PORT/livez")
 
-    if [ "$HTTP_CODE" = "200" ] && echo "$BODY" | grep -q '"ok"'; then
-        log_pass "/health returns 200 with {\"status\":\"ok\"}"
+    if [ "$HTTP_CODE" = "200" ] && [ "$BODY" = "alive" ]; then
+        log_pass "/livez returns 200 with body 'alive'"
     else
-        log_fail "/health returned $HTTP_CODE: $BODY"
+        log_fail "/livez returned $HTTP_CODE: $BODY"
     fi
 else
     log_fail "service failed to start"
@@ -145,7 +145,7 @@ reset_db
 unset NATS_URL
 
 if start_service; then
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/health")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/readyz")
 
     if [ "$HTTP_CODE" = "200" ]; then
         log_pass "service runs without NATS_URL"

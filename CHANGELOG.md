@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0
+
+A reuse pass on the shared library: bump every `br-rust-common` pin to the unified
+`v0.8.0` and adopt the lib's RLS, observability and readiness helpers in place of
+hand-rolled code. No change to the GraphQL surface or the `br-notifier-contract`
+wire format; the probe-endpoint change is an operational contract for the chart.
+
+### Changed
+- **Shared-lib bump → unified `v0.8.0`.** `br-core-auth`, `br-util-axum-auth` and
+  `br-util-postgres` (and the `br-core-auth` dev-dep) move from
+  `tag = "br-util-postgres-v0.7.0"` to `tag = "v0.8.0"` — one coherent set, one
+  tag. Adds `br-util-observability` and `br-util-axum-readiness` at the same tag.
+- **GraphQL RLS context via the shared `br_util_postgres::set_rls_context`.** The
+  resolver path now threads the real `Passport` from the auth middleware to the
+  transaction boundary and calls the shared helper, replacing the hand-rolled
+  `SELECT set_config('app.current_user_id', …, true)`. The helper sets five
+  transaction-local `app.*` GUCs; the notifications policy reads only
+  `app.current_user_id`, so the extra GUCs are inert. The realtime listener has no
+  `Passport` (its recipient is synthesized from the `pg_notify` signal) and keeps
+  its single manual `set_config` — fabricating a fake identity to reach the helper
+  would be a security smell.
+- **Observability via `br-util-observability`.** `init_logging("svc-notifier")`
+  replaces the hand-rolled `tracing_subscriber` JSON setup (and the
+  `tracing-subscriber` dependency is dropped). `init_metrics` + `metrics_route`
+  (`/metrics`) + `http_metrics_layer` add a Prometheus exposition with process and
+  HTTP collectors and anonymized labels.
+- **Probe endpoints `/health` → `/livez` + `/readyz`** (BREAKING for the chart).
+  `/health` is removed. `/livez` (always-200 liveness, `br-util-observability`) and
+  `/readyz` (`br-util-axum-readiness`, `503` until boot work completes, then `200`)
+  replace it. The chart's liveness probe moves from a TCP-port check to
+  `httpGet /livez` and the readiness probe to `/readyz` (`values.yaml` gains
+  `probes.liveness.path`); chart `version`/`appVersion` bump to 0.5.0 in lockstep.
+
+### Notes
+- **`br_core_integration::DurableConsumer` evaluated and declined for the intake.**
+  Its public consume methods force the integration envelope; svc-notifier consumes
+  a bare `DeliverNotification` on a contract-owned subject, so the hand-rolled
+  `consumer.messages()` loop is kept (see README → Infra debt).
+
 ## 0.4.1
 
 A chart-only patch: a generic knob for adding labels to the rendered Service,
