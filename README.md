@@ -1,5 +1,23 @@
 # svc-notifier
 
+> [!IMPORTANT]
+> **This repository is maintained for BotResources and its authorized clients.**
+> It is published under MIT and made available read-only for visibility. The MIT
+> license governs your rights to use, modify, and fork the code; the rest of this
+> notice describes our operational stance, not a legal restriction.
+>
+> **We do not accept external pull requests, issues, or support requests.**
+> Issues and Discussions are disabled. PRs from accounts that are not on the
+> internal contributor allowlist will be closed without review. Forks are
+> permitted by MIT and we do not (and cannot) prevent them; we simply do not
+> monitor, support, or accept contributions from forks outside the BR commercial
+> relationship.
+>
+> - Clients with a commercial relationship: contact your BR account manager.
+> - Security reports: see [SECURITY.md](SECURITY.md) (private email channel).
+> - This is not a community-supported project. No support is provided through
+>   GitHub.
+
 Standalone notification service. Producers publish a typed deliver command on NATS
 JetStream; svc-notifier persists one notification per recipient in PostgreSQL under
 row-level security and serves recipients through a GraphQL subgraph — list and unread
@@ -390,7 +408,7 @@ lint), `--local-image`, `--dry-run` — see the script header.
   wire-format frozen and tested in `br-notifier-contract` and depended on by
   producers — so adopting the wrapper would mean re-enveloping the published
   contract, a breaking change for no benefit. The intake keeps its hand-rolled
-  `consumer.messages()` loop (fatty tolerates inline IO), which also preserves its
+  `consumer.messages()` loop (IO inline by design), which also preserves its
   own redelivery-budget and fail-closed-on-poison policy. Re-evaluate if the lib
   later exposes a payload-agnostic `run` (the `bind` side already fits once the
   consumer is deployment-declared).
@@ -403,3 +421,10 @@ lint), `--local-image`, `--dry-run` — see the script header.
 - **Allowed-template list** — the service accepts any `template` string. The list of
   valid templates is per-project policy and belongs in configuration; it must never
   be hard-coded in the generic contract crate.
+
+## License & contributing
+
+MIT — see [LICENSE](LICENSE). This repository does not accept external
+contributions or support requests; see [CONTRIBUTING.md](CONTRIBUTING.md) and
+[SUPPORT.md](SUPPORT.md). Report security issues privately via
+[SECURITY.md](SECURITY.md).

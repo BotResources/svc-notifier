@@ -136,7 +136,7 @@ jobs:
       #   1. A glibc-linked binary's runtime libc must stay >= the libc the
       #      binary was built against. The runner image's GLIBC has bumped
       #      past debian:bookworm-slim's GLIBC_2.36 in the past, shipping
-      #      CrashLoop releases (see br-graphql-gateway#29).
+      #      CrashLoop releases.
       #   2. Static-musl decouples the binary from the runtime image's libc
       #      *entirely* — a future runner bump cannot reintroduce the skew
       #      because the binary no longer depends on the runtime libc at all.

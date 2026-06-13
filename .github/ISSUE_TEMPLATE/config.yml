@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Commercial contact (clients)
+    url: https://botresources.ai
+    about: This repository does not accept external issues. Clients — please contact your BR account manager.
+  - name: Security report (private)
+    url: https://github.com/BotResources/svc-notifier/blob/main/SECURITY.md
+    about: Report security issues privately by email — see SECURITY.md. Do not open a public issue.

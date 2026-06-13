@@ -4,8 +4,8 @@
 # Uses cargo-zigbuild with Zig as the C compiler. We deliberately avoid
 # `cross` (DinD bind-mount fails on ARC runners, cross-rs/cross#260) and
 # the system `gcc-aarch64-linux-gnu` + glibc path (runner-vs-runtime
-# GLIBC skew has shipped CrashLoop releases before, see
-# br-graphql-gateway#29). Zig also handles `ring` + `aws-lc-sys`
+# GLIBC skew has shipped CrashLoop releases before). Zig also handles
+# `ring` + `aws-lc-sys`
 # (transitively pulled by rustls everywhere) cleanly, unlike the apt
 # musl-cross toolchain for aarch64.
 #

@@ -4,9 +4,8 @@
 # Uses cargo-zigbuild with Zig as the C compiler. We deliberately avoid
 # `cross` (DinD bind-mount fails on ARC runners, cross-rs/cross#260) and
 # the system `gcc-aarch64-linux-gnu` + glibc path (runner-vs-runtime
-# GLIBC skew has shipped CrashLoop releases before, see
-# br-graphql-gateway#29). Static-musl decouples the binary from the
-# runtime image's libc entirely.
+# GLIBC skew has shipped CrashLoop releases before). Static-musl
+# decouples the binary from the runtime image's libc entirely.
 #
 # Prerequisites (CI: installed in cd.yml; local Linux/macOS:
 # `rustup target add x86_64-unknown-linux-musl`, install Zig + run

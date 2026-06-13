@@ -124,9 +124,9 @@ shared lib.
 
 The from-scratch rebuild: the service is reimplemented against the README
 contract and the e2e scenario suite, which now passes green against real
-Postgres and real NATS JetStream. Built in the single-crate "fatty" manner —
-capability files (`notification`, `intake`, `graphql`, `realtime`) with types,
-SQL, resolvers and IO inline, no hexagonal layering.
+Postgres and real NATS JetStream. Built as a single crate — capability files
+(`notification`, `intake`, `graphql`, `realtime`) with types, SQL, resolvers
+and IO inline.
 
 ### Fixed (code review)
 - **Realtime listener now reads under RLS, never via a privileged role.** The
@@ -153,8 +153,8 @@ SQL, resolvers and IO inline, no hexagonal layering.
   rather than re-reading the Passport, making "the row touched belongs to the
   authenticated caller" a fact carried by the type.
 - Removed the SDL-rendering placeholder pool (the `schema` subcommand builds the
-  schema without runtime data) and all source doc-comments (the fatty manner
-  keeps intent in names, types and this README). Migration drops `IF NOT EXISTS`
+  schema without runtime data) and all source doc-comments (intent lives in
+  names, types and this README). Migration drops `IF NOT EXISTS`
   on the objects it owns (table + indexes), keeping `DROP POLICY IF EXISTS`.
 
 ### Added
@@ -234,7 +234,7 @@ SQL, resolvers and IO inline, no hexagonal layering.
   `CRATE_NAME`).
 
 ### Removed
-- `docs/domain.md` — its staged hexagonal plan is superseded; the notification
+- `docs/domain.md` — its staged refactor plan is superseded; the notification
   lifecycle and behavior inventory it carried are absorbed into the README (its
   open questions on delete semantics and template allow-listing survive there).
 
@@ -252,9 +252,8 @@ SQL, resolvers and IO inline, no hexagonal layering.
 - Runtime-only `Dockerfile` (debian:bookworm-slim, ~80 MB). The binary is
   compiled outside Docker via `cross` and copied in — no more
   `--mount=type=ssh` required for image builds.
-- `scripts/publish.sh` + `scripts/lib/*.sh` — local/CI publish pipeline
-  mirrored from `svc-auth`. Supports `--dry-run`, `--local-image`,
-  `--check-only`, `--skip-checks`.
+- `scripts/publish.sh` + `scripts/lib/*.sh` — local/CI publish pipeline.
+  Supports `--dry-run`, `--local-image`, `--check-only`, `--skip-checks`.
 - `.dockerignore` and `CHANGELOG.md`.
 
 ### Changed
