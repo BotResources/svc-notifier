@@ -6,7 +6,9 @@ Endpoints (in-cluster):
   POST   http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/graphql
   GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/graphql/playground
   GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/sdl
-  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/health
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/livez
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/readyz
+  GET    http://{{ include "br-svc-notifier.fullname" . }}:{{ .Values.port }}/metrics
 
 Postgres DSNs must exist in Secret "{{ .Values.postgres.existingSecret }}" under keys:
   {{ .Values.postgres.keys.databaseUrl }}        (svc_notifier_app)

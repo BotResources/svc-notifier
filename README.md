@@ -188,7 +188,12 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   says); the re-read runs in a transaction scoped to the signal's recipient, so it
   obeys the same row-level-security policy as every user-facing read — the listener
   has no privileged, RLS-bypassing read path. The event is then routed to that
-  recipient's local subscription connections.
+  recipient's local subscription connections. This re-read is the only builder of an
+  `Added` push, so its recipient-isolation is proven at the envelope by
+  `scenarios_intake::s02_multi_recipient_fans_out_one_row_each_and_isolates_subscribers`
+  (each recipient's `Added` carries only its own row) and
+  `scenarios_surface::s06_rls_isolates_recipients_on_query_count_and_stream`
+  (a foreign recipient gets no `Added` push at all).
 - The only in-process state is the strictly per-connection registry of open
   subscriptions. Correctness is therefore replica-count-independent: a write handled
   by one instance reaches subscribers connected to any instance.
@@ -202,10 +207,22 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   resolved one; network policy blocks direct external access to the service. The
   passport middleware decodes that header — it is trustworthy *only* behind such a
   gateway, never on an exposed port.
+- **A service passport is rejected before any work.** Every query and mutation guards
+  on the passport kind first: a `Passport::Service` is a `FORBIDDEN` error returned
+  *before* a transaction is opened (notifications are recipient-scoped, and a service
+  is never a recipient). Proven by
+  `scenarios_authn::service_passport_queries_and_mutations_are_forbidden`.
 - **Row-level security as the authorization backstop**: resolvers open a transaction,
   inject the caller's transaction-local RLS context, and the policies restrict every
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
-  table owner cannot bypass it.
+  table owner cannot bypass it. The GraphQL path injects the context with the shared
+  `br_util_postgres::set_rls_context(tx, passport)`, threading the real `Passport`
+  from the auth middleware to the transaction boundary; the helper sets five
+  transaction-local `app.*` GUCs and the notifications policy reads only
+  `app.current_user_id`. The realtime listener has **no** `Passport` — its recipient
+  is synthesized from the `pg_notify` signal — so it keeps a single manual
+  `set_config('app.current_user_id', …, true)`; fabricating a fake identity just to
+  call the shared helper would be a security smell, not reuse.
 - **Two runtime PostgreSQL roles, least privilege**:
   - `svc_notifier_app` — GraphQL resolvers *and* the realtime listener's row
     re-reads; user-scoped by the RLS policies above. The listener scopes its
@@ -291,7 +308,9 @@ harness-only and is never handed to the service.
 |-----------------------|--------|------------------------------------------------------|
 | `/graphql`            | POST   | GraphQL endpoint; SSE subscriptions via `Accept: text/event-stream` |
 | `/graphql/playground` | GET    | GraphiQL UI                                          |
-| `/health`             | GET    | Health check                                         |
+| `/livez`              | GET    | Liveness — always `200` (`br-util-observability`); the chart points the liveness probe here |
+| `/readyz`             | GET    | Readiness (`br-util-axum-readiness`) — `200` once boot work succeeds, `503` while starting; the chart points the readiness probe here |
+| `/metrics`            | GET    | Prometheus exposition (`br-util-observability`) — process + HTTP collectors, anonymized labels |
 | `/sdl`                | GET    | GraphQL SDL (the gateway composer polls this path)   |
 
 ## Tests
@@ -363,6 +382,18 @@ lint), `--local-image`, `--dry-run` — see the script header.
   is no silent config drift. Moving the consumer declaration into the deployment
   (and flipping the bind to `get_consumer`) is owed; until then this is the
   defensible middle.
+- **`br_core_integration::DurableConsumer` (v0.8.0) was evaluated and declined for
+  the intake.** Its public `run_commands` / `run_events` deserialize every message
+  into the integration envelope (`IntegrationCommand<T>` / `IntegrationEvent<T>`);
+  the only payload-agnostic path (`run_inner`) is private. svc-notifier consumes a
+  **bare** `DeliverNotification` on `notifier.cmd.notification.deliver.v1` — a
+  wire-format frozen and tested in `br-notifier-contract` and depended on by
+  producers — so adopting the wrapper would mean re-enveloping the published
+  contract, a breaking change for no benefit. The intake keeps its hand-rolled
+  `consumer.messages()` loop (fatty tolerates inline IO), which also preserves its
+  own redelivery-budget and fail-closed-on-poison policy. Re-evaluate if the lib
+  later exposes a payload-agnostic `run` (the `bind` side already fits once the
+  consumer is deployment-declared).
 
 ## Open questions
 

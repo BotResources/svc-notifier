@@ -1,5 +1,3 @@
-// Trust-boundary scenarios: the service authorizes, never authenticates —
-// no Passport means 401 at the middleware, before any resolver runs.
 mod common;
 
 use common::*;
@@ -30,14 +28,48 @@ async fn graphql_with_malformed_passport_returns_401() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn health_is_accessible_without_passport() {
+async fn liveness_is_accessible_without_passport() {
     let ctx = TestContext::setup().await;
     let resp = reqwest::Client::new()
-        .get(format!("{}/health", ctx.instance.base_url))
+        .get(format!("{}/livez", ctx.instance.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn service_passport_queries_and_mutations_are_forbidden() {
+    let ctx = TestContext::setup().await;
+    let service_passport = make_service_passport(Uuid::now_v7());
+
+    let cases = [
+        ("notifierUnreadCount", UNREAD_QUERY, json!({})),
+        ("notifierNotifications", LIST_QUERY, json!({})),
+        (
+            "notifierMarkAllAsRead",
+            "mutation { notifierMarkAllAsRead }",
+            json!({}),
+        ),
+        (
+            "notifierMarkAsRead",
+            "mutation($id: ID!) { notifierMarkAsRead(notificationId: $id) }",
+            json!({"id": Uuid::now_v7().to_string()}),
+        ),
+    ];
+
+    for (field, query, vars) in cases {
+        let response = ctx.instance.graphql(&service_passport, query, vars).await;
+        assert!(
+            response["data"][field].is_null(),
+            "{field}: a service passport must not get a result: {response}"
+        );
+        assert_eq!(
+            response["errors"][0]["extensions"]["code"], "FORBIDDEN",
+            "{field}: a service passport must be rejected with FORBIDDEN before any work: {response}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -29,6 +29,10 @@ fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
     }
 }
 
+fn require_human(ctx: &Context<'_>) -> Result<()> {
+    recipient(ctx).map(|_| ())
+}
+
 fn coded(code: &str) -> Error {
     Error::new(code.to_string()).extend_with(|_, e| e.set("code", code))
 }
@@ -104,9 +108,9 @@ impl QueryRoot {
         #[graphql(default = 20)] first: i32,
         after: Option<ID>,
     ) -> Result<NotificationConnection> {
-        let caller = recipient(ctx)?;
+        require_human(ctx)?;
         let after = parse_id(after)?;
-        let mut tx = scoped_tx(ctx, &caller).await?;
+        let mut tx = scoped_tx(ctx).await?;
         let page = list_notifications(&mut tx, first as i64, after)
             .await
             .map_err(db_error)?;
@@ -118,8 +122,8 @@ impl QueryRoot {
     }
 
     async fn notifier_unread_count(&self, ctx: &Context<'_>) -> Result<i32> {
-        let caller = recipient(ctx)?;
-        let mut tx = scoped_tx(ctx, &caller).await?;
+        require_human(ctx)?;
+        let mut tx = scoped_tx(ctx).await?;
         let count = unread_count(&mut tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         Ok(count as i32)
@@ -133,7 +137,7 @@ impl MutationRoot {
     async fn notifier_mark_as_read(&self, ctx: &Context<'_>, notification_id: ID) -> Result<bool> {
         let caller = recipient(ctx)?;
         let id = require_id(&notification_id)?;
-        let mut tx = scoped_tx(ctx, &caller).await?;
+        let mut tx = scoped_tx(ctx).await?;
         match mark_as_read(&mut tx, caller.0, id)
             .await
             .map_err(db_error)?
@@ -148,7 +152,7 @@ impl MutationRoot {
 
     async fn notifier_mark_all_as_read(&self, ctx: &Context<'_>) -> Result<bool> {
         let caller = recipient(ctx)?;
-        let mut tx = scoped_tx(ctx, &caller).await?;
+        let mut tx = scoped_tx(ctx).await?;
         mark_all_as_read(&mut tx, caller.0)
             .await
             .map_err(db_error)?;
@@ -163,7 +167,7 @@ impl MutationRoot {
     ) -> Result<bool> {
         let caller = recipient(ctx)?;
         let id = require_id(&notification_id)?;
-        let mut tx = scoped_tx(ctx, &caller).await?;
+        let mut tx = scoped_tx(ctx).await?;
         let deleted = delete_notifications(&mut tx, caller.0, &[id])
             .await
             .map_err(db_error)?;
@@ -177,7 +181,7 @@ impl MutationRoot {
     async fn notifier_delete_notifications(&self, ctx: &Context<'_>, ids: Vec<ID>) -> Result<bool> {
         let caller = recipient(ctx)?;
         let ids = ids.iter().map(require_id).collect::<Result<Vec<_>>>()?;
-        let mut tx = scoped_tx(ctx, &caller).await?;
+        let mut tx = scoped_tx(ctx).await?;
         delete_notifications(&mut tx, caller.0, &ids)
             .await
             .map_err(db_error)?;
@@ -227,15 +231,11 @@ fn into_union(event: ClientEvent) -> NotifierNotificationEvent {
     }
 }
 
-async fn scoped_tx<'a>(
-    ctx: &Context<'a>,
-    caller: &Recipient,
-) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+async fn scoped_tx<'a>(ctx: &Context<'a>) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
     let state = ctx.data::<AppState>()?;
+    let passport = ctx.data::<Passport>()?;
     let mut tx = state.app_pool.begin().await.map_err(db_error)?;
-    sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
-        .bind(caller.0.to_string())
-        .execute(&mut *tx)
+    br_util_postgres::set_rls_context(&mut tx, passport)
         .await
         .map_err(db_error)?;
     Ok(tx)

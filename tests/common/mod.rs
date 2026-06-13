@@ -264,7 +264,7 @@ impl TestContext {
 
 impl ServiceInstance {
     async fn wait_for_health(&self) {
-        let url = format!("{}/health", self.base_url);
+        let url = format!("{}/readyz", self.base_url);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -367,8 +367,6 @@ impl ServiceInstance {
         }
     }
 
-    /// Raw GET on an arbitrary path (no Passport) — used to pin unauthenticated
-    /// HTTP-surface routes like `/sdl` and `/health`.
     pub async fn get(&self, path: &str) -> (reqwest::StatusCode, String) {
         let client = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
