@@ -159,7 +159,7 @@ jobs:
           # crate.
           #   RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel; no patch
           #     available. Pulled transitively by sqlx-postgres for SCRAM
-          #     auth. svc-auth ignores the same advisory.
+          #     auth.
           #   RUSTSEC-2026-0097 — rand unsound under custom-logger + ThreadRng
           #     reseed scenario we do not hit.
           ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0097
