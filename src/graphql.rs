@@ -29,6 +29,10 @@ fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
     }
 }
 
+fn require_human(ctx: &Context<'_>) -> Result<()> {
+    recipient(ctx).map(|_| ())
+}
+
 fn coded(code: &str) -> Error {
     Error::new(code.to_string()).extend_with(|_, e| e.set("code", code))
 }
@@ -104,7 +108,7 @@ impl QueryRoot {
         #[graphql(default = 20)] first: i32,
         after: Option<ID>,
     ) -> Result<NotificationConnection> {
-        recipient(ctx)?;
+        require_human(ctx)?;
         let after = parse_id(after)?;
         let mut tx = scoped_tx(ctx).await?;
         let page = list_notifications(&mut tx, first as i64, after)
@@ -118,7 +122,7 @@ impl QueryRoot {
     }
 
     async fn notifier_unread_count(&self, ctx: &Context<'_>) -> Result<i32> {
-        recipient(ctx)?;
+        require_human(ctx)?;
         let mut tx = scoped_tx(ctx).await?;
         let count = unread_count(&mut tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;

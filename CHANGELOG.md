@@ -38,6 +38,13 @@ wire format; the probe-endpoint change is an operational contract for the chart.
   `httpGet /livez` and the readiness probe to `/readyz` (`values.yaml` gains
   `probes.liveness.path`); chart `version`/`appVersion` bump to 0.5.0 in lockstep.
 
+### Tests
+- **The service-passport rejection is now proven on the query/mutation surface.**
+  `scenarios_authn::service_passport_queries_and_mutations_are_forbidden` asserts a
+  `Passport::Service` gets a `FORBIDDEN` verdict (no result) on both reads and writes,
+  backing the README's "rejected before any work" claim. The query/mutation guard is
+  extracted as a named `require_human` so its authZ intent is not mistaken for dead code.
+
 ### Notes
 - **`br_core_integration::DurableConsumer` evaluated and declined for the intake.**
   Its public consume methods force the integration envelope; svc-notifier consumes

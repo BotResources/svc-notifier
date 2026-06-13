@@ -188,7 +188,12 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   says); the re-read runs in a transaction scoped to the signal's recipient, so it
   obeys the same row-level-security policy as every user-facing read — the listener
   has no privileged, RLS-bypassing read path. The event is then routed to that
-  recipient's local subscription connections.
+  recipient's local subscription connections. This re-read is the only builder of an
+  `Added` push, so its recipient-isolation is proven at the envelope by
+  `scenarios_intake::s02_multi_recipient_fans_out_one_row_each_and_isolates_subscribers`
+  (each recipient's `Added` carries only its own row) and
+  `scenarios_surface::s06_rls_isolates_recipients_on_query_count_and_stream`
+  (a foreign recipient gets no `Added` push at all).
 - The only in-process state is the strictly per-connection registry of open
   subscriptions. Correctness is therefore replica-count-independent: a write handled
   by one instance reaches subscribers connected to any instance.
@@ -202,6 +207,11 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   resolved one; network policy blocks direct external access to the service. The
   passport middleware decodes that header — it is trustworthy *only* behind such a
   gateway, never on an exposed port.
+- **A service passport is rejected before any work.** Every query and mutation guards
+  on the passport kind first: a `Passport::Service` is a `FORBIDDEN` error returned
+  *before* a transaction is opened (notifications are recipient-scoped, and a service
+  is never a recipient). Proven by
+  `scenarios_authn::service_passport_queries_and_mutations_are_forbidden`.
 - **Row-level security as the authorization backstop**: resolvers open a transaction,
   inject the caller's transaction-local RLS context, and the policies restrict every
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
