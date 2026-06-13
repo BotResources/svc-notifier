@@ -33,9 +33,8 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "allow"
-# Versionless git/path deps (the br-* git pins, the in-workspace contract
-# crate) are how this repo consumes them — not accidental `*` requirements.
-wildcards = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

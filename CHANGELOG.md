@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.1
+
+### Changed
+- **Explicit version on every `br-rust-common` pin.** The form is now
+  `{ git, package, tag = "v0.8.0", version = "0.8.0" }` on all five deps and the
+  `br-core-auth` dev-dep — a bare `{ git, tag }` pin is, to cargo, a wildcard
+  (`*`); the version makes the requirement explicit and readable. `[bans]
+  wildcards` flips `allow` → `deny`, with `allow-wildcard-paths = true` and
+  `publish = false` so the in-workspace `br-notifier-contract` path dep stays
+  exempt, so the pin form cannot silently regress to a wildcard. No `Cargo.lock`
+  change, no runtime change.
+
 ## 0.5.0
 
 A reuse pass on the shared library: bump every `br-rust-common` pin to the unified
