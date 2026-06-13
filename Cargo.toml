@@ -6,6 +6,7 @@ default-members = [".", "br-notifier-contract"]
 name = "svc-notifier"
 version = "0.5.0"
 edition = "2024"
+publish = false
 rust-version = "1.94"
 license = "MIT"
 description = "Standalone notification service — NATS intake, GraphQL API, RLS, real-time subscriptions"
@@ -13,11 +14,11 @@ repository = "https://github.com/BotResources/svc-notifier"
 
 [dependencies]
 br-notifier-contract = { path = "br-notifier-contract" }
-br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.8.0" }
-br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.8.0" }
-br-util-axum-readiness = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-readiness", tag = "v0.8.0" }
-br-util-observability = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-observability", tag = "v0.8.0" }
-br-util-postgres = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-postgres", tag = "v0.8.0" }
+br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.8.0", version = "0.8.0" }
+br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.8.0", version = "0.8.0" }
+br-util-axum-readiness = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-readiness", tag = "v0.8.0", version = "0.8.0" }
+br-util-observability = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-observability", tag = "v0.8.0", version = "0.8.0" }
+br-util-postgres = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-postgres", tag = "v0.8.0", version = "0.8.0" }
 async-graphql = { version = "7", features = ["chrono", "uuid"] }
 async-nats = "0.48"
 axum = "0.8"
@@ -34,7 +35,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 br-notifier-contract = { path = "br-notifier-contract" }
-br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.8.0" }
+br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.8.0", version = "0.8.0" }
 async-nats = "0.48"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
