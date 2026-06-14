@@ -1,6 +1,4 @@
-use async_graphql::{
-    Context, Error, ErrorExtensions, ID, Object, Result, SimpleObject, Subscription, Union,
-};
+use async_graphql::{Context, ID, Object, SimpleObject, Subscription, Union};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use sqlx::PgPool;
@@ -8,12 +6,15 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use br_core_auth::Passport;
+use br_util_graphql::EdgeError;
 
 use crate::notification::{
     Notification, delete_notifications, list_notifications, mark_all_as_read, mark_as_read,
     unread_count,
 };
 use crate::realtime::{ClientEvent, Subscribers};
+
+type Result<T> = std::result::Result<T, EdgeError>;
 
 pub struct AppState {
     pub app_pool: PgPool,
@@ -22,10 +23,15 @@ pub struct AppState {
 
 struct Recipient(Uuid);
 
+fn passport<'a>(ctx: &Context<'a>) -> Result<&'a Passport> {
+    ctx.data::<Passport>()
+        .map_err(|_| EdgeError::internal("missing passport in context"))
+}
+
 fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
-    match ctx.data::<Passport>()? {
+    match passport(ctx)? {
         Passport::Human { user_id, .. } => Ok(Recipient(*user_id)),
-        Passport::Service { .. } => Err(coded("FORBIDDEN")),
+        Passport::Service { .. } => Err(EdgeError::forbidden()),
     }
 }
 
@@ -33,13 +39,9 @@ fn require_human(ctx: &Context<'_>) -> Result<()> {
     recipient(ctx).map(|_| ())
 }
 
-fn coded(code: &str) -> Error {
-    Error::new(code.to_string()).extend_with(|_, e| e.set("code", code))
-}
-
-fn db_error(error: sqlx::Error) -> Error {
+fn db_error(error: sqlx::Error) -> EdgeError {
     tracing::error!(%error, "database error");
-    coded("INTERNAL")
+    EdgeError::internal("database error")
 }
 
 #[derive(SimpleObject)]
@@ -146,7 +148,7 @@ impl MutationRoot {
                 tx.commit().await.map_err(db_error)?;
                 Ok(true)
             }
-            None => Err(coded("NOT_FOUND")),
+            None => Err(EdgeError::not_found()),
         }
     }
 
@@ -172,7 +174,7 @@ impl MutationRoot {
             .await
             .map_err(db_error)?;
         if deleted.is_empty() {
-            return Err(coded("NOT_FOUND"));
+            return Err(EdgeError::not_found());
         }
         tx.commit().await.map_err(db_error)?;
         Ok(true)
@@ -232,8 +234,10 @@ fn into_union(event: ClientEvent) -> NotifierNotificationEvent {
 }
 
 async fn scoped_tx<'a>(ctx: &Context<'a>) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
-    let state = ctx.data::<AppState>()?;
-    let passport = ctx.data::<Passport>()?;
+    let state = ctx
+        .data::<AppState>()
+        .map_err(|_| EdgeError::internal("missing app state in context"))?;
+    let passport = passport(ctx)?;
     let mut tx = state.app_pool.begin().await.map_err(db_error)?;
     br_util_postgres::set_rls_context(&mut tx, passport)
         .await
@@ -249,5 +253,5 @@ fn parse_id(id: Option<ID>) -> Result<Option<Uuid>> {
 }
 
 fn require_id(id: &ID) -> Result<Uuid> {
-    Uuid::parse_str(id.as_str()).map_err(|_| coded("BAD_REQUEST"))
+    Uuid::parse_str(id.as_str()).map_err(|_| EdgeError::bad_user_input())
 }

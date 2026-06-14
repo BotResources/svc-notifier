@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **GraphQL error code `BAD_REQUEST` → `BAD_USER_INPUT`.** A malformed `ID`
+  argument (an unparseable notification id) returned the `code` extension
+  `BAD_REQUEST`, which is not in the published `ErrorCode` contract the gateway
+  and frontend bind to. It now returns `BAD_USER_INPUT`. `FORBIDDEN`,
+  `NOT_FOUND` and the internal/database mapping are unchanged, and the error
+  *shape* (`extensions: { code }`) is identical — only the one wrong code is
+  corrected.
+
+### Changed
+- **Adopt `br-util-graphql` for edge errors.** The hand-rolled `coded` /
+  `db_error` helpers are replaced by `br_util_graphql::EdgeError`; resolvers
+  return `Result<_, EdgeError>` and rely on the crate's
+  `From<EdgeError> for async_graphql::Error`. Internal/database failures map to
+  `EdgeError::internal` (detail logged, never returned to the client).
+- **Bump `br-rust-common` to `v0.11.0`.** All five prod deps and the
+  `br-core-auth` dev-dep move from `tag = "v0.10.0"` to `tag = "v0.11.0"` with
+  the matching `version = "0.11.0"`; adds `br-util-graphql` (`graphql` feature)
+  at the same pin. The full e2e suite passes against real Postgres + NATS.
+
+### Removed
+- **Doc-comments stripped from `br-notifier-contract`.** The `//!` / `///`
+  rustdoc on `lib.rs` is removed (house no-comments rule); the surviving intent
+  already lives in `br-notifier-contract/README.md`.
+
 ## 0.5.2
 
 A dependency-and-metadata patch: bump the shared library and pick up the
