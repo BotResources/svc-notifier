@@ -20,7 +20,7 @@ permissions:
 jobs:
   fmt:
     name: cargo fmt (auto-fix)
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -59,7 +59,7 @@ jobs:
   check:
     name: cargo clippy + test
     needs: fmt
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +88,7 @@ jobs:
   integration:
     name: integration (e2e)
     needs: fmt
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -145,7 +145,7 @@ jobs:
   audit:
     name: cargo audit (RustSec)
     needs: fmt
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: write
@@ -167,7 +167,7 @@ jobs:
   deny:
     name: cargo-deny check
     needs: fmt
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -177,7 +177,7 @@ jobs:
   machete:
     name: cargo-machete (unused deps)
     needs: fmt
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -188,7 +188,7 @@ jobs:
   semver:
     name: cargo semver-checks (contract)
     needs: fmt
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -211,7 +211,7 @@ jobs:
 
   changelog:
     name: changelog entry present (per crate)
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -242,7 +242,7 @@ jobs:
 
   shellcheck:
     name: shellcheck
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
@@ -253,7 +253,7 @@ jobs:
 
   secrets:
     name: trufflehog (secret scan)
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:

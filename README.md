@@ -2,16 +2,16 @@
 
 > [!IMPORTANT]
 > **This repository is maintained for BotResources and its authorized clients.**
-> It is published under MIT and made available read-only for visibility. The MIT
-> license governs your rights to use, modify, and fork the code; the rest of this
-> notice describes our operational stance, not a legal restriction.
+> It is published under Apache-2.0 and made available read-only for visibility
+> and dependency consumption. The Apache-2.0 license governs your rights to
+> use, modify, and fork the code; the rest of this notice describes our
+> operational stance, not a legal restriction.
 >
 > **We do not accept external pull requests, issues, or support requests.**
 > Issues and Discussions are disabled. PRs from accounts that are not on the
-> internal contributor allowlist will be closed without review. Forks are
-> permitted by MIT and we do not (and cannot) prevent them; we simply do not
-> monitor, support, or accept contributions from forks outside the BR commercial
-> relationship.
+> internal contributor allowlist will be closed without review. The GitHub
+> fork button is disabled — you may still fork under Apache-2.0, but we
+> provide no support outside the BR commercial relationship.
 >
 > - Clients with a commercial relationship: contact your BR account manager.
 > - Security reports: see [SECURITY.md](SECURITY.md) (private email channel).
@@ -424,7 +424,7 @@ lint), `--local-image`, `--dry-run` — see the script header.
 
 ## License & contributing
 
-MIT — see [LICENSE](LICENSE). This repository does not accept external
+Apache-2.0 — see [LICENSE](LICENSE). This repository does not accept external
 contributions or support requests; see [CONTRIBUTING.md](CONTRIBUTING.md) and
 [SUPPORT.md](SUPPORT.md). Report security issues privately via
 [SECURITY.md](SECURITY.md).

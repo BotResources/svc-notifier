@@ -37,7 +37,7 @@ env:
 jobs:
   detect-bump:
     name: detect-bump
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     outputs:
       publish_service: ${{ steps.detect.outputs.publish_service }}
       service_version: ${{ steps.detect.outputs.service_version }}
@@ -121,7 +121,7 @@ jobs:
     name: Publish image + chart
     needs: detect-bump
     if: needs.detect-bump.outputs.publish_service == 'true'
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash
@@ -176,7 +176,7 @@ jobs:
     name: Tag + Release svc-notifier
     needs: [detect-bump, publish]
     if: needs.detect-bump.outputs.publish_service == 'true' && github.ref == 'refs/heads/main'
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -203,7 +203,7 @@ jobs:
     name: Tag + Release br-notifier-contract
     needs: detect-bump
     if: needs.detect-bump.outputs.tag_contract == 'true'
-    runs-on: arc-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
