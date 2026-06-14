@@ -3,7 +3,7 @@ name = "br-notifier-contract"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-license = "MIT"
+license = "Apache-2.0"
 description = "Published language for svc-notifier — typed deliver command, fail-closed RelativeLink, subject constant"
 repository = "https://github.com/BotResources/svc-notifier"
 

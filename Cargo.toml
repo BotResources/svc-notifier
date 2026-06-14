@@ -8,7 +8,7 @@ version = "0.5.1"
 edition = "2024"
 publish = false
 rust-version = "1.94"
-license = "MIT"
+license = "Apache-2.0"
 description = "Standalone notification service — NATS intake, GraphQL API, RLS, real-time subscriptions"
 repository = "https://github.com/BotResources/svc-notifier"
 
