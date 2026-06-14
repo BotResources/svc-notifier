@@ -53,7 +53,10 @@ async fn s01_deliver_command_reaches_the_recipient_on_all_three_envelopes() {
     assert_eq!(info.num_redelivered, 0, "no redelivery on the happy path");
 
     // then: GraphQL — subscription push, query and unread count agree
-    let event = subscription.expect_event("NotificationAdded").await;
+    let raw = subscription
+        .expect_event("NotificationAdded", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
     assert_eq!(event["__typename"], "NotificationAdded");
     let pushed = &event["notification"];
     assert_eq!(pushed["id"], json!(rows[0].id));
@@ -99,12 +102,22 @@ async fn s02_multi_recipient_fans_out_one_row_each_and_isolates_subscribers() {
         assert_eq!(ctx.stack.rows_for(recipient).await.len(), 1);
     }
 
-    let alice_event = alice_sub.expect_event("alice's NotificationAdded").await;
-    assert_eq!(alice_event["notification"]["template"], "fanout");
-    let bob_event = bob_sub.expect_event("bob's NotificationAdded").await;
-    assert_eq!(bob_event["notification"]["template"], "fanout");
+    let alice_raw = alice_sub
+        .expect_event("alice's NotificationAdded", SSE_TIMEOUT)
+        .await;
+    assert_eq!(
+        notifier_event(&alice_raw)["notification"]["template"],
+        "fanout"
+    );
+    let bob_raw = bob_sub
+        .expect_event("bob's NotificationAdded", SSE_TIMEOUT)
+        .await;
+    assert_eq!(
+        notifier_event(&bob_raw)["notification"]["template"],
+        "fanout"
+    );
     alice_sub
-        .expect_silence("only one event per recipient")
+        .expect_silence("only one event per recipient", CONSUME_WAIT)
         .await;
 }
 
@@ -153,12 +166,12 @@ async fn s03_duplicate_source_event_first_wins_even_with_a_different_payload() {
     assert_eq!(info.num_ack_pending, 0);
 
     // then: GraphQL — one notification, one push (no duplicate event)
-    let event = subscription
-        .expect_event("the first NotificationAdded")
+    let raw = subscription
+        .expect_event("the first NotificationAdded", SSE_TIMEOUT)
         .await;
-    assert_eq!(event["notification"]["template"], "first");
+    assert_eq!(notifier_event(&raw)["notification"]["template"], "first");
     subscription
-        .expect_silence("no push for the deduplicated message")
+        .expect_silence("no push for the deduplicated message", CONSUME_WAIT)
         .await;
     let count = ctx
         .instance
@@ -194,7 +207,9 @@ async fn s04_malformed_payload_is_acked_without_persistence_or_push() {
         "no redelivery storm on poison messages"
     );
     assert_eq!(ctx.stack.count_rows().await, 0);
-    subscription.expect_silence("nothing reaches GraphQL").await;
+    subscription
+        .expect_silence("nothing reaches GraphQL", CONSUME_WAIT)
+        .await;
 }
 
 #[tokio::test]
@@ -234,7 +249,7 @@ async fn s05_invalid_link_rejects_the_whole_message_fail_closed() {
         "no partial fan-out: zero rows for any recipient"
     );
     alice_sub
-        .expect_silence("nothing reaches any recipient")
+        .expect_silence("nothing reaches any recipient", CONSUME_WAIT)
         .await;
 }
 
@@ -340,9 +355,9 @@ async fn s14_redelivery_of_a_partially_applied_batch_completes_without_duplicate
 
     // then: GraphQL — the already-served recipient gets exactly one push
     first_recipient_sub
-        .expect_event("the initial NotificationAdded")
+        .expect_event("the initial NotificationAdded", SSE_TIMEOUT)
         .await;
     first_recipient_sub
-        .expect_silence("no duplicate push on redelivery")
+        .expect_silence("no duplicate push on redelivery", CONSUME_WAIT)
         .await;
 }

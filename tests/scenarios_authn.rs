@@ -1,5 +1,6 @@
 mod common;
 
+use br_test_harness::verdict;
 use common::*;
 use reqwest::StatusCode;
 use serde_json::json;
@@ -65,9 +66,13 @@ async fn service_passport_queries_and_mutations_are_forbidden() {
             response["data"][field].is_null(),
             "{field}: a service passport must not get a result: {response}"
         );
+        let code = verdict::expect_code_shaped(
+            &response,
+            &format!("{field}: a service passport must be rejected before any work"),
+        );
         assert_eq!(
-            response["errors"][0]["extensions"]["code"], "FORBIDDEN",
-            "{field}: a service passport must be rejected with FORBIDDEN before any work: {response}"
+            code, "FORBIDDEN",
+            "{field}: a service passport must be rejected with FORBIDDEN: {response}"
         );
     }
 }
@@ -92,6 +97,6 @@ async fn service_passports_get_no_subscription_events() {
     );
 
     subscription
-        .expect_silence("a service is never a recipient")
+        .expect_silence("a service is never a recipient", CONSUME_WAIT)
         .await;
 }

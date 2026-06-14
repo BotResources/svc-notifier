@@ -1,16 +1,8 @@
-//! Published language for `svc-notifier` — the contract producers use to request
-//! a notification delivery. Owned by the receiver; versioned independently of the
-//! service. See the repository README for the full intake semantics.
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// JetStream subject on which [`DeliverNotification`] commands are published.
 pub const DELIVER_SUBJECT: &str = "notifier.cmd.notification.deliver.v1";
 
-/// The v1 deliver command: one message fans out to one notification per recipient.
-/// Delivery is idempotent on `(source_event_id, recipient_id)` — the first command
-/// wins, duplicates are silently skipped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeliverNotification {
     pub source_event_id: Uuid,
@@ -21,12 +13,6 @@ pub struct DeliverNotification {
     pub link: Option<RelativeLink>,
 }
 
-/// A link a frontend can render on a notification — restricted to same-domain
-/// relative URLs, validated at construction and on deserialization (fail closed).
-///
-/// Accepted: a path rooted at `/` (query string and fragment allowed).
-/// Rejected: everything else — absolute URLs and schemes (`https:`, `javascript:`, …),
-/// scheme-relative `//host`, backslashes, whitespace, control characters, empty input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RelativeLink(String);

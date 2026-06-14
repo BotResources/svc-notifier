@@ -2,6 +2,7 @@
 // and the contract that every state change reaches every session's stream.
 mod common;
 
+use br_test_harness::verdict;
 use common::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -83,7 +84,9 @@ async fn s06_rls_isolates_recipients_on_query_count_and_stream() {
         .graphql(&intruder_passport, UNREAD_QUERY, json!({}))
         .await;
     assert_eq!(ServiceInstance::unread_count(&count), 0);
-    intruder_sub.expect_silence("no cross-recipient push").await;
+    intruder_sub
+        .expect_silence("no cross-recipient push", CONSUME_WAIT)
+        .await;
 
     assert_eq!(
         ctx.stack.rows_for(owner).await.len(),
@@ -113,14 +116,12 @@ async fn s09_mark_as_read_propagates_to_every_session_of_the_recipient() {
             json!({"id": notification_id}),
         )
         .await;
-    assert_eq!(
-        ack["data"]["notifierMarkAsRead"], true,
-        "mutation returns an ack: {ack}"
-    );
+    verdict::expect_ack(&ack, "notifierMarkAsRead");
 
     // then: both sessions receive the same bulk-shaped fact
     for (name, session) in [("A", &mut session_a), ("B", &mut session_b)] {
-        let event = session.expect_event("NotificationsRead").await;
+        let raw = session.expect_event("NotificationsRead", SSE_TIMEOUT).await;
+        let event = notifier_event(&raw);
         assert_eq!(event["__typename"], "NotificationsRead", "session {name}");
         assert_eq!(event["ids"], json!([notification_id]), "session {name}");
         assert!(
@@ -159,9 +160,12 @@ async fn s10_mark_all_as_read_emits_exactly_one_bulk_event() {
         .instance
         .graphql(&passport, "mutation { notifierMarkAllAsRead }", json!({}))
         .await;
-    assert_eq!(ack["data"]["notifierMarkAllAsRead"], true);
+    verdict::expect_ack(&ack, "notifierMarkAllAsRead");
 
-    let event = session.expect_event("one bulk NotificationsRead").await;
+    let raw = session
+        .expect_event("one bulk NotificationsRead", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
     assert_eq!(event["__typename"], "NotificationsRead");
     let mut ids: Vec<String> = event["ids"]
         .as_array()
@@ -176,7 +180,7 @@ async fn s10_mark_all_as_read_emits_exactly_one_bulk_event() {
         "the single event carries every affected id"
     );
     session
-        .expect_silence("exactly one event, not one per row")
+        .expect_silence("exactly one event, not one per row", CONSUME_WAIT)
         .await;
 
     assert!(
@@ -211,9 +215,9 @@ async fn s11_bulk_delete_skips_foreign_ids_and_emits_only_owned_ones() {
             json!({"ids": [owned_one, owned_two, foreign]}),
         )
         .await;
-    assert_eq!(
-        ack["data"]["notifierDeleteNotifications"], true,
-        "foreign ids are invisible, not an error: {ack}"
+    verdict::expect_ack(
+        &ack,
+        "notifierDeleteNotifications (foreign ids are invisible)",
     );
 
     // then: PG — own rows gone, the foreign row untouched
@@ -222,7 +226,10 @@ async fn s11_bulk_delete_skips_foreign_ids_and_emits_only_owned_ones() {
 
     // then: GraphQL — one event, owned ids only, foreign id absent; the
     // other user sees nothing at all
-    let event = caller_session.expect_event("NotificationsDeleted").await;
+    let raw = caller_session
+        .expect_event("NotificationsDeleted", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
     assert_eq!(event["__typename"], "NotificationsDeleted");
     let mut ids: Vec<String> = event["ids"]
         .as_array()
@@ -238,7 +245,7 @@ async fn s11_bulk_delete_skips_foreign_ids_and_emits_only_owned_ones() {
         "the foreign id must be absent from the event"
     );
     other_session
-        .expect_silence("the other user observes nothing")
+        .expect_silence("the other user observes nothing", CONSUME_WAIT)
         .await;
 }
 
@@ -260,9 +267,12 @@ async fn s12_single_delete_is_observed_by_other_sessions() {
             json!({"id": notification_id}),
         )
         .await;
-    assert_eq!(ack["data"]["notifierDeleteNotification"], true);
+    verdict::expect_ack(&ack, "notifierDeleteNotification");
 
-    let event = other_session.expect_event("NotificationsDeleted").await;
+    let raw = other_session
+        .expect_event("NotificationsDeleted", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
     assert_eq!(event["__typename"], "NotificationsDeleted");
     assert_eq!(event["ids"], json!([notification_id]));
     assert_eq!(ctx.stack.rows_for(recipient).await.len(), 0);

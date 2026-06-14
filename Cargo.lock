@@ -318,11 +318,12 @@ dependencies = [
 
 [[package]]
 name = "br-core-auth"
-version = "0.10.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.10.0#32c463adc19791205230de75cd603ae375b7633d"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
 dependencies = [
  "base64",
  "br-core-kernel",
+ "br-core-scope",
  "serde",
  "serde_json",
  "sha2",
@@ -332,11 +333,29 @@ dependencies = [
 
 [[package]]
 name = "br-core-kernel"
-version = "0.10.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.10.0#32c463adc19791205230de75cd603ae375b7633d"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
 dependencies = [
  "serde",
  "uuid",
+]
+
+[[package]]
+name = "br-core-scope"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "br-core-values"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
+dependencies = [
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -351,9 +370,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "br-test-harness"
+version = "0.5.1"
+source = "git+https://github.com/BotResources/br-e2e-harness?tag=v0.5.1#0606dc20960484afa133adf0a3db3824324ff1e8"
+dependencies = [
+ "async-nats",
+ "br-core-auth",
+ "bytes",
+ "dotenvy",
+ "futures-util",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "br-util-axum-auth"
-version = "0.10.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.10.0#32c463adc19791205230de75cd603ae375b7633d"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
 dependencies = [
  "axum",
  "br-core-auth",
@@ -362,17 +400,29 @@ dependencies = [
 
 [[package]]
 name = "br-util-axum-readiness"
-version = "0.10.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.10.0#32c463adc19791205230de75cd603ae375b7633d"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
 dependencies = [
  "axum",
  "tracing",
 ]
 
 [[package]]
+name = "br-util-graphql"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
+dependencies = [
+ "async-graphql",
+ "axum",
+ "br-core-values",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "br-util-observability"
-version = "0.10.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.10.0#32c463adc19791205230de75cd603ae375b7633d"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
 dependencies = [
  "axum",
  "chrono",
@@ -388,8 +438,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-postgres"
-version = "0.10.0"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v0.10.0#32c463adc19791205230de75cd603ae375b7633d"
+version = "0.11.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v0.11.0#c186db041004ee190ca9c16243c78ccf70444f91"
 dependencies = [
  "br-core-auth",
  "sqlx",
@@ -444,6 +494,12 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
@@ -1081,8 +1137,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1092,9 +1150,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1318,6 +1378,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -1675,6 +1736,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "lru-slab"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "mach2"
@@ -2243,6 +2310,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "quinn"
+version = "0.11.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "pin-project-lite",
+ "quinn-proto",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-proto"
+version = "0.11.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+dependencies = [
+ "bytes",
+ "getrandom 0.3.4",
+ "lru-slab",
+ "rand 0.9.4",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror",
+ "tinyvec",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "quinn-udp"
+version = "0.5.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+dependencies = [
+ "cfg_aliases",
+ "libc",
+ "once_cell",
+ "socket2",
+ "tracing",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2438,6 +2560,8 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2445,6 +2569,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -2454,6 +2579,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2559,6 +2685,7 @@ version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be040f8b0a225e40375822a563fa9524378b9d63112f53e19ffff34df5d33fdd"
 dependencies = [
+ "web-time",
  "zeroize",
 ]
 
@@ -3143,18 +3270,19 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svc-notifier"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-graphql",
  "async-nats",
  "axum",
  "br-core-auth",
  "br-notifier-contract",
+ "br-test-harness",
  "br-util-axum-auth",
  "br-util-axum-readiness",
+ "br-util-graphql",
  "br-util-observability",
  "br-util-postgres",
- "bytes",
  "chrono",
  "dotenvy",
  "futures",
@@ -3814,6 +3942,16 @@ name = "web-sys"
 version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f2dfbb17949fa2088e5d39408c48368947b86f7834484e87b73de55bc14d97d"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

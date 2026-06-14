@@ -10,6 +10,8 @@ It is versioned independently of the `svc-notifier` service crate.
 
 ### Changed
 - Relicensed from MIT to Apache-2.0.
+- Stripped doc-comments from `lib.rs` per the no-comments doctrine; the contract
+  surface is unchanged (public API stable).
 
 ## 0.1.0
 
