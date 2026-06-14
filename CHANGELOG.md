@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.6.0
+
 ### Fixed
 - **GraphQL error code `BAD_REQUEST` → `BAD_USER_INPUT`.** A malformed `ID`
   argument (an unparseable notification id) returned the `code` extension
@@ -22,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return `Result<_, EdgeError>` and rely on the crate's
   `From<EdgeError> for async_graphql::Error`. Internal/database failures map to
   `EdgeError::internal` (detail logged, never returned to the client).
+- **Missing-context error codes.** Paths where `Passport` or `AppState` is
+  absent (server misconfiguration only) now emit `code: INTERNAL` instead of
+  async-graphql's code-less default — a strict improvement, surfaced here for
+  honesty.
 - **Bump `br-rust-common` to `v0.11.0`.** All five prod deps and the
   `br-core-auth` dev-dep move from `tag = "v0.10.0"` to `tag = "v0.11.0"` with
   the matching `version = "0.11.0"`; adds `br-util-graphql` (`graphql` feature)
