@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.5.2
+
+A dependency-and-metadata patch: bump the shared library and pick up the
+Apache-2.0 relicense. No code, contract, or behavior change.
+
 ### Changed
 - **Bump `br-rust-common` to `v0.10.0`.** All five deps (`br-core-auth`,
   `br-util-axum-auth`, `br-util-axum-readiness`, `br-util-observability`,
@@ -19,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumes — so no API breakage and no runtime change. The full e2e suite passes
   against real Postgres + NATS.
 - Relicensed from MIT to Apache-2.0.
+- Chart `version`/`appVersion` bumped to 0.5.2 in lockstep with the crate (no
+  template change).
 
 ## 0.5.1
 
