@@ -3,6 +3,7 @@
 // that handled the write.
 mod common;
 
+use br_test_harness::verdict;
 use common::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -38,7 +39,8 @@ async fn s13_subscribe_then_snapshot_loses_nothing_across_the_gap() {
         .collect();
 
     let mut event_ids = Vec::new();
-    while let Some(event) = subscription.next_event(SSE_TIMEOUT).await {
+    while let Some(raw) = subscription.next_event(SSE_TIMEOUT).await {
+        let event = notifier_event(&raw);
         if event["__typename"] == "NotificationAdded" {
             event_ids.push(event["notification"]["id"].as_str().unwrap().to_string());
         }
@@ -82,9 +84,10 @@ async fn s15_two_replicas_pushes_derive_from_committed_pg_state() {
     );
 
     // then: the subscriber connected to instance A receives the push
-    let event = subscriber_on_a
-        .expect_event("NotificationAdded across instances")
+    let raw = subscriber_on_a
+        .expect_event("NotificationAdded across instances", SSE_TIMEOUT)
         .await;
+    let event = notifier_event(&raw);
     assert_eq!(event["__typename"], "NotificationAdded");
     assert_eq!(event["notification"]["template"], "cross_instance");
     let notification_id = event["notification"]["id"].as_str().unwrap().to_string();
@@ -97,12 +100,13 @@ async fn s15_two_replicas_pushes_derive_from_committed_pg_state() {
             json!({"id": notification_id}),
         )
         .await;
-    assert_eq!(ack["data"]["notifierMarkAsRead"], true, "{ack}");
+    verdict::expect_ack(&ack, "notifierMarkAsRead across instances");
 
     // then: instance A's subscriber observes the read fact
-    let event = subscriber_on_a
-        .expect_event("NotificationsRead across instances")
+    let raw = subscriber_on_a
+        .expect_event("NotificationsRead across instances", SSE_TIMEOUT)
         .await;
+    let event = notifier_event(&raw);
     assert_eq!(event["__typename"], "NotificationsRead");
     assert_eq!(event["ids"], json!([notification_id]));
 }

@@ -2,16 +2,16 @@
 // helpers shared here appear dead to clippy from binaries that don't use them.
 #![allow(dead_code)]
 
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use async_nats::jetstream;
-use br_core_auth::{AuthMethod, Passport, PassportHeader};
+use br_core_auth::{Passport, PassportBuilder};
 use br_notifier_contract::{DELIVER_SUBJECT, DeliverNotification};
+use br_test_harness::{GraphqlClient, SpawnedProcess, SseSubscription, nats, recreate_stream};
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -34,8 +34,6 @@ fn next_port() -> u16 {
 }
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONSUME_WAIT: Duration = Duration::from_secs(3);
 pub const SSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,11 +55,12 @@ pub struct TestStack {
     nats_url: String,
 }
 
-/// One running svc-notifier process.
+/// One running svc-notifier process, with its GraphQL client.
 pub struct ServiceInstance {
     pub port: u16,
     pub base_url: String,
-    child: Child,
+    process: SpawnedProcess,
+    graphql: GraphqlClient,
 }
 
 /// Convenience: a stack plus a single instance — the default scenario shape.
@@ -103,22 +102,12 @@ impl TestStack {
             .await
             .ok();
 
-        let nats_client = async_nats::connect(&nats_url)
+        let nats_client = nats::connect(&nats_url)
             .await
             .expect("failed to connect to NATS");
         let jetstream = jetstream::new(nats_client.clone());
 
-        let _ = jetstream.delete_stream(STREAM_NAME).await;
-        jetstream
-            .create_stream(jetstream::stream::Config {
-                name: STREAM_NAME.to_string(),
-                subjects: vec!["notifier.cmd.>".to_string(), "notify.>".to_string()],
-                storage: jetstream::stream::StorageType::File,
-                retention: jetstream::stream::RetentionPolicy::Limits,
-                ..Default::default()
-            })
-            .await
-            .expect("failed to create NOTIFY stream");
+        recreate_stream(&jetstream, STREAM_NAME, &["notifier.cmd.>", "notify.>"]).await;
 
         Self {
             owner_pool,
@@ -137,35 +126,36 @@ impl TestStack {
     pub async fn spawn_instance(&self, with_nats: bool) -> ServiceInstance {
         let port = next_port();
         let base_url = format!("http://localhost:{port}");
+        let port_str = port.to_string();
 
-        let bin_path = env!("CARGO_BIN_EXE_svc-notifier");
-        let mut command = Command::new(bin_path);
-        command
-            .env("PORT", port.to_string())
-            .env("DATABASE_URL_OWNER", &self.service_owner_url)
-            .env("DATABASE_URL", &self.app_url)
-            .env("RUST_LOG", "warn")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        let mut envs: Vec<(&str, &str)> = vec![
+            ("PORT", &port_str),
+            ("DATABASE_URL_OWNER", &self.service_owner_url),
+            ("DATABASE_URL", &self.app_url),
+            ("RUST_LOG", "warn"),
+        ];
         if with_nats {
-            command
-                .env("NATS_URL", &self.nats_url)
-                .env("DATABASE_URL_INGEST", &self.ingest_url);
-        } else {
-            command.env_remove("NATS_URL");
+            envs.push(("NATS_URL", &self.nats_url));
+            envs.push(("DATABASE_URL_INGEST", &self.ingest_url));
         }
-        let child = command.spawn().expect("failed to spawn svc-notifier");
 
-        let instance = ServiceInstance {
-            port,
-            base_url,
-            child,
-        };
-        instance.wait_for_health().await;
+        let mut process = SpawnedProcess::spawn(env!("CARGO_BIN_EXE_svc-notifier"), &[], &envs);
+        if let Err(reason) = process
+            .wait_for_http_ok(&format!("{base_url}/readyz"), STARTUP_TIMEOUT)
+            .await
+        {
+            panic!("svc-notifier did not become healthy on port {port}: {reason}");
+        }
         if with_nats {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        instance
+
+        ServiceInstance {
+            port,
+            base_url: base_url.clone(),
+            process,
+            graphql: GraphqlClient::new(&base_url),
+        }
     }
 
     /// Publish a typed deliver command on the contract subject — the only
@@ -235,22 +225,12 @@ impl TestStack {
             .messages
     }
 
-    /// Poll until `predicate` is true or `timeout` elapses; returns success.
-    pub async fn wait_until<F, Fut>(&self, timeout: Duration, mut predicate: F) -> bool
+    pub async fn wait_until<F, Fut>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: FnMut() -> Fut,
-        Fut: Future<Output = bool>,
+        Fut: std::future::Future<Output = bool>,
     {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if predicate().await {
-                return true;
-            }
-            if tokio::time::Instant::now() > deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        br_test_harness::wait_until(timeout, predicate).await
     }
 }
 
@@ -263,123 +243,31 @@ impl TestContext {
 }
 
 impl ServiceInstance {
-    async fn wait_for_health(&self) {
-        let url = format!("{}/readyz", self.base_url);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-
-        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                panic!(
-                    "svc-notifier did not become healthy within {:?} on port {}",
-                    STARTUP_TIMEOUT, self.port
-                );
-            }
-            if let Ok(resp) = client.get(&url).send().await
-                && resp.status().is_success()
-            {
-                return;
-            }
-            tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
-        }
-    }
-
     /// Authenticated GraphQL request (forged Passport — we are inside the
     /// trust boundary the gateway normally establishes).
     pub async fn graphql(&self, passport: &Passport, query: &str, vars: Value) -> Value {
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .unwrap();
-
-        let resp = client
-            .post(format!("{}/graphql", self.base_url))
-            .header("X-Passport", passport.to_header())
-            .json(&json!({ "query": query, "variables": vars }))
-            .send()
-            .await
-            .expect("GraphQL request failed");
-
-        resp.json::<Value>()
-            .await
-            .expect("failed to parse GraphQL response")
+        self.graphql.query(passport, query, vars).await
     }
 
     pub async fn graphql_unauthenticated(&self, query: &str) -> (reqwest::StatusCode, Value) {
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .unwrap();
-
-        let resp = client
-            .post(format!("{}/graphql", self.base_url))
-            .json(&json!({ "query": query, "variables": {} }))
-            .send()
-            .await
-            .expect("unauthenticated request failed");
-
-        let status = resp.status();
-        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
-        (status, body)
+        self.graphql.query_unauthenticated(query, json!({})).await
     }
 
     pub async fn graphql_bad_passport(&self, query: &str, header: &str) -> reqwest::StatusCode {
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .unwrap();
-
-        let resp = client
-            .post(format!("{}/graphql", self.base_url))
-            .header("X-Passport", header)
-            .json(&json!({ "query": query, "variables": {} }))
-            .send()
-            .await
-            .expect("bad passport request failed");
-
-        resp.status()
+        let (status, _) = self
+            .graphql
+            .query_with_passport_header(header, query, json!({}))
+            .await;
+        status
     }
 
     /// Open the notification event-union subscription over SSE.
-    pub async fn subscribe(&self, passport: &Passport) -> Subscription {
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("{}/graphql", self.base_url))
-            .header("X-Passport", passport.to_header())
-            .header("Accept", "text/event-stream")
-            .json(&json!({ "query": EVENTS_SUBSCRIPTION }))
-            .send()
-            .await
-            .expect("subscription request failed");
-
-        assert!(
-            resp.status().is_success(),
-            "subscription request returned {}",
-            resp.status()
-        );
-
-        Subscription {
-            stream: Box::pin(resp.bytes_stream()),
-            buffer: String::new(),
-        }
+    pub async fn subscribe(&self, passport: &Passport) -> SseSubscription {
+        SseSubscription::open(&self.base_url, passport, EVENTS_SUBSCRIPTION).await
     }
 
     pub async fn get(&self, path: &str) -> (reqwest::StatusCode, String) {
-        let client = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .unwrap();
-        let resp = client
-            .get(format!("{}{path}", self.base_url))
-            .send()
-            .await
-            .expect("GET request failed");
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        (status, body)
+        self.graphql.get_raw(path).await
     }
 
     pub fn unread_count(value: &Value) -> i64 {
@@ -389,11 +277,10 @@ impl ServiceInstance {
     }
 }
 
-impl Drop for ServiceInstance {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// The unwrapped `notifierNotificationEvents` payload of a pushed SSE event.
+/// `SseSubscription` returns `data`; this peels the single root field.
+pub fn notifier_event(event: &Value) -> &Value {
+    &event["notifierNotificationEvents"]
 }
 
 pub const EVENTS_SUBSCRIPTION: &str = r#"subscription {
@@ -414,79 +301,6 @@ pub const LIST_QUERY: &str = r#"query {
 
 pub const UNREAD_QUERY: &str = "{ notifierUnreadCount }";
 
-/// A live SSE subscription; `next_event` returns the unwrapped
-/// `notifierNotificationEvents` payload of the next pushed event.
-/// A GraphQL error on the stream fails the scenario loudly.
-pub struct Subscription {
-    stream: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
-    buffer: String,
-}
-
-impl Subscription {
-    pub async fn next_event(&mut self, timeout: Duration) -> Option<Value> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(block) = self.take_block() {
-                if let Some(event) = Self::parse_block(&block) {
-                    return Some(event);
-                }
-                continue;
-            }
-
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            match tokio::time::timeout(remaining, self.stream.next()).await {
-                Ok(Some(Ok(bytes))) => {
-                    self.buffer.push_str(&String::from_utf8_lossy(&bytes));
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    pub async fn expect_event(&mut self, what: &str) -> Value {
-        self.next_event(SSE_TIMEOUT)
-            .await
-            .unwrap_or_else(|| panic!("expected subscription event: {what}, got none"))
-    }
-
-    pub async fn expect_silence(&mut self, what: &str) {
-        if let Some(event) = self.next_event(CONSUME_WAIT).await {
-            panic!("expected no subscription event ({what}), got: {event}");
-        }
-    }
-
-    fn take_block(&mut self) -> Option<String> {
-        let block_end = self.buffer.find("\n\n")?;
-        let block = self.buffer[..block_end].to_string();
-        self.buffer = self.buffer[block_end + 2..].to_string();
-        Some(block)
-    }
-
-    fn parse_block(block: &str) -> Option<Value> {
-        let mut event_type = None;
-        let mut data = None;
-        for line in block.lines() {
-            if let Some(val) = line.strip_prefix("event:") {
-                event_type = Some(val.trim().to_string());
-            } else if let Some(val) = line.strip_prefix("data:") {
-                data = Some(val.trim().to_string());
-            }
-        }
-        if event_type.as_deref() != Some("next") {
-            return None;
-        }
-        let payload: Value = serde_json::from_str(&data?).ok()?;
-        if payload["errors"] != Value::Null {
-            panic!("subscription stream returned errors: {}", payload["errors"]);
-        }
-        let event = payload["data"]["notifierNotificationEvents"].clone();
-        (event != Value::Null).then_some(event)
-    }
-}
-
 #[derive(Debug, sqlx::FromRow)]
 pub struct NotificationRecord {
     pub id: Uuid,
@@ -500,21 +314,13 @@ pub struct NotificationRecord {
 }
 
 pub fn make_passport(user_id: Uuid) -> Passport {
-    Passport::Human {
-        user_id,
-        is_super_admin: false,
-        is_active: true,
-        claims: json!({}),
-        auth_method: AuthMethod::Jwt,
-        impersonator: None,
-    }
+    PassportBuilder::new().user_id(user_id).build()
 }
 
 pub fn make_service_passport(service_account_id: Uuid) -> Passport {
-    Passport::Service {
-        service_account_id,
-        claims: json!({}),
-    }
+    PassportBuilder::new()
+        .user_id(service_account_id)
+        .build_service()
 }
 
 pub fn deliver(recipients: &[Uuid], template: &str, payload: Value) -> DeliverNotification {
