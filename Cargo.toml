@@ -4,7 +4,7 @@ default-members = [".", "br-notifier-contract"]
 
 [package]
 name = "svc-notifier"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 publish = false
 rust-version = "1.94"
@@ -14,12 +14,13 @@ repository = "https://github.com/BotResources/svc-notifier"
 
 [dependencies]
 br-notifier-contract = { path = "br-notifier-contract" }
-br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.11.0", version = "0.11.0" }
-br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v0.11.0", version = "0.11.0" }
-br-util-axum-readiness = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-readiness", tag = "v0.11.0", version = "0.11.0" }
-br-util-graphql = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-graphql", tag = "v0.11.0", version = "0.11.0", features = ["graphql"] }
-br-util-observability = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-observability", tag = "v0.11.0", version = "0.11.0" }
-br-util-postgres = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-postgres", tag = "v0.11.0", version = "0.11.0" }
+br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v1.0.1", version = "1.0.1" }
+br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v1.0.1", version = "1.0.1" }
+br-util-axum-readiness = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-readiness", tag = "v1.0.1", version = "1.0.1" }
+br-util-graphql = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-graphql", tag = "v1.0.1", version = "1.0.1", features = ["graphql"] }
+br-util-nats-fabric = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-nats-fabric", tag = "v1.0.1", version = "1.0.1" }
+br-util-observability = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-observability", tag = "v1.0.1", version = "1.0.1" }
+br-util-postgres = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-postgres", tag = "v1.0.1", version = "1.0.1" }
 async-graphql = { version = "7", features = ["chrono", "uuid"] }
 async-nats = "0.48"
 axum = "0.8"
@@ -36,8 +37,9 @@ uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 br-notifier-contract = { path = "br-notifier-contract" }
-br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v0.11.0", version = "0.11.0", features = ["test-support"] }
-br-test-harness = { git = "https://github.com/BotResources/br-e2e-harness", package = "br-test-harness", tag = "v0.5.1", version = "0.5.1", default-features = false, features = ["passport", "graphql", "sse", "nats"] }
+br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v1.0.1", version = "1.0.1", features = ["test-support"] }
+br-core-integration = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-integration", tag = "v1.0.1", version = "1.0.1" }
+br-test-harness = { git = "https://github.com/BotResources/br-e2e-harness", package = "br-test-harness", tag = "v1.0.0", version = "1.0.0", default-features = false, features = ["passport", "graphql", "sse", "nats", "nats-fabric"] }
 async-nats = "0.48"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"

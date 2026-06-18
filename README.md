@@ -26,9 +26,10 @@ count, ack-only mutations, and a real-time subscription stream.
 ## Architecture
 
 ```
-producers ──notifier.cmd.notification.deliver.v1──▶ NATS JetStream
-                                                        │ durable pull consumer
-                                                        ▼
+producers ──integration.cmd.notifier.notification.deliver.v1──▶ NATS JetStream
+            (enveloped IntegrationCommand)              INTEGRATION_CMD stream
+                                                        │ Fabric run_commands
+                                                        ▼  (bind-only, zero-CPU)
                                                   PostgreSQL (RLS)  ◀── the single
                                                         │               source of truth
                                                    pg_notify on commit
@@ -36,16 +37,22 @@ producers ──notifier.cmd.notification.deliver.v1──▶ NATS JetStream
 recipients ◀──GraphQL: queries / mutations / subscription stream──┘
 ```
 
-- **Intake (NATS JetStream)** — a durable pull consumer (`consumer.messages()`, no
-  polling) fans each deliver command out to one row per recipient. It consumes
-  `notifier.cmd.notification.deliver.v1` only; nothing listens on the legacy
-  `notify.deliver` subject. The `NOTIFY` stream is treated as
-  deployment-provisioned infrastructure — the service binds to it and never
-  creates it. The **durable consumer is declared by the service at boot**, with
-  its delivery contract (`filter_subject`, `max_deliver`, `ack_wait`, explicit
-  ack) reconciled fail-loud: a consumer already present with a *different* config
-  aborts startup rather than running on a silently divergent contract (see "Infra
-  debt" below).
+- **Intake (Fabric over NATS JetStream)** — all NATS messaging routes through the
+  `br-util-nats-fabric` Fabric; svc-notifier never touches `async-nats` for
+  messaging (the sole `async_nats` use is the boot connect in `connect_jetstream`,
+  which carries the `NATS_USER`/`NATS_PASSWORD` seam and hands the connected
+  context to `Fabric::new`). Intake runs on `Fabric::run_commands`: a bind-only
+  (`get_consumer`, never provisioned), filter-verified, zero-CPU-park durable on
+  the **fixed `INTEGRATION_CMD` stream**, filtering
+  `integration.cmd.notifier.notification.deliver.v1` (typed `CommandCoords`,
+  rendered + validated on the v1 grammar). Each enveloped
+  `IntegrationCommand<DeliverNotification>` fans out to one row per recipient; the
+  handler returns a `MessageOutcome` — `Ack` on success, `Nak` on a retryable DB
+  failure, `Term` on a poison/undecodable message. The **durable is
+  deployment-declared** (`filter_subject` / `max_deliver` / `ack_wait` owned by the
+  `dp-*` deploy repo on `INTEGRATION_CMD`); the service binds it and fails loud at
+  boot if it is absent or misconfigured (readiness gate), and flips readiness DOWN
+  if the consumer task ever exits.
 - **Truth (PostgreSQL)** — notifications live in one table, deduplicated by
   `(source_event_id, recipient_id)`, protected by forced row-level security.
 - **Surface (GraphQL subgraph)** — recipient-facing, composed behind a gateway.
@@ -65,31 +72,50 @@ This repository is a two-crate workspace: the `svc-notifier` service and
 The contract crate is owned by the receiver (this service), versioned and tagged
 independently, and is what producers depend on — never on the service crate.
 
-- Subject: `DELIVER_SUBJECT` = `notifier.cmd.notification.deliver.v1` — the only
-  subject the service consumes.
-- Command: `DeliverNotification { source_event_id, recipient_ids, template, payload,
-  link: Option<RelativeLink> }`. Producers serialize it with serde and publish it on
-  the subject — no helper needed, and the contract crate stays free of any NATS
-  dependency.
+- Coordinates: `declare_command_coords() -> CommandCoords` (receiver/bc `notifier`,
+  aggregate `notification`, verb `deliver`, v1). The Fabric renders them to the only
+  subject the service consumes — `integration.cmd.notifier.notification.deliver.v1`
+  on the fixed `INTEGRATION_CMD` stream. There is no freestyle subject string and
+  the stream name is not caller-chosen.
+- Command: the payload `DeliverNotification { source_event_id, recipient_ids,
+  template, payload, link: Option<RelativeLink> }`, carried as the `payload: T` of an
+  `IntegrationCommand<DeliverNotification>` envelope (`command_id`, `command_type`,
+  `version`, `issued_at`, `metadata`, `payload`). Producers build the envelope and
+  publish it via the Fabric on the coordinates above. `command_id` identifies the
+  *message*; `source_event_id` (inside the payload) is the *idempotency key* — do
+  not conflate them.
 - `RelativeLink` is a fail-closed newtype: a same-domain relative URL, i.e. a path
   rooted at `/` (query and fragment allowed). It rejects absolute URLs and schemes
   (`https:`, `javascript:`, …), scheme-relative `//host`, backslashes, whitespace,
   control characters, and empty input — at construction *and* on deserialization.
   Its unit tests are the authoritative accept/reject vectors.
 
-Wire format (pinned by a round-trip test in the contract crate):
+Wire format — the enveloped command published on
+`integration.cmd.notifier.notification.deliver.v1` (the payload is pinned by a
+round-trip test in the contract crate):
 
 ```json
 {
-  "source_event_id": "0196a000-0000-7000-8000-000000000001",
-  "recipient_ids": ["0196a000-0000-7000-8000-000000000002"],
-  "template": "meeting_scheduled",
-  "payload": { "meeting_id": "m-1" },
-  "link": "/meetings/m-1"
+  "command_id": "0196a000-0000-7000-8000-0000000000aa",
+  "command_type": "notifier.notification.deliver",
+  "version": 1,
+  "issued_at": "2026-06-18T00:00:00Z",
+  "metadata": {
+    "actor_id": "0196a000-0000-7000-8000-0000000000bb",
+    "actor_kind": "human",
+    "correlation_id": "0196a000-0000-7000-8000-0000000000cc"
+  },
+  "payload": {
+    "source_event_id": "0196a000-0000-7000-8000-000000000001",
+    "recipient_ids": ["0196a000-0000-7000-8000-000000000002"],
+    "template": "meeting_scheduled",
+    "payload": { "meeting_id": "m-1" },
+    "link": "/meetings/m-1"
+  }
 }
 ```
 
-`link` is optional and omitted from the wire when absent.
+`payload.link` is optional and omitted from the wire when absent.
 
 ### Intake semantics (the receiver's promises)
 
@@ -105,7 +131,8 @@ Wire format (pinned by a round-trip test in the contract crate):
   malformed-message path: acked with an error log, zero rows persisted (no partial
   fan-out), nothing reaches any recipient.
 - **Database failure mid-batch**: the message is NAKed and redelivered (up to the
-  consumer's `max_deliver`, currently 5). Redelivery completes the remaining
+  `max_deliver` the deployment declares on the durable — current `dp-*` default: 5;
+  the service code sets no budget of its own). Redelivery completes the remaining
   recipients; already-inserted recipients are not duplicated (the dedup constraint
   makes the fan-out idempotent). The final delivery the budget allows is the
   give-up slot: it is terminated without a further write attempt, so an exhausted
@@ -233,14 +260,14 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
 - **Row-level security as the authorization backstop**: resolvers open a transaction,
   inject the caller's transaction-local RLS context, and the policies restrict every
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
-  table owner cannot bypass it. The GraphQL path injects the context with the shared
-  `br_util_postgres::set_rls_context(tx, passport)`, threading the real `Passport`
-  from the auth middleware to the transaction boundary; the helper sets five
-  transaction-local `app.*` GUCs and the notifications policy reads only
-  `app.current_user_id`. The realtime listener has **no** `Passport` — its recipient
-  is synthesized from the `pg_notify` signal — so it keeps a single manual
-  `set_config('app.current_user_id', …, true)`; fabricating a fake identity just to
-  call the shared helper would be a security smell, not reuse.
+  table owner cannot bypass it. The GraphQL path resolves the caller from
+  `passport.user_id()` and injects the context with the single shared
+  `set_rls_user` free fn — `set_config('app.current_user_id', <user_id>, true)`,
+  transaction-local (the `true` third arg), the one GUC the notifications policy
+  reads. (`br_util_postgres::set_rls_context` was removed in `br-rust-common`
+  v1.0.0; the service inlines the one-liner it shares with the realtime listener.)
+  The realtime listener has **no** `Passport` — its recipient is synthesized from
+  the `pg_notify` signal — and calls the same `set_rls_user` with that recipient.
 - **Two runtime PostgreSQL roles, least privilege**:
   - `svc_notifier_app` — GraphQL resolvers *and* the realtime listener's row
     re-reads; user-scoped by the RLS policies above. The listener scopes its
@@ -357,6 +384,16 @@ cargo test --tests --no-fail-fast
 The scenario suite is the service's definition of done: it passes green
 against the real harness.
 
+### Why the harness is shaped this way
+
+| Thing | Why it is the way it is |
+| --- | --- |
+| Tests open Postgres twice — a superuser DSN and `service_owner_url` | The superuser DSN is HARNESS-ONLY (assertion connection + state reset). The service under test gets `service_owner_url`, a non-superuser migration role mirroring the production posture, so any service code path reading through the owner pool is subject to `FORCE RLS` in tests exactly as in production. |
+| Tests forge a `Passport` directly | The suite sits inside the trust boundary the gateway normally establishes (it strips client-forged copies and re-injects the resolved one); forging the header is how a test stands in for that edge. |
+| The outage scenarios provision the durable with a finite `max_deliver` via raw `async-nats` | `FabricTestNats` cannot yet provision a custom `max_deliver` ([ws#87]). Exercising redelivery-budget exhaustion needs a finite budget, so the bench hand-rolls that one durable in `tests/**` (never `src/**`, where the only `async-nats` is the boot connect) per the lib-gap rule. |
+
+[ws#87]: https://github.com/BotResources/ws-cc-platform.botresources.ai/issues/87
+
 ## Versioning & release
 
 Two independently versioned crates:
@@ -388,30 +425,20 @@ No manual tagging, no manual image/chart push.
 Local pipeline: `./scripts/publish.sh --check-only` (fmt, clippy, unit tests, helm
 lint), `--local-image`, `--dry-run` — see the script header.
 
-## Infra debt
+## Infra
 
-- **The durable consumer is declared by the service, not by the deployment.**
-  Doctrine prefers declared-by-deployment infrastructure with the service binding
-  fail-loud (`get_consumer`). Today the service still creates the consumer at boot,
-  because the test harness recreates the stream per scenario and does not declare a
-  consumer. The mitigation is that creation is **declarative and reconciled**:
-  `create_consumer_strict` either creates the consumer with the exact delivery
-  config or, if one already exists with a *different* config, fails startup — there
-  is no silent config drift. Moving the consumer declaration into the deployment
-  (and flipping the bind to `get_consumer`) is owed; until then this is the
-  defensible middle.
-- **`br_core_integration::DurableConsumer` (v0.8.0) was evaluated and declined for
-  the intake.** Its public `run_commands` / `run_events` deserialize every message
-  into the integration envelope (`IntegrationCommand<T>` / `IntegrationEvent<T>`);
-  the only payload-agnostic path (`run_inner`) is private. svc-notifier consumes a
-  **bare** `DeliverNotification` on `notifier.cmd.notification.deliver.v1` — a
-  wire-format frozen and tested in `br-notifier-contract` and depended on by
-  producers — so adopting the wrapper would mean re-enveloping the published
-  contract, a breaking change for no benefit. The intake keeps its hand-rolled
-  `consumer.messages()` loop (IO inline by design), which also preserves its
-  own redelivery-budget and fail-closed-on-poison policy. Re-evaluate if the lib
-  later exposes a payload-agnostic `run` (the `bind` side already fits once the
-  consumer is deployment-declared).
+- **The durable is deployment-declared.** `filter_subject` / `max_deliver` /
+  `ack_wait` on the fixed `INTEGRATION_CMD` stream are owned by the `dp-*` deploy
+  repo, not minted at runtime. The service binds the durable fail-loud at boot
+  (`verify_command_durable` before `set_ready()`), and the Fabric's `run_commands`
+  is bind-only (`get_consumer`, never provisions) and rejects a widened or
+  misconfigured durable (`FilterMismatch`). This resolves the prior "Infra debt"
+  (the lib auto-provisioning a `NOTIFY` consumer at boot) — the v1.0.0
+  `br-util-nats-fabric` exposes exactly the payload-typed, bind-only wrapper the
+  intake needs, so the hand-rolled consumer is gone. The wire moved to the
+  enveloped `IntegrationCommand<DeliverNotification>` on
+  `integration.cmd.notifier.notification.deliver.v1` (a coordinated breaking change
+  with producers), so envelope adoption is no longer a "no benefit" cost.
 
 ## Open questions
 

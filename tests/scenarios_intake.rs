@@ -1,9 +1,6 @@
-// Intake behavior scenarios — each pins the three external envelopes:
-// NATS (ack/NAK/redelivery, consumer state), PG (exact rows via the
-// assertion connection), GraphQL (what a forged Passport observes).
 mod common;
 
-use br_notifier_contract::{DELIVER_SUBJECT, DeliverNotification, RelativeLink};
+use br_notifier_contract::{DeliverNotification, RelativeLink};
 use common::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -188,7 +185,10 @@ async fn s04_malformed_payload_is_acked_without_persistence_or_push() {
     let mut subscription = ctx.instance.subscribe(&make_passport(observer)).await;
 
     ctx.stack
-        .publish_raw(DELIVER_SUBJECT, b"this is not a deliver command".to_vec())
+        .publish_raw(
+            &deliver_subject(),
+            b"this is not a deliver command".to_vec(),
+        )
         .await;
     tokio::time::sleep(CONSUME_WAIT).await;
 
@@ -220,15 +220,26 @@ async fn s05_invalid_link_rejects_the_whole_message_fail_closed() {
     let mut alice_sub = ctx.instance.subscribe(&make_passport(alice)).await;
 
     for unsafe_link in ["https://evil.com", "//evil.com", "javascript:alert(1)"] {
-        let raw = json!({
-            "source_event_id": Uuid::now_v7(),
-            "recipient_ids": [alice, bob],
-            "template": "tempting",
-            "payload": {},
-            "link": unsafe_link,
+        let envelope = json!({
+            "command_id": Uuid::now_v7(),
+            "command_type": "notifier.notification.deliver",
+            "version": 1,
+            "issued_at": "2026-06-18T00:00:00Z",
+            "metadata": {
+                "actor_id": Uuid::now_v7(),
+                "actor_kind": "human",
+                "correlation_id": Uuid::now_v7(),
+            },
+            "payload": {
+                "source_event_id": Uuid::now_v7(),
+                "recipient_ids": [alice, bob],
+                "template": "tempting",
+                "payload": {},
+                "link": unsafe_link,
+            },
         });
         ctx.stack
-            .publish_raw(DELIVER_SUBJECT, serde_json::to_vec(&raw).unwrap())
+            .publish_raw(&deliver_subject(), serde_json::to_vec(&envelope).unwrap())
             .await;
     }
     tokio::time::sleep(CONSUME_WAIT).await;
@@ -255,12 +266,13 @@ async fn s05_invalid_link_rejects_the_whole_message_fail_closed() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn s08_nothing_consumes_the_legacy_subject() {
+async fn s08_the_legacy_subject_is_dead_no_fixed_stream_binds_it() {
     let ctx = TestContext::setup().await;
     let recipient = Uuid::now_v7();
 
-    ctx.stack
-        .publish_raw(
+    let accepted = ctx
+        .stack
+        .try_publish_raw(
             LEGACY_SUBJECT,
             serde_json::to_vec(&json!({
                 "source_event_id": Uuid::now_v7(),
@@ -273,15 +285,14 @@ async fn s08_nothing_consumes_the_legacy_subject() {
         .await;
     tokio::time::sleep(CONSUME_WAIT).await;
 
+    assert!(
+        !accepted,
+        "the pre-v1 subject must not be bound by any fixed stream — no stream acks it"
+    );
     assert_eq!(
         ctx.stack.count_rows().await,
         0,
-        "a legacy notify.deliver message must not be consumed"
-    );
-    assert_eq!(
-        ctx.stack.stream_message_count().await,
-        1,
-        "the message sits unconsumed in the stream"
+        "a legacy message must never be consumed"
     );
 }
 

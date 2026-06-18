@@ -16,6 +16,7 @@ use axum::{Extension, Json, Router};
 use br_core_auth::Passport;
 use br_util_axum_auth::passport_header_middleware;
 use br_util_axum_readiness::{ReadinessHandle, readiness_route};
+use br_util_nats_fabric::Fabric;
 use br_util_observability::{
     http_metrics_layer, init_logging, init_metrics, liveness_route, metrics_route,
 };
@@ -58,9 +59,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| "DATABASE_URL_INGEST is required when NATS_URL is set")?;
         let ingest_pool = ingest_pool(&ingest_url).await?;
         let jetstream = connect_jetstream(&nats_url).await?;
+        let fabric = Fabric::new(jetstream);
+        intake::verify(&fabric).await?;
+        let intake_readiness = readiness.clone();
         tokio::spawn(async move {
-            if let Err(error) = intake::run(jetstream, ingest_pool).await {
-                tracing::error!(%error, "intake terminated");
+            match intake::run(fabric, ingest_pool).await {
+                Ok(()) => intake_readiness.set_not_ready("intake consumer stream ended"),
+                Err(error) => {
+                    tracing::error!(%error, "intake terminated");
+                    intake_readiness.set_not_ready("intake consumer failed");
+                }
             }
         });
     }

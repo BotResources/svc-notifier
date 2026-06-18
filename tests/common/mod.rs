@@ -1,5 +1,3 @@
-// Shared e2e harness. Each `tests/*.rs` is compiled as a separate binary, so
-// helpers shared here appear dead to clippy from binaries that don't use them.
 #![allow(dead_code)]
 
 use std::process::Command;
@@ -9,16 +7,16 @@ use std::time::Duration;
 
 use async_nats::jetstream;
 use br_core_auth::{Passport, PassportBuilder};
-use br_notifier_contract::{DELIVER_SUBJECT, DeliverNotification};
-use br_test_harness::{GraphqlClient, SpawnedProcess, SseSubscription, nats, recreate_stream};
+use br_core_integration::{Actor, CommandCoords, EventMetadata, IntegrationCommand, UserId};
+use br_notifier_contract::{DeliverNotification, declare_command_coords};
+use br_test_harness::{FabricTestNats, GraphqlClient, SpawnedProcess, SseSubscription, nats};
+use br_util_nats_fabric::{INTEGRATION_CMD, command_subject};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-// TEST_PORT_BASE lets several checkouts run the suite on one machine
-// without their spawned instances colliding (default base: 9100).
 static PORT_COUNTER: OnceLock<AtomicU16> = OnceLock::new();
 
 fn next_port() -> u16 {
@@ -38,24 +36,29 @@ pub const CONSUME_WAIT: Duration = Duration::from_secs(3);
 pub const SSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub const STREAM_NAME: &str = "NOTIFY";
+pub const STREAM_NAME: &str = INTEGRATION_CMD;
 pub const DURABLE_NAME: &str = "svc-notifier";
-pub const LEGACY_SUBJECT: &str = "notify.deliver";
+pub const LEGACY_SUBJECT: &str = "notifier.cmd.notification.deliver.v1";
 
-/// Shared infra (Postgres + NATS) with a clean slate: empty notifications
-/// table, freshly recreated stream (which also drops durable consumers and
-/// any pending messages from previous tests).
+pub fn deliver_coords() -> CommandCoords {
+    declare_command_coords()
+}
+
+pub fn deliver_subject() -> String {
+    command_subject(&deliver_coords())
+}
+
 pub struct TestStack {
     pub owner_pool: PgPool,
     pub nats_client: async_nats::Client,
     pub jetstream: jetstream::Context,
+    fabric_nats: FabricTestNats,
     service_owner_url: String,
     app_url: String,
     ingest_url: String,
     nats_url: String,
 }
 
-/// One running svc-notifier process, with its GraphQL client.
 pub struct ServiceInstance {
     pub port: u16,
     pub base_url: String,
@@ -63,7 +66,6 @@ pub struct ServiceInstance {
     graphql: GraphqlClient,
 }
 
-/// Convenience: a stack plus a single instance — the default scenario shape.
 pub struct TestContext {
     pub stack: TestStack,
     pub instance: ServiceInstance,
@@ -73,11 +75,6 @@ impl TestStack {
     pub async fn up() -> Self {
         let _ = dotenvy::from_filename(".env.test");
 
-        // The superuser DSN is HARNESS-ONLY (assertion connection, state
-        // reset). The service under test gets `service_owner_url` — a
-        // non-superuser migration role mirroring the production posture, so
-        // any service code path reading through the owner pool is subject to
-        // FORCE RLS in tests exactly as it would be in production.
         let owner_url = std::env::var("DATABASE_URL_OWNER")
             .unwrap_or_else(|_| "postgres://owner:owner@localhost:5432/svc_notifier_test".into());
         let service_owner_url = std::env::var("DATABASE_URL_SERVICE_OWNER").unwrap_or_else(|_| {
@@ -107,12 +104,17 @@ impl TestStack {
             .expect("failed to connect to NATS");
         let jetstream = jetstream::new(nats_client.clone());
 
-        recreate_stream(&jetstream, STREAM_NAME, &["notifier.cmd.>", "notify.>"]).await;
+        let fabric_nats = FabricTestNats::connect(&nats_url).await;
+        purge_command_stream(&jetstream).await;
+        fabric_nats
+            .provision_command_durable(&deliver_coords(), DURABLE_NAME)
+            .await;
 
         Self {
             owner_pool,
             nats_client,
             jetstream,
+            fabric_nats,
             service_owner_url,
             app_url,
             ingest_url,
@@ -120,9 +122,6 @@ impl TestStack {
         }
     }
 
-    /// Spawn a real svc-notifier process. `with_nats: false` starts the
-    /// instance without intake (serving GraphQL only) — used to prove pushes
-    /// derive from committed PG state, not from the consuming process.
     pub async fn spawn_instance(&self, with_nats: bool) -> ServiceInstance {
         let port = next_port();
         let base_url = format!("http://localhost:{port}");
@@ -158,15 +157,39 @@ impl TestStack {
         }
     }
 
-    /// Publish a typed deliver command on the contract subject — the only
-    /// legitimate way to seed notifications.
-    pub async fn publish_deliver(&self, command: &DeliverNotification) {
-        let bytes = serde_json::to_vec(command).expect("failed to serialize deliver command");
-        self.publish_raw(DELIVER_SUBJECT, bytes).await;
+    pub async fn provision_command_durable_with_max_deliver(
+        &self,
+        max_deliver: i64,
+        ack_wait: Duration,
+    ) {
+        let stream = self
+            .jetstream
+            .get_stream(STREAM_NAME)
+            .await
+            .expect("fixed command stream must exist before re-provisioning the durable");
+        let _ = stream.delete_consumer(DURABLE_NAME).await;
+        stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some(DURABLE_NAME.to_string()),
+                filter_subjects: vec![deliver_subject()],
+                ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                ack_wait,
+                max_deliver,
+                ..Default::default()
+            })
+            .await
+            .expect("failed to create finite-budget command durable");
     }
 
-    /// Publish arbitrary bytes on an arbitrary subject (malformed payloads,
-    /// invalid links, legacy subject).
+    pub async fn publish_deliver(&self, command: &DeliverNotification) {
+        let envelope = enveloped(command);
+        self.fabric_nats
+            .fabric()
+            .publish_command(&deliver_coords(), &envelope)
+            .await
+            .expect("failed to publish enveloped deliver command on the fabric");
+    }
+
     pub async fn publish_raw(&self, subject: &str, bytes: Vec<u8>) {
         self.jetstream
             .publish(subject.to_string(), bytes.into())
@@ -176,7 +199,17 @@ impl TestStack {
             .expect("failed to get publish ack");
     }
 
-    /// Exact rows, via the dedicated assertion connection (bypasses RLS).
+    pub async fn try_publish_raw(&self, subject: &str, bytes: Vec<u8>) -> bool {
+        match self
+            .jetstream
+            .publish(subject.to_string(), bytes.into())
+            .await
+        {
+            Ok(ack) => ack.await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
     pub async fn notification_rows(&self) -> Vec<NotificationRecord> {
         sqlx::query_as::<_, NotificationRecord>(
             "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
@@ -203,7 +236,6 @@ impl TestStack {
         row.0 as usize
     }
 
-    /// State of the service's durable consumer — the NATS envelope.
     pub async fn consumer_info(&self) -> Option<async_nats::jetstream::consumer::Info> {
         let stream = self.jetstream.get_stream(STREAM_NAME).await.ok()?;
         let mut consumer: jetstream::consumer::PullConsumer =
@@ -240,11 +272,18 @@ impl TestContext {
         let instance = stack.spawn_instance(true).await;
         Self { stack, instance }
     }
+
+    pub async fn setup_with_finite_redelivery_budget(max_deliver: i64, ack_wait: Duration) -> Self {
+        let stack = TestStack::up().await;
+        stack
+            .provision_command_durable_with_max_deliver(max_deliver, ack_wait)
+            .await;
+        let instance = stack.spawn_instance(true).await;
+        Self { stack, instance }
+    }
 }
 
 impl ServiceInstance {
-    /// Authenticated GraphQL request (forged Passport — we are inside the
-    /// trust boundary the gateway normally establishes).
     pub async fn graphql(&self, passport: &Passport, query: &str, vars: Value) -> Value {
         self.graphql.query(passport, query, vars).await
     }
@@ -261,7 +300,6 @@ impl ServiceInstance {
         status
     }
 
-    /// Open the notification event-union subscription over SSE.
     pub async fn subscribe(&self, passport: &Passport) -> SseSubscription {
         SseSubscription::open(&self.base_url, passport, EVENTS_SUBSCRIPTION).await
     }
@@ -277,8 +315,6 @@ impl ServiceInstance {
     }
 }
 
-/// The unwrapped `notifierNotificationEvents` payload of a pushed SSE event.
-/// `SseSubscription` returns `data`; this peels the single root field.
 pub fn notifier_event(event: &Value) -> &Value {
     &event["notifierNotificationEvents"]
 }
@@ -333,8 +369,27 @@ pub fn deliver(recipients: &[Uuid], template: &str, payload: Value) -> DeliverNo
     }
 }
 
-/// Pauses the Postgres container; unpauses on drop so a panicking scenario
-/// cannot poison the rest of the suite.
+pub fn enveloped(command: &DeliverNotification) -> IntegrationCommand<DeliverNotification> {
+    let actor = Actor::Human(UserId::from(Uuid::now_v7()));
+    IntegrationCommand::new(
+        Uuid::now_v7(),
+        "notifier.notification.deliver",
+        1,
+        Utc::now(),
+        EventMetadata::new(actor, Uuid::now_v7()),
+        command.clone(),
+    )
+}
+
+async fn purge_command_stream(jetstream: &jetstream::Context) {
+    if let Ok(stream) = jetstream.get_stream(STREAM_NAME).await {
+        stream
+            .purge()
+            .await
+            .expect("failed to purge command stream");
+    }
+}
+
 pub struct PausedPostgres {
     container: String,
 }
@@ -357,9 +412,6 @@ impl Drop for PausedPostgres {
 
 fn find_postgres_container() -> String {
     let port = postgres_host_port();
-    // Published-port filter disambiguates between several local stacks; a
-    // host-networked container (the CI shape) publishes nothing, so fall
-    // back to the name/image scan — unambiguous on a single-stack runner.
     docker_ps_first_postgres(&["--filter", &format!("publish={port}")])
         .or_else(|| docker_ps_first_postgres(&[]))
         .unwrap_or_else(|| {

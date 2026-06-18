@@ -1,7 +1,16 @@
+use br_core_integration::{Aggregate, Bc, CommandCoords, Verb};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const DELIVER_SUBJECT: &str = "notifier.cmd.notification.deliver.v1";
+pub fn declare_command_coords() -> CommandCoords {
+    CommandCoords {
+        receiver: Bc::new("notifier").expect("notifier is a valid bc segment"),
+        aggregate: Aggregate::new("notification")
+            .expect("notification is a valid aggregate segment"),
+        verb: Verb::new("deliver").expect("deliver is a valid verb segment"),
+        version: 1,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeliverNotification {
@@ -207,8 +216,11 @@ mod tests {
     }
 
     #[test]
-    fn subject_follows_the_command_convention() {
-        let convention = regex::Regex::new(r"^[a-z-]+\.cmd\.[a-z-]+\.[a-z-]+\.v[0-9]+$").unwrap();
-        assert!(convention.is_match(DELIVER_SUBJECT), "{DELIVER_SUBJECT}");
+    fn command_coords_pin_the_v1_grammar_segments() {
+        let coords = declare_command_coords();
+        assert_eq!(coords.receiver.as_str(), "notifier");
+        assert_eq!(coords.aggregate.as_str(), "notification");
+        assert_eq!(coords.verb.as_str(), "deliver");
+        assert_eq!(coords.version, 1);
     }
 }

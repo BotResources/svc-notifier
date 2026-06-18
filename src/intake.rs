@@ -1,91 +1,51 @@
 use std::time::Duration;
 
-use async_nats::jetstream::{self, consumer::PullConsumer};
-use futures::StreamExt;
 use sqlx::PgPool;
 
-use br_notifier_contract::{DELIVER_SUBJECT, DeliverNotification};
+use br_notifier_contract::{DeliverNotification, declare_command_coords};
+use br_util_nats_fabric::{Delivery, Fabric, FabricError, IntegrationCommand, MessageOutcome};
 
-use crate::notification::insert_notification;
-
-const STREAM_NAME: &str = "NOTIFY";
-const DURABLE_NAME: &str = "svc-notifier";
-const MAX_DELIVER: i64 = 5;
-const ACK_WAIT: Duration = Duration::from_secs(5);
+pub const DURABLE_NAME: &str = "svc-notifier";
 const NAK_DELAY: Duration = Duration::from_secs(1);
 
-pub async fn run(jetstream: jetstream::Context, ingest_pool: PgPool) -> Result<(), IntakeError> {
-    let stream = jetstream
-        .get_stream(STREAM_NAME)
+pub async fn run(fabric: Fabric, ingest_pool: PgPool) -> Result<(), FabricError> {
+    let coords = declare_command_coords();
+    fabric
+        .run_commands::<DeliverNotification, _, _, _>(
+            &coords,
+            DURABLE_NAME,
+            |delivery| handle(&ingest_pool, delivery),
+            on_poison,
+        )
         .await
-        .map_err(|e| IntakeError::Stream(e.to_string()))?;
-
-    let consumer: PullConsumer = stream
-        .create_consumer_strict(jetstream::consumer::pull::Config {
-            durable_name: Some(DURABLE_NAME.to_string()),
-            filter_subject: DELIVER_SUBJECT.to_string(),
-            ack_policy: jetstream::consumer::AckPolicy::Explicit,
-            max_deliver: MAX_DELIVER,
-            ack_wait: ACK_WAIT,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| IntakeError::Consumer(e.to_string()))?;
-
-    let mut messages = consumer
-        .messages()
-        .await
-        .map_err(|e| IntakeError::Consumer(e.to_string()))?;
-
-    tracing::info!(subject = DELIVER_SUBJECT, "intake consumer ready");
-    while let Some(message) = messages.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::warn!(%error, "intake message error");
-                continue;
-            }
-        };
-        handle(&ingest_pool, &message).await;
-    }
-    Ok(())
 }
 
-async fn handle(pool: &PgPool, message: &jetstream::Message) {
-    let command: DeliverNotification = match serde_json::from_slice(&message.payload) {
-        Ok(command) => command,
-        Err(error) => {
-            tracing::warn!(%error, "rejecting undecodable deliver command (fail-closed)");
-            ack(message).await;
-            return;
-        }
-    };
+pub async fn verify(fabric: &Fabric) -> Result<(), FabricError> {
+    fabric
+        .verify_command_durable(&declare_command_coords(), DURABLE_NAME)
+        .await
+}
 
-    if delivery_count(message) >= MAX_DELIVER {
-        tracing::error!(
-            source_event_id = %command.source_event_id,
-            "redelivery budget exhausted, dropping command"
-        );
-        terminate(message).await;
-        return;
-    }
-
+async fn handle(
+    pool: &PgPool,
+    delivery: Delivery<IntegrationCommand<DeliverNotification>>,
+) -> MessageOutcome {
+    let command = delivery.envelope.payload;
     match fan_out(pool, &command).await {
-        Ok(()) => ack(message).await,
+        Ok(()) => MessageOutcome::Ack,
         Err(error) => {
-            tracing::error!(%error, source_event_id = %command.source_event_id, "deliver fan-out failed, NAKing");
-            if let Err(nak_error) = message
-                .ack_with(jetstream::AckKind::Nak(Some(NAK_DELAY)))
-                .await
-            {
-                tracing::error!(%nak_error, "failed to NAK message");
-            }
+            tracing::error!(
+                %error,
+                source_event_id = %command.source_event_id,
+                "deliver fan-out failed, NAKing for redelivery"
+            );
+            MessageOutcome::Nak(Some(NAK_DELAY))
         }
     }
 }
 
-fn delivery_count(message: &jetstream::Message) -> i64 {
-    message.info().map(|info| info.delivered).unwrap_or(1)
+fn on_poison(error: FabricError) {
+    tracing::warn!(%error, "rejecting undecodable deliver command (fail-closed, terminated)");
 }
 
 async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<(), sqlx::Error> {
@@ -94,7 +54,7 @@ async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<(), sql
     }
     let mut tx = pool.begin().await?;
     for recipient_id in &command.recipient_ids {
-        insert_notification(
+        crate::notification::insert_notification(
             &mut tx,
             command.source_event_id,
             *recipient_id,
@@ -106,24 +66,4 @@ async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<(), sql
     }
     tx.commit().await?;
     Ok(())
-}
-
-async fn ack(message: &jetstream::Message) {
-    if let Err(error) = message.ack().await {
-        tracing::error!(%error, "failed to ack message");
-    }
-}
-
-async fn terminate(message: &jetstream::Message) {
-    if let Err(error) = message.ack_with(jetstream::AckKind::Term).await {
-        tracing::error!(%error, "failed to terminate message");
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum IntakeError {
-    #[error("intake stream unavailable: {0}")]
-    Stream(String),
-    #[error("intake consumer unavailable: {0}")]
-    Consumer(String),
 }

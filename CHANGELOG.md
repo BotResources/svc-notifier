@@ -5,7 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## 1.0.0
+
+Breaking. Migrates to `br-rust-common` v1.0.1, moves the NATS intake onto the
+`br-util-nats-fabric` Fabric, and adopts the enveloped command wire on the v1
+Project NATS Fabric grammar. The svc-notifier PR and the producer PRs must land
+together (the legacy subject is retired).
+
+### Changed
+- **BREAKING — Fabric intake on the v1 grammar / fixed stream.** The hand-rolled
+  durable consumer is gone. Intake now runs on `Fabric::run_commands(&coords,
+  durable, handler, on_poison)`: a bind-only (no provisioning), filter-verified,
+  zero-CPU-park consumer on the **fixed `INTEGRATION_CMD` stream** filtering
+  `integration.cmd.notifier.notification.deliver.v1`. The bespoke `NOTIFY` stream
+  and its `create_consumer_strict`/ack-loop are retired. The handler decodes
+  `IntegrationCommand<DeliverNotification>`, fans out, and returns a
+  `MessageOutcome` (`Ack` on success, `Nak` on a retryable DB failure, `Term`
+  on a poison/undecodable message — fail-closed).
+- **BREAKING — `br-notifier-contract` 0.1.0 → 0.2.0.** The wire is now the
+  enveloped `IntegrationCommand<DeliverNotification>` on the new subject; producers
+  move in lockstep. See that crate's CHANGELOG.
+- **Fail-loud readiness (security invariant #6).** Boot now calls
+  `verify_command_durable(&coords, durable)` **before** `set_ready()` — a missing
+  or misconfigured deployment-declared durable fails the pod loud at startup
+  instead of coming up Ready with a dead consumer. If the `run_commands` task ever
+  exits, readiness flips DOWN (`/readyz`).
+- **The durable is deployment-declared.** `filter_subject` / `max_deliver` /
+  `ack_wait` on `INTEGRATION_CMD` are owned by the `dp-*` deploy repo, not minted
+  at runtime — this closes the prior "Infra debt" (the lib never auto-provisions).
+- **Inlined RLS.** `br_util_postgres::set_rls_context` was removed in v1.0.0; the
+  GraphQL read/write path now sets the transaction-local
+  `set_config('app.current_user_id', <user_id>, true)` directly via one shared
+  `set_rls_user` free fn (the `true` third arg — transaction-local — is preserved
+  exactly; RLS isolation does not regress).
+- **Passport variant fields are private (v1.0.0).** `recipient()` and the
+  subscription destructure now read `passport.user_id() -> Option<Uuid>`; `None`
+  (a `Passport::Service`) keeps the existing rejection.
+- **Bump `br-rust-common` to `v1.0.1`.** The six prod `br-*` deps move to
+  `tag = "v1.0.1"`, `version = "1.0.1"`; adds `br-util-nats-fabric` at the same
+  pin. The sole sanctioned `async_nats::` use is the boot connect in
+  `connect_jetstream` (carrying the `NATS_USER`/`NATS_PASSWORD` seam; `Fabric::new`
+  takes the already-connected context).
+- **Tests on `FabricTestNats`.** `br-test-harness` dev-dep `v0.5.1` → `v1.0.0`
+  (with `br-core-auth` dev-dep at `v1.0.1` in lockstep); the suite provisions the
+  command durable via `provision_command_durable` and publishes the enveloped wire
+  via `fabric().publish_command`.
 
 ## 0.6.0
 

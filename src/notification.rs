@@ -59,6 +59,17 @@ pub enum NotificationSignal {
 
 pub const NOTIFY_CHANNEL: &str = "notification_events";
 
+pub async fn set_rls_user(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+        .bind(user_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn signal<'e, E>(executor: E, signal: &NotificationSignal) -> Result<(), sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
@@ -250,10 +261,7 @@ pub async fn read_notification_for(
     id: Uuid,
 ) -> Result<Option<Notification>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
-        .bind(recipient_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+    set_rls_user(&mut tx, recipient_id).await?;
     let row = sqlx::query(
         "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
          FROM notifications WHERE id = $1",

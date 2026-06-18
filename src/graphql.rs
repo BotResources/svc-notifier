@@ -29,9 +29,9 @@ fn passport<'a>(ctx: &Context<'a>) -> Result<&'a Passport> {
 }
 
 fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
-    match passport(ctx)? {
-        Passport::Human { user_id, .. } => Ok(Recipient(*user_id)),
-        Passport::Service { .. } => Err(EdgeError::forbidden()),
+    match passport(ctx)?.user_id() {
+        Some(user_id) => Ok(Recipient(user_id)),
+        None => Err(EdgeError::forbidden()),
     }
 }
 
@@ -201,9 +201,9 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
     ) -> impl Stream<Item = NotifierNotificationEvent> + use<> {
         let receiver = match (ctx.data::<AppState>(), ctx.data::<Passport>()) {
-            (Ok(state), Ok(Passport::Human { user_id, .. })) => {
-                Some(state.subscribers.subscribe(*user_id))
-            }
+            (Ok(state), Ok(passport)) => passport
+                .user_id()
+                .map(|user_id| state.subscribers.subscribe(user_id)),
             _ => None,
         };
         futures::stream::iter(receiver)
@@ -237,9 +237,9 @@ async fn scoped_tx<'a>(ctx: &Context<'a>) -> Result<sqlx::Transaction<'a, sqlx::
     let state = ctx
         .data::<AppState>()
         .map_err(|_| EdgeError::internal("missing app state in context"))?;
-    let passport = passport(ctx)?;
+    let caller = recipient(ctx)?;
     let mut tx = state.app_pool.begin().await.map_err(db_error)?;
-    br_util_postgres::set_rls_context(&mut tx, passport)
+    crate::notification::set_rls_user(&mut tx, caller.0)
         .await
         .map_err(db_error)?;
     Ok(tx)
