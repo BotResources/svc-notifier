@@ -115,18 +115,14 @@ jobs:
           docker logs postgres
           exit 1
 
-      # The `services:` block does not let us pass custom args, and NATS
-      # JetStream requires `--jetstream`. Run it inline on the host network.
-      - name: Start NATS JetStream
+      - name: install nats-server
         run: |
-          docker run -d --name nats --network host nats:2.12 --jetstream
-          for i in {1..20}; do
-            if nc -z localhost 4222; then echo "NATS up"; exit 0; fi
-            sleep 1
-          done
-          echo "NATS failed to start" >&2
-          docker logs nats
-          exit 1
+          NATS_VERSION="v2.14.1"
+          URL="https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
+          curl -sSfL "$URL" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          sudo install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+          nats-server --version
 
       - name: Provision Postgres roles
         run: docker exec -i postgres psql -U owner -d svc_notifier_test < scripts/init-db.sql
@@ -137,10 +133,9 @@ jobs:
           DATABASE_URL_SERVICE_OWNER: postgres://svc_notifier_owner:svc_notifier_owner@localhost:5432/svc_notifier_test
           DATABASE_URL: postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test
           DATABASE_URL_INGEST: postgres://svc_notifier_ingest:svc_notifier_ingest@localhost:5432/svc_notifier_test
-          NATS_URL: nats://localhost:4222
           PORT: "8010"
           RUST_LOG: info
-        run: cargo test --tests --no-fail-fast
+        run: cargo test --tests --no-fail-fast -- --test-threads=1
 
   audit:
     name: cargo audit (RustSec)
