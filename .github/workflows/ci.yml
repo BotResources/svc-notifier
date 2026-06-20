@@ -209,6 +209,30 @@ jobs:
           echo "Baseline: $baseline"
           cargo semver-checks check-release -p br-notifier-contract --baseline-rev "$baseline"
 
+  semver-publisher:
+    name: cargo semver-checks (publisher)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: semver-check br-notifier-publisher against its latest release
+        run: |
+          baseline="$(git tag -l 'br-notifier-publisher/v*' --sort=-v:refname | head -1)"
+          if [ -z "$baseline" ]; then
+            echo "No br-notifier-publisher release tag yet — nothing to compare against."
+            exit 0
+          fi
+          echo "Baseline: $baseline"
+          cargo semver-checks check-release -p br-notifier-publisher --baseline-rev "$baseline"
+
   changelog:
     name: changelog entry present (per crate)
     runs-on: ubuntu-latest
@@ -233,9 +257,14 @@ jobs:
             echo "::error::svc-notifier code changed without a CHANGELOG.md entry"
             fail=1
           fi
-          if echo "$changed" | grep -qE '^br-notifier-contract/(src/|Cargo\.toml)' \
-            && ! echo "$changed" | grep -qx 'br-notifier-contract/CHANGELOG.md'; then
+          if echo "$changed" | grep -qE '^crates/br-notifier-contract/(src/|Cargo\.toml)' \
+            && ! echo "$changed" | grep -qx 'crates/br-notifier-contract/CHANGELOG.md'; then
             echo "::error::br-notifier-contract changed without a CHANGELOG.md entry"
+            fail=1
+          fi
+          if echo "$changed" | grep -qE '^crates/br-notifier-publisher/(src/|Cargo\.toml)' \
+            && ! echo "$changed" | grep -qx 'crates/br-notifier-publisher/CHANGELOG.md'; then
+            echo "::error::br-notifier-publisher changed without a CHANGELOG.md entry"
             fail=1
           fi
           exit $fail

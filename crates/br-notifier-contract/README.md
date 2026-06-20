@@ -10,8 +10,14 @@ receiver, versioned and tagged independently of the service.
   notification per recipient. Delivery is idempotent on
   `(source_event_id, recipient_id)`: the first command wins, duplicates are
   silently skipped.
-- **`DELIVER_SUBJECT`** — the JetStream subject the command is published on:
-  `notifier.cmd.notification.deliver.v1`.
+- **`deliver_coords()`** — the typed `CommandCoords` (from `br-core-integration`)
+  the command is published on: receiver `notifier`, aggregate `notification`,
+  verb `deliver`, version `1`. The NATS Fabric renders these to the fixed v1
+  subject `integration.cmd.notifier.notification.deliver.v1` on the
+  `INTEGRATION_CMD` stream. This crate is transport-agnostic: it owns the
+  coordinates, not the rendered subject string (the Fabric owns rendering).
+  The segment values are also exposed as `DELIVER_RECEIVER` / `DELIVER_AGGREGATE`
+  / `DELIVER_VERB` / `DELIVER_VERSION`.
 - **`RelativeLink`** — a fail-closed, same-domain relative URL, validated at
   construction **and** on deserialization. Accepts a path rooted at `/`
   (query string and fragment allowed); rejects absolute URLs, schemes
@@ -20,8 +26,10 @@ receiver, versioned and tagged independently of the service.
   stable codes.
 
 The wire format is pinned by tests: a producer that serializes a
-`DeliverNotification` to JSON and publishes it on `DELIVER_SUBJECT` is a
-conforming producer. See the
+`DeliverNotification` to JSON and publishes it on the subject the Fabric renders
+from `deliver_coords()` is a conforming producer. The
+[`br-notifier-publisher`](https://github.com/BotResources/svc-notifier) crate is
+the supported way to publish it over the Fabric. See the
 [service README](https://github.com/BotResources/svc-notifier#readme) for the
 full intake semantics.
 
@@ -29,7 +37,7 @@ full intake semantics.
 
 ```toml
 [dependencies]
-br-notifier-contract = { git = "https://github.com/BotResources/svc-notifier", package = "br-notifier-contract", tag = "br-notifier-contract/v0.1.0", version = "0.1.0" }
+br-notifier-contract = { git = "https://github.com/BotResources/svc-notifier", package = "br-notifier-contract", tag = "br-notifier-contract/v0.2.0", version = "0.2.0" }
 ```
 
-License: MIT.
+License: Apache-2.0.

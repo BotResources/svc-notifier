@@ -1,0 +1,25 @@
+[package]
+name = "br-notifier-publisher"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Producer kit for svc-notifier: publishes a typed DeliverNotification as an integration command over the real br-util-nats-fabric on the deliver coordinates."
+repository = "https://github.com/BotResources/svc-notifier"
+
+[dependencies]
+br-notifier-contract = { path = "../br-notifier-contract", version = "0.2.0" }
+br-util-nats-fabric = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-nats-fabric", tag = "v1.0.2", version = "1.0.2" }
+
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+chrono = "0.4"
+
+[dev-dependencies]
+br-core-integration = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-integration", tag = "v1.0.2", version = "1.0.2" }
+serde_json = "1"
+br-test-harness = { git = "https://github.com/BotResources/br-e2e-harness", package = "br-test-harness", tag = "v1.0.2", version = "1.0.2", default-features = false, features = [
+    "nats-fabric",
+    "spawned-nats",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

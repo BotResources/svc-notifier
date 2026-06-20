@@ -237,9 +237,11 @@ async fn scoped_tx<'a>(ctx: &Context<'a>) -> Result<sqlx::Transaction<'a, sqlx::
     let state = ctx
         .data::<AppState>()
         .map_err(|_| EdgeError::internal("missing app state in context"))?;
-    let passport = passport(ctx)?;
+    let recipient = recipient(ctx)?;
     let mut tx = state.app_pool.begin().await.map_err(db_error)?;
-    br_util_postgres::set_rls_context(&mut tx, passport)
+    sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
+        .bind(recipient.0.to_string())
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
     Ok(tx)

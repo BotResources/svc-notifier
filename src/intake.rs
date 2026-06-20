@@ -1,91 +1,104 @@
 use std::time::Duration;
 
-use async_nats::jetstream::{self, consumer::PullConsumer};
-use futures::StreamExt;
+use br_notifier_contract::{DeliverNotification, deliver_coords};
+use br_util_axum_readiness::ReadinessHandle;
+use br_util_nats_fabric::{
+    CommandConsumer, Delivered, Fabric, FabricError, IntegrationCommand, MessageOutcome,
+};
 use sqlx::PgPool;
-
-use br_notifier_contract::{DELIVER_SUBJECT, DeliverNotification};
+use tokio::sync::watch;
 
 use crate::notification::insert_notification;
 
-const STREAM_NAME: &str = "NOTIFY";
 const DURABLE_NAME: &str = "svc-notifier";
 const MAX_DELIVER: i64 = 5;
-const ACK_WAIT: Duration = Duration::from_secs(5);
 const NAK_DELAY: Duration = Duration::from_secs(1);
+const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 10;
 
-pub async fn run(jetstream: jetstream::Context, ingest_pool: PgPool) -> Result<(), IntakeError> {
-    let stream = jetstream
-        .get_stream(STREAM_NAME)
-        .await
-        .map_err(|e| IntakeError::Stream(e.to_string()))?;
-
-    let consumer: PullConsumer = stream
-        .create_consumer_strict(jetstream::consumer::pull::Config {
-            durable_name: Some(DURABLE_NAME.to_string()),
-            filter_subject: DELIVER_SUBJECT.to_string(),
-            ack_policy: jetstream::consumer::AckPolicy::Explicit,
-            max_deliver: MAX_DELIVER,
-            ack_wait: ACK_WAIT,
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| IntakeError::Consumer(e.to_string()))?;
-
-    let mut messages = consumer
-        .messages()
-        .await
-        .map_err(|e| IntakeError::Consumer(e.to_string()))?;
-
-    tracing::info!(subject = DELIVER_SUBJECT, "intake consumer ready");
-    while let Some(message) = messages.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::warn!(%error, "intake message error");
-                continue;
-            }
-        };
-        handle(&ingest_pool, &message).await;
-    }
-    Ok(())
+pub async fn bind(fabric: &Fabric) -> Result<CommandConsumer<DeliverNotification>, IntakeError> {
+    let consumer = fabric
+        .ensure_command_consumer::<DeliverNotification>(&deliver_coords(), DURABLE_NAME)
+        .await?;
+    tracing::info!(durable = DURABLE_NAME, "intake consumer bound");
+    Ok(consumer)
 }
 
-async fn handle(pool: &PgPool, message: &jetstream::Message) {
-    let command: DeliverNotification = match serde_json::from_slice(&message.payload) {
-        Ok(command) => command,
+pub async fn consume(
+    mut consumer: CommandConsumer<DeliverNotification>,
+    ingest_pool: PgPool,
+    readiness: ReadinessHandle,
+    shutdown_tx: watch::Sender<bool>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut consecutive_errors: u32 = 0;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            received = consumer.recv() => match received {
+                Ok(Some(delivered)) => {
+                    consecutive_errors = 0;
+                    handle(&ingest_pool, delivered).await;
+                }
+                Ok(None) => {
+                    fail_loud(&readiness, &shutdown_tx, "intake stream closed (durable or stream gone)");
+                    break;
+                }
+                Err(error) => {
+                    consecutive_errors += 1;
+                    tracing::warn!(%error, consecutive_errors, "intake recv error");
+                    if consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        fail_loud(&readiness, &shutdown_tx, "intake recv errors past the budget");
+                        break;
+                    }
+                }
+            },
+        }
+    }
+    consumer.drain().await;
+}
+
+fn fail_loud(readiness: &ReadinessHandle, shutdown_tx: &watch::Sender<bool>, reason: &str) {
+    tracing::error!(reason, "intake terminated abnormally — failing loud");
+    readiness.set_not_ready(reason.to_owned());
+    let _ = shutdown_tx.send(true);
+}
+
+async fn handle(pool: &PgPool, delivered: Delivered<IntegrationCommand<DeliverNotification>>) {
+    let command = match delivered.payload() {
+        Ok(envelope) => envelope.payload.clone(),
         Err(error) => {
-            tracing::warn!(%error, "rejecting undecodable deliver command (fail-closed)");
-            ack(message).await;
+            tracing::error!(%error, "terminating undecodable command (poison)");
+            apply(delivered, outcome_for_undecodable()).await;
             return;
         }
     };
 
-    if delivery_count(message) >= MAX_DELIVER {
-        tracing::error!(
-            source_event_id = %command.source_event_id,
-            "redelivery budget exhausted, dropping command"
-        );
-        terminate(message).await;
-        return;
+    let fan_out = fan_out(pool, &command).await;
+    let outcome = outcome_for(delivered.delivered_count(), fan_out.is_ok());
+    if let Err(error) = &fan_out {
+        if outcome == MessageOutcome::Term {
+            tracing::error!(%error, source_event_id = %command.source_event_id, "redelivery budget exhausted, terminating command");
+        } else {
+            tracing::error!(%error, source_event_id = %command.source_event_id, "deliver fan-out failed, NAKing");
+        }
     }
 
-    match fan_out(pool, &command).await {
-        Ok(()) => ack(message).await,
-        Err(error) => {
-            tracing::error!(%error, source_event_id = %command.source_event_id, "deliver fan-out failed, NAKing");
-            if let Err(nak_error) = message
-                .ack_with(jetstream::AckKind::Nak(Some(NAK_DELAY)))
-                .await
-            {
-                tracing::error!(%nak_error, "failed to NAK message");
-            }
-        }
+    apply(delivered, outcome).await;
+}
+
+fn outcome_for(delivered_count: Option<i64>, fan_out_ok: bool) -> MessageOutcome {
+    if fan_out_ok {
+        return MessageOutcome::Ack;
+    }
+    match delivered_count {
+        Some(count) if count > MAX_DELIVER => MessageOutcome::Term,
+        _ => MessageOutcome::Nak(Some(NAK_DELAY)),
     }
 }
 
-fn delivery_count(message: &jetstream::Message) -> i64 {
-    message.info().map(|info| info.delivered).unwrap_or(1)
+fn outcome_for_undecodable() -> MessageOutcome {
+    MessageOutcome::Term
 }
 
 async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<(), sqlx::Error> {
@@ -108,22 +121,77 @@ async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<(), sql
     Ok(())
 }
 
-async fn ack(message: &jetstream::Message) {
-    if let Err(error) = message.ack().await {
-        tracing::error!(%error, "failed to ack message");
-    }
-}
-
-async fn terminate(message: &jetstream::Message) {
-    if let Err(error) = message.ack_with(jetstream::AckKind::Term).await {
-        tracing::error!(%error, "failed to terminate message");
+async fn apply(
+    delivered: Delivered<IntegrationCommand<DeliverNotification>>,
+    outcome: MessageOutcome,
+) {
+    let result = match outcome {
+        MessageOutcome::Ack => delivered.ack().await,
+        MessageOutcome::Nak(delay) => delivered.nak(delay).await,
+        MessageOutcome::Term => delivered.term().await,
+        other => {
+            tracing::error!(?other, "unexpected message outcome, NAKing");
+            delivered.nak(Some(NAK_DELAY)).await
+        }
+    };
+    if let Err(error) = result {
+        tracing::error!(%error, ?outcome, "failed to settle message");
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum IntakeError {
-    #[error("intake stream unavailable: {0}")]
-    Stream(String),
     #[error("intake consumer unavailable: {0}")]
-    Consumer(String),
+    Consumer(#[from] FabricError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fan_out_success_always_acks() {
+        assert_eq!(outcome_for(Some(1), true), MessageOutcome::Ack);
+        assert_eq!(
+            outcome_for(Some(MAX_DELIVER + 9), true),
+            MessageOutcome::Ack
+        );
+        assert_eq!(outcome_for(None, true), MessageOutcome::Ack);
+    }
+
+    #[test]
+    fn transient_failure_naks_within_the_budget() {
+        for count in 1..=MAX_DELIVER {
+            assert_eq!(
+                outcome_for(Some(count), false),
+                MessageOutcome::Nak(Some(NAK_DELAY)),
+                "delivery {count} is within the budget"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_past_the_budget_terminates() {
+        assert_eq!(
+            outcome_for(Some(MAX_DELIVER + 1), false),
+            MessageOutcome::Term
+        );
+        assert_eq!(
+            outcome_for(Some(MAX_DELIVER + 100), false),
+            MessageOutcome::Term
+        );
+    }
+
+    #[test]
+    fn absent_delivery_count_on_failure_naks_rather_than_terminating() {
+        assert_eq!(
+            outcome_for(None, false),
+            MessageOutcome::Nak(Some(NAK_DELAY))
+        );
+    }
+
+    #[test]
+    fn an_undecodable_frame_is_terminated_not_acked() {
+        assert_eq!(outcome_for_undecodable(), MessageOutcome::Term);
+    }
 }
