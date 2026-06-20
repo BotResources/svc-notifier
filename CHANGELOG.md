@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.0
+
+**BREAKING — the external NATS envelope changed.** The deliver command is now
+consumed from the fixed `INTEGRATION_CMD` stream at the coordinate
+`integration.cmd.notifier.notification.deliver.v1`, carried in the standard
+`IntegrationCommand` envelope, replacing the previous bespoke subject/stream.
+Producers must publish through `br-notifier-publisher` (or the equivalent Fabric
+coordinates); the old wire no longer reaches the service. This break to the
+service's public contract is the reason for the major version bump.
+
 ### Fixed
 - **Fail-loud on a missing `INTEGRATION_CMD` stream now gates readiness.** The
   intake consumer is bound in `main` (`intake::bind`) **before** `/readyz` is set
