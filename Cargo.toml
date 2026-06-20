@@ -4,7 +4,7 @@ default-members = [".", "crates/br-notifier-contract", "crates/br-notifier-publi
 
 [package]
 name = "svc-notifier"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 publish = false
 rust-version = "1.94"
