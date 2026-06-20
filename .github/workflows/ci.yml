@@ -115,18 +115,14 @@ jobs:
           docker logs postgres
           exit 1
 
-      # The `services:` block does not let us pass custom args, and NATS
-      # JetStream requires `--jetstream`. Run it inline on the host network.
-      - name: Start NATS JetStream
+      - name: install nats-server
         run: |
-          docker run -d --name nats --network host nats:2.12 --jetstream
-          for i in {1..20}; do
-            if nc -z localhost 4222; then echo "NATS up"; exit 0; fi
-            sleep 1
-          done
-          echo "NATS failed to start" >&2
-          docker logs nats
-          exit 1
+          NATS_VERSION="v2.14.1"
+          URL="https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
+          curl -sSfL "$URL" -o /tmp/nats-server.tar.gz
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          sudo install "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+          nats-server --version
 
       - name: Provision Postgres roles
         run: docker exec -i postgres psql -U owner -d svc_notifier_test < scripts/init-db.sql
@@ -137,10 +133,9 @@ jobs:
           DATABASE_URL_SERVICE_OWNER: postgres://svc_notifier_owner:svc_notifier_owner@localhost:5432/svc_notifier_test
           DATABASE_URL: postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test
           DATABASE_URL_INGEST: postgres://svc_notifier_ingest:svc_notifier_ingest@localhost:5432/svc_notifier_test
-          NATS_URL: nats://localhost:4222
           PORT: "8010"
           RUST_LOG: info
-        run: cargo test --tests --no-fail-fast
+        run: cargo test --tests --no-fail-fast -- --test-threads=1
 
   audit:
     name: cargo audit (RustSec)
@@ -209,6 +204,30 @@ jobs:
           echo "Baseline: $baseline"
           cargo semver-checks check-release -p br-notifier-contract --baseline-rev "$baseline"
 
+  semver-publisher:
+    name: cargo semver-checks (publisher)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: semver-check br-notifier-publisher against its latest release
+        run: |
+          baseline="$(git tag -l 'br-notifier-publisher/v*' --sort=-v:refname | head -1)"
+          if [ -z "$baseline" ]; then
+            echo "No br-notifier-publisher release tag yet — nothing to compare against."
+            exit 0
+          fi
+          echo "Baseline: $baseline"
+          cargo semver-checks check-release -p br-notifier-publisher --baseline-rev "$baseline"
+
   changelog:
     name: changelog entry present (per crate)
     runs-on: ubuntu-latest
@@ -233,9 +252,14 @@ jobs:
             echo "::error::svc-notifier code changed without a CHANGELOG.md entry"
             fail=1
           fi
-          if echo "$changed" | grep -qE '^br-notifier-contract/(src/|Cargo\.toml)' \
-            && ! echo "$changed" | grep -qx 'br-notifier-contract/CHANGELOG.md'; then
+          if echo "$changed" | grep -qE '^crates/br-notifier-contract/(src/|Cargo\.toml)' \
+            && ! echo "$changed" | grep -qx 'crates/br-notifier-contract/CHANGELOG.md'; then
             echo "::error::br-notifier-contract changed without a CHANGELOG.md entry"
+            fail=1
+          fi
+          if echo "$changed" | grep -qE '^crates/br-notifier-publisher/(src/|Cargo\.toml)' \
+            && ! echo "$changed" | grep -qx 'crates/br-notifier-publisher/CHANGELOG.md'; then
+            echo "::error::br-notifier-publisher changed without a CHANGELOG.md entry"
             fail=1
           fi
           exit $fail

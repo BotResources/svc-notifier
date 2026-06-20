@@ -1,6 +1,3 @@
-// Realtime behavior scenarios: the reconnect contract, and the proof that
-// pushes derive from committed PG state — not from the memory of the process
-// that handled the write.
 mod common;
 
 use br_test_harness::verdict;
@@ -61,7 +58,7 @@ async fn s13_subscribe_then_snapshot_loses_nothing_across_the_gap() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn s15_two_replicas_pushes_derive_from_committed_pg_state() {
+async fn s16_two_replicas_pushes_derive_from_committed_pg_state() {
     let stack = TestStack::up().await;
 
     // given: instance A serves GraphQL only (no intake), instance B owns the

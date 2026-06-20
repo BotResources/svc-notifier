@@ -1,0 +1,15 @@
+[package]
+name = "br-notifier-contract"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Published language for svc-notifier — typed deliver command, fail-closed RelativeLink, typed integration-command coordinates"
+repository = "https://github.com/BotResources/svc-notifier"
+
+[dependencies]
+br-core-integration = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-integration", tag = "v1.0.2", version = "1.0.2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["serde"] }

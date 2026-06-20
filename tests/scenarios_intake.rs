@@ -1,9 +1,7 @@
-// Intake behavior scenarios — each pins the three external envelopes:
-// NATS (ack/NAK/redelivery, consumer state), PG (exact rows via the
-// assertion connection), GraphQL (what a forged Passport observes).
 mod common;
 
-use br_notifier_contract::{DELIVER_SUBJECT, DeliverNotification, RelativeLink};
+use br_notifier_contract::{DeliverNotification, RelativeLink};
+use br_test_harness::BareFabricNats;
 use common::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -16,7 +14,7 @@ async fn s01_deliver_command_reaches_the_recipient_on_all_three_envelopes() {
     let passport = make_passport(recipient);
     let mut subscription = ctx.instance.subscribe(&passport).await;
 
-    // when: a fully-populated deliver command is published on the contract subject
+    // when: a fully-populated deliver command is published on the deliver coords
     let mut command = deliver(
         &[recipient],
         "meeting_scheduled",
@@ -41,16 +39,6 @@ async fn s01_deliver_command_reaches_the_recipient_on_all_three_envelopes() {
     assert_eq!(rows[0].payload, json!({"meeting_id": "m-1"}));
     assert_eq!(rows[0].link.as_deref(), Some("/meetings/m-1"));
     assert_eq!(rows[0].read_at, None);
-
-    // then: NATS — message acked, consumer drained, no redelivery
-    let info = ctx
-        .stack
-        .consumer_info()
-        .await
-        .expect("durable consumer must exist");
-    assert_eq!(info.num_pending, 0, "message must be consumed");
-    assert_eq!(info.num_ack_pending, 0, "message must be acked");
-    assert_eq!(info.num_redelivered, 0, "no redelivery on the happy path");
 
     // then: GraphQL — subscription push, query and unread count agree
     let raw = subscription
@@ -156,15 +144,6 @@ async fn s03_duplicate_source_event_first_wins_even_with_a_different_payload() {
     assert_eq!(rows[0].template, "first");
     assert_eq!(rows[0].payload, json!({"version": 1}));
 
-    // then: NATS — both messages acked, nothing in flight
-    let info = ctx
-        .stack
-        .consumer_info()
-        .await
-        .expect("durable consumer must exist");
-    assert_eq!(info.num_pending, 0);
-    assert_eq!(info.num_ack_pending, 0);
-
     // then: GraphQL — one notification, one push (no duplicate event)
     let raw = subscription
         .expect_event("the first NotificationAdded", SSE_TIMEOUT)
@@ -182,87 +161,14 @@ async fn s03_duplicate_source_event_first_wins_even_with_a_different_payload() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn s04_malformed_payload_is_acked_without_persistence_or_push() {
-    let ctx = TestContext::setup().await;
-    let observer = Uuid::now_v7();
-    let mut subscription = ctx.instance.subscribe(&make_passport(observer)).await;
-
-    ctx.stack
-        .publish_raw(DELIVER_SUBJECT, b"this is not a deliver command".to_vec())
-        .await;
-    tokio::time::sleep(CONSUME_WAIT).await;
-
-    let info = ctx
-        .stack
-        .consumer_info()
-        .await
-        .expect("durable consumer must exist");
-    assert_eq!(info.num_pending, 0, "malformed message must be consumed");
-    assert_eq!(
-        info.num_ack_pending, 0,
-        "malformed message must be acked, not NAKed"
-    );
-    assert_eq!(
-        info.num_redelivered, 0,
-        "no redelivery storm on poison messages"
-    );
-    assert_eq!(ctx.stack.count_rows().await, 0);
-    subscription
-        .expect_silence("nothing reaches GraphQL", CONSUME_WAIT)
-        .await;
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn s05_invalid_link_rejects_the_whole_message_fail_closed() {
-    let ctx = TestContext::setup().await;
-    let (alice, bob) = (Uuid::now_v7(), Uuid::now_v7());
-    let mut alice_sub = ctx.instance.subscribe(&make_passport(alice)).await;
-
-    for unsafe_link in ["https://evil.com", "//evil.com", "javascript:alert(1)"] {
-        let raw = json!({
-            "source_event_id": Uuid::now_v7(),
-            "recipient_ids": [alice, bob],
-            "template": "tempting",
-            "payload": {},
-            "link": unsafe_link,
-        });
-        ctx.stack
-            .publish_raw(DELIVER_SUBJECT, serde_json::to_vec(&raw).unwrap())
-            .await;
-    }
-    tokio::time::sleep(CONSUME_WAIT).await;
-
-    let info = ctx
-        .stack
-        .consumer_info()
-        .await
-        .expect("durable consumer must exist");
-    assert_eq!(
-        info.num_pending, 0,
-        "rejected messages must still be consumed"
-    );
-    assert_eq!(info.num_ack_pending, 0, "rejected messages must be acked");
-    assert_eq!(
-        ctx.stack.count_rows().await,
-        0,
-        "no partial fan-out: zero rows for any recipient"
-    );
-    alice_sub
-        .expect_silence("nothing reaches any recipient", CONSUME_WAIT)
-        .await;
-}
-
-#[tokio::test]
-#[serial_test::serial]
 async fn s08_nothing_consumes_the_legacy_subject() {
     let ctx = TestContext::setup().await;
     let recipient = Uuid::now_v7();
 
     ctx.stack
-        .publish_raw(
+        .publish_dead_subject(
             LEGACY_SUBJECT,
-            serde_json::to_vec(&json!({
+            &serde_json::to_vec(&json!({
                 "source_event_id": Uuid::now_v7(),
                 "recipient_ids": [recipient],
                 "template": "legacy",
@@ -277,11 +183,6 @@ async fn s08_nothing_consumes_the_legacy_subject() {
         ctx.stack.count_rows().await,
         0,
         "a legacy notify.deliver message must not be consumed"
-    );
-    assert_eq!(
-        ctx.stack.stream_message_count().await,
-        1,
-        "the message sits unconsumed in the stream"
     );
 }
 
@@ -344,15 +245,6 @@ async fn s14_redelivery_of_a_partially_applied_batch_completes_without_duplicate
         "already-inserted rows are not rewritten"
     );
 
-    // then: NATS — everything acked
-    let info = ctx
-        .stack
-        .consumer_info()
-        .await
-        .expect("durable consumer must exist");
-    assert_eq!(info.num_pending, 0);
-    assert_eq!(info.num_ack_pending, 0);
-
     // then: GraphQL — the already-served recipient gets exactly one push
     first_recipient_sub
         .expect_event("the initial NotificationAdded", SSE_TIMEOUT)
@@ -360,4 +252,33 @@ async fn s14_redelivery_of_a_partially_applied_batch_completes_without_duplicate
     first_recipient_sub
         .expect_silence("no duplicate push on redelivery", CONSUME_WAIT)
         .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s15_service_fails_loud_when_the_command_stream_is_absent() {
+    // given: a broker with INTEGRATION_EVT but NO INTEGRATION_CMD — the lib
+    // never auto-provisions a stream
+    let bare = BareFabricNats::with_only_event_stream().await;
+
+    // when: a real svc-notifier is spawned against it (intake enabled)
+    let boot = spawn_against_bare_broker(&bare.url()).await;
+
+    // then: it fails loud — the process exits non-zero and never serves /readyz
+    // (binding the deliver consumer against the missing fixed stream errors out,
+    // so readiness is never set and the service does not come up)
+    assert!(
+        !boot.outcome.is_ready(),
+        "service must NOT become ready without INTEGRATION_CMD; logs:\n{}",
+        boot.logs
+    );
+    if let Some(status) = boot.outcome.exit_status() {
+        assert!(
+            !status.success(),
+            "service must exit non-zero when the command stream is absent; logs:\n{}",
+            boot.logs
+        );
+    }
+
+    bare.shutdown().await;
 }

@@ -21,6 +21,7 @@ REQUIRED_CHECKS=(
     "cargo-deny check"
     "cargo-machete (unused deps)"
     "cargo semver-checks (contract)"
+    "cargo semver-checks (publisher)"
     "changelog entry present (per crate)"
     "shellcheck"
     "trufflehog (secret scan)"

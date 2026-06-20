@@ -43,6 +43,8 @@ jobs:
       service_version: ${{ steps.detect.outputs.service_version }}
       tag_contract: ${{ steps.detect.outputs.tag_contract }}
       contract_version: ${{ steps.detect.outputs.contract_version }}
+      tag_publisher: ${{ steps.detect.outputs.tag_publisher }}
+      publisher_version: ${{ steps.detect.outputs.publisher_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,12 +98,12 @@ jobs:
           esac
 
           # --- contract (tag-only release, main pushes only) ---------------
-          contract_version="$(crate_version br-notifier-contract/Cargo.toml)"
+          contract_version="$(crate_version crates/br-notifier-contract/Cargo.toml)"
           tag_contract=false
           if [ "${GITHUB_REF}" = "refs/heads/main" ] \
             && is_release "$contract_version" \
             && ! tag_exists "br-notifier-contract/v${contract_version}"; then
-            if grep -qE "^## ${contract_version}( |$)" br-notifier-contract/CHANGELOG.md; then
+            if grep -qE "^## ${contract_version}( |$)" crates/br-notifier-contract/CHANGELOG.md; then
               tag_contract=true
             else
               echo "::warning::br-notifier-contract ${contract_version} has no CHANGELOG heading — not tagging"
@@ -110,11 +112,28 @@ jobs:
             echo "br-notifier-contract ${contract_version}: already tagged or not applicable"
           fi
 
+          # --- publisher (tag-only release, main pushes only) -------------
+          publisher_version="$(crate_version crates/br-notifier-publisher/Cargo.toml)"
+          tag_publisher=false
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] \
+            && is_release "$publisher_version" \
+            && ! tag_exists "br-notifier-publisher/v${publisher_version}"; then
+            if grep -qE "^## ${publisher_version}( |$)" crates/br-notifier-publisher/CHANGELOG.md; then
+              tag_publisher=true
+            else
+              echo "::warning::br-notifier-publisher ${publisher_version} has no CHANGELOG heading — not tagging"
+            fi
+          else
+            echo "br-notifier-publisher ${publisher_version}: already tagged or not applicable"
+          fi
+
           {
             echo "publish_service=${publish_service}"
             echo "service_version=${service_version}"
             echo "tag_contract=${tag_contract}"
             echo "contract_version=${contract_version}"
+            echo "tag_publisher=${tag_publisher}"
+            echo "publisher_version=${publisher_version}"
           } >> "$GITHUB_OUTPUT"
 
   publish:
@@ -224,4 +243,31 @@ jobs:
           fi
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
             --title "$tag" \
-            --notes "See the \`## ${VERSION}\` section of br-notifier-contract/CHANGELOG.md."
+            --notes "See the \`## ${VERSION}\` section of crates/br-notifier-contract/CHANGELOG.md."
+
+  tag-publisher:
+    name: Tag + Release br-notifier-publisher
+    needs: detect-bump
+    if: needs.detect-bump.outputs.tag_publisher == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create tag + GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect-bump.outputs.publisher_version }}
+        run: |
+          tag="br-notifier-publisher/v${VERSION}"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            echo "Tag $tag already exists"
+          else
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
+            --title "$tag" \
+            --notes "See the \`## ${VERSION}\` section of crates/br-notifier-publisher/CHANGELOG.md."

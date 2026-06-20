@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Fail-loud on a missing `INTEGRATION_CMD` stream now gates readiness.** The
+  intake consumer is bound in `main` (`intake::bind`) **before** `/readyz` is set
+  ready; on bind failure (e.g. the fixed stream is absent) the process exits
+  non-zero and never serves readiness, instead of the previous detached
+  log-and-die task that left `/readyz` returning 200 over a dead intake
+  (Security Invariant #6). Proven service-level by `s15` (a real svc-notifier
+  spawned against a broker missing the stream stays not-ready / exits non-zero).
+- **Undecodable commands are terminated, not acked.** A frame whose payload fails
+  to decode (invalid JSON, or a contract-rejected unsafe `link`) now resolves to
+  `term` (poison handling, Security Invariant #6) instead of `ack` — acking a
+  poison message falsely signals successful processing and drops the poison
+  signal. Unit-tested in `intake::tests`.
+- **Abnormal intake termination after boot now fails loud.** If the intake
+  `recv()` loop ends unexpectedly while the service is live — the stream/durable
+  vanishing (`Ok(None)`), or `recv()` erroring past a consecutive-error budget —
+  the loop logs `tracing::error!`, flips `/readyz` to not-ready, and triggers
+  process shutdown for a non-zero exit so K8s reschedules. Previously the spawned
+  task simply ended while `/readyz` kept returning 200 over a dead intake (the
+  runtime counterpart of the boot-time Security Invariant #6 fix). The intentional
+  shutdown path (SIGTERM/ctrl-c) stays silent and exits zero as before.
+
+### Changed
+- **`IntakeError::Consumer` / `PublishError::Publish` carry the typed
+  `FabricError`** (`#[from]`) instead of a stringified message, preserving the
+  error kind across the boundary.
+- **The deliver `command_type` derives from the contract.**
+  `br-notifier-contract` now exposes `deliver_command_type()`
+  (`{aggregate}.{verb}`); `br-notifier-publisher` builds the envelope from it
+  (and `DELIVER_VERSION`) so the coordinates and the envelope cannot drift.
+- **README corrected to match the code.** The RLS paragraph no longer claims a
+  removed `br_util_postgres::set_rls_context` helper setting five `app.*` GUCs —
+  both the GraphQL `scoped_tx` and the listener set the single
+  `app.current_user_id` GUC inline (the lib removed the helper; the GUC shape is a
+  per-project seam). The intake-semantics and Fabric sections describe the
+  undecodable → `term` contract and the readiness-gated bind. The Tests section
+  records that the malformed-frame / invalid-`link` decisions (`s04`/`s05`) are
+  proven by unit tests + the contract's deserialization tests; a live-intake e2e
+  of a deliberately-corrupt frame is intentionally not added (it would require a
+  raw-publish foot-gun the operator ruled out; a compliant `br-notifier-publisher`
+  producer cannot emit such a frame by construction).
+- **All NATS access now goes through `br-util-nats-fabric` — no direct `async_nats`
+  anywhere in the repo (production or tests).** The intake binds a Fabric
+  create-or-bind durable consumer on the deliver coordinates (rendered to
+  `integration.cmd.notifier.notification.deliver.v1` on the fixed `INTEGRATION_CMD`
+  stream), replacing the hand-rolled `async_nats` connect + `create_consumer_strict`
+  + `consumer.messages()` loop. The connection is `Fabric::connect` /
+  `connect_with`. The deliver command travels as the standard `IntegrationCommand`
+  envelope (its `payload` is the unchanged `DeliverNotification`).
+- **`br-rust-common` git pins bumped `v0.11.0` → `v1.0.2`** (and `br-test-harness`
+  → `v1.0.2`), with the matching `version = "1.0.2"` next to each tag.
+- **`scoped_tx` sets the RLS context inline.** `br_util_postgres::set_rls_context`
+  was removed in the v1.0.x lib; the GraphQL read path now sets
+  `app.current_user_id` transaction-local from the recipient (Service passports
+  are rejected from the recipient surface as before). Behavior is unchanged for
+  human recipients.
+- **Graceful shutdown.** The intake loop runs under a `tokio::select!` over a
+  shutdown watch channel and `drain()`s the consumer on SIGTERM/ctrl-c, leaving
+  un-acked frames un-acked (at-least-once preserved). `axum::serve` uses
+  `with_graceful_shutdown`.
+- **An empty `NATS_URL` is treated as unset** (no intake), matching the k8s
+  empty-env idiom.
+- Repository is now a three-crate workspace; `br-notifier-contract` moved under
+  `crates/`, joined by the new `br-notifier-publisher`.
+
+### Added
+- **`br-notifier-publisher`** (0.1.0) — the producer kit: a thin `NotifierPublisher`
+  over the Fabric that publishes a typed `DeliverNotification`. The e2e harness
+  publishes test commands through it (never raw `async_nats`).
+
+### Removed
+- The `async-nats` dependency (production and dev). `grep async_nats` over the repo
+  returns nothing.
+
 ## 0.6.0
 
 ### Fixed

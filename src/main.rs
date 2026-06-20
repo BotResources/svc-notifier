@@ -16,6 +16,7 @@ use axum::{Extension, Json, Router};
 use br_core_auth::Passport;
 use br_util_axum_auth::passport_header_middleware;
 use br_util_axum_readiness::{ReadinessHandle, readiness_route};
+use br_util_nats_fabric::{Fabric, NatsAuth};
 use br_util_observability::{
     http_metrics_layer, init_logging, init_metrics, liveness_route, metrics_route,
 };
@@ -53,16 +54,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscribers = Subscribers::default();
     tokio::spawn(run_listener(app_pool.clone(), subscribers.clone()));
 
-    if let Ok(nats_url) = std::env::var("NATS_URL") {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Some(nats_url) = std::env::var("NATS_URL").ok().filter(|url| !url.is_empty()) {
         let ingest_url = std::env::var("DATABASE_URL_INGEST")
             .map_err(|_| "DATABASE_URL_INGEST is required when NATS_URL is set")?;
         let ingest_pool = ingest_pool(&ingest_url).await?;
-        let jetstream = connect_jetstream(&nats_url).await?;
-        tokio::spawn(async move {
-            if let Err(error) = intake::run(jetstream, ingest_pool).await {
-                tracing::error!(%error, "intake terminated");
-            }
-        });
+        let fabric = connect_fabric(&nats_url).await?;
+        let consumer = intake::bind(&fabric).await?;
+        tokio::spawn(intake::consume(
+            consumer,
+            ingest_pool,
+            readiness.clone(),
+            shutdown_tx.clone(),
+            shutdown_rx.clone(),
+        ));
     }
 
     let schema = schema_builder()
@@ -92,8 +97,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     readiness.set_ready();
     tracing::info!(port, "svc-notifier listening");
-    axum::serve(listener, app).await?;
+    let intake_failed = shutdown_rx.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await?;
+    let intake_terminated_abnormally = *intake_failed.borrow();
+    let _ = shutdown_tx.send(true);
+    if intake_terminated_abnormally {
+        return Err("intake terminated abnormally — exiting non-zero so K8s reschedules".into());
+    }
     Ok(())
+}
+
+async fn shutdown_signal(mut intake_down: tokio::sync::watch::Receiver<bool>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    let intake_failed = async {
+        let _ = intake_down.wait_for(|down| *down).await;
+    };
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+        _ = intake_failed => {},
+    }
 }
 
 fn schema_builder() -> SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> {
@@ -123,18 +160,14 @@ async fn run_migrations() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn connect_jetstream(
-    nats_url: &str,
-) -> Result<async_nats::jetstream::Context, Box<dyn std::error::Error>> {
-    let client = match (std::env::var("NATS_USER"), std::env::var("NATS_PASSWORD")) {
+async fn connect_fabric(nats_url: &str) -> Result<Fabric, Box<dyn std::error::Error>> {
+    let fabric = match (std::env::var("NATS_USER"), std::env::var("NATS_PASSWORD")) {
         (Ok(user), Ok(password)) => {
-            async_nats::ConnectOptions::with_user_and_password(user, password)
-                .connect(nats_url)
-                .await?
+            Fabric::connect_with(nats_url, &NatsAuth { user, password }).await?
         }
-        _ => async_nats::connect(nats_url).await?,
+        _ => Fabric::connect(nats_url).await?,
     };
-    Ok(async_nats::jetstream::new(client))
+    Ok(fabric)
 }
 
 async fn schema_sdl(State(state): State<HttpState>) -> impl IntoResponse {
