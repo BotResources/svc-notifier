@@ -368,8 +368,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-auth"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "base64",
  "br-core-kernel",
@@ -383,8 +383,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-directory"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "serde",
  "serde_json",
@@ -394,8 +394,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-events"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "br-core-kernel",
  "chrono",
@@ -406,8 +406,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-integration"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "br-core-events",
  "chrono",
@@ -418,8 +418,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-kernel"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "serde",
  "uuid",
@@ -427,8 +427,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-scope"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "serde",
  "thiserror",
@@ -436,8 +436,8 @@ dependencies = [
 
 [[package]]
 name = "br-core-values"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "serde",
  "thiserror",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "br-notifier-contract"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "br-core-integration",
  "serde",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "br-notifier-publisher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "br-core-integration",
  "br-notifier-contract",
@@ -471,16 +471,16 @@ dependencies = [
 
 [[package]]
 name = "br-scope-declaration-contract"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "br-core-integration",
 ]
 
 [[package]]
 name = "br-test-harness"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-e2e-harness?tag=v1.0.2#316e6cb78c19a05c221e28c96b1bbe88e99151d2"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-e2e-harness?tag=v1.1.0#a831e793ad414978030cde0516b18d57db5c8b35"
 dependencies = [
  "async-nats",
  "br-core-auth",
@@ -506,8 +506,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-axum-auth"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "axum",
  "br-core-auth",
@@ -516,8 +516,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-axum-readiness"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "axum",
  "tracing",
@@ -525,8 +525,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-graphql"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "async-graphql",
  "axum",
@@ -537,8 +537,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-nats-fabric"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -555,8 +555,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-observability"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "axum",
  "chrono",
@@ -572,8 +572,8 @@ dependencies = [
 
 [[package]]
 name = "br-util-postgres"
-version = "1.0.2"
-source = "git+https://github.com/BotResources/br-rust-common?tag=v1.0.2#3513953956453cd39f6da4a492bb8f251405c597"
+version = "1.1.0"
+source = "git+https://github.com/BotResources/br-rust-common?tag=v1.1.0#d7586cfb3828c05ef95957120712c549434121f0"
 dependencies = [
  "sqlx",
  "thiserror",
@@ -791,9 +791,9 @@ checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1328,11 +1328,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1342,11 +1340,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2521,14 +2521,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.1",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -2650,6 +2651,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "rand_xoshiro"
@@ -3469,7 +3479,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svc-notifier"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-graphql",
  "axum",

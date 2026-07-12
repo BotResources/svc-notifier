@@ -8,6 +8,17 @@ It is versioned independently of the `svc-notifier` service crate.
 
 ## [Unreleased]
 
+## 0.3.0
+
+### Changed
+- **Bump `br-core-integration` `v1.0.2` → `v1.1.0`** (with the matching
+  `version = "1.1.0"` next to the tag). `deliver_coords()` returns
+  `br_core_integration::CommandCoords` in its public signature, so the library
+  version that coordinate type resolves to is part of this crate's public API —
+  hence the minor bump rather than a patch. The coordinate values, the
+  `DeliverNotification` / `RelativeLink` wire, `deliver_command_type()` and the
+  rendered subject are all unchanged; no source change.
+
 ## 0.2.0
 
 ### Added
