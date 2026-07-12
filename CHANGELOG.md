@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.1
+
+A dependency patch: bump the shared library and harness to the unified
+`v1.1.0`. The service's wire is unchanged — the NATS subjects, the
+`IntegrationCommand` envelope, the GraphQL surface and the `LISTEN/NOTIFY`
+realtime path are byte-for-byte identical; the pins are internal to the binary.
+
+### Changed
+- **Bump `br-rust-common` `v1.0.2` → `v1.1.0`** (and `br-test-harness` →
+  `v1.1.0`), with the matching `version = "1.1.0"` next to each tag. The
+  `v1.1.0` delta is additive: it hardens the `br-util-nats-fabric` run-loop with
+  automatic recovery from transient consumer errors (rebind + capped backoff; a
+  missed consumer heartbeat now retries indefinitely instead of surfacing an
+  error, and a non-transient run-loop error is budgeted before it fails loud).
+  The intake consumer (`intake::consume`, over the Fabric `CommandConsumer`)
+  inherits this directly — a transient missed heartbeat no longer surfaces from
+  `recv()`, so it no longer counts against the service's consecutive-recv-error
+  budget and no longer risks tearing the intake down, which was the known
+  abnormal-termination mode. There is no service code change: the poison budget
+  (`max_deliver` 5 + `term()`), the `ack_wait` grace and the consecutive-recv-
+  error budget are all unchanged.
+- Chart `version`/`appVersion` bumped to 1.0.1 in lockstep with the crate (no
+  template change).
+
+### Security
+- **`crossbeam-epoch` `0.9.18` → `0.9.20`** (`cargo update`) to clear
+  RUSTSEC-2026-0204. Transitive dependency; no source or behavior change.
+
 ## 1.0.0
 
 **BREAKING — the external NATS envelope changed.** The deliver command is now

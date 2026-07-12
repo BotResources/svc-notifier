@@ -26,7 +26,7 @@ producer's to supply, so the command carries its provenance.
 
 ```toml
 [dependencies]
-br-notifier-publisher = { git = "https://github.com/BotResources/svc-notifier", package = "br-notifier-publisher", tag = "br-notifier-publisher/v0.1.0", version = "0.1.0" }
+br-notifier-publisher = { git = "https://github.com/BotResources/svc-notifier", package = "br-notifier-publisher", tag = "br-notifier-publisher/v0.2.0", version = "0.2.0" }
 ```
 
 License: Apache-2.0.
