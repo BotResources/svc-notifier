@@ -1,6 +1,6 @@
 [package]
 name = "br-notifier-publisher"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -8,7 +8,7 @@ description = "Producer kit for svc-notifier: publishes a typed DeliverNotificat
 repository = "https://github.com/BotResources/svc-notifier"
 
 [dependencies]
-br-notifier-contract = { path = "../br-notifier-contract", version = "0.3.0" }
+br-notifier-contract = { path = "../br-notifier-contract", version = "0.3.1" }
 br-util-nats-fabric = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-nats-fabric", tag = "v1.2.0", version = "1.2.0" }
 
 thiserror = "2"

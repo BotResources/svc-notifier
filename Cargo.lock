@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "br-notifier-contract"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "br-core-integration",
  "serde",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "br-notifier-publisher"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "br-core-integration",
  "br-notifier-contract",
