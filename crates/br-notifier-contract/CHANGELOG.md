@@ -8,6 +8,14 @@ It is versioned independently of the `svc-notifier` service crate.
 
 ## [Unreleased]
 
+## 0.3.1
+
+### Changed
+
+- Dependency-only patch: `br-core-integration` pin `v1.1.0` → **`v1.2.0`**
+  (single-source alignment with the br-rust-common v1.2.0 consumer wave; no
+  wire or API change).
+
 ## 0.3.0
 
 ### Changed
