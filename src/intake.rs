@@ -36,6 +36,7 @@ enum FanOutVerdict {
 
 #[derive(Debug, Clone, Copy)]
 struct Trace {
+    command_id: Uuid,
     correlation_id: Uuid,
     causation_id: Option<Uuid>,
 }
@@ -206,12 +207,18 @@ async fn handle(
         Ok(envelope) => (
             envelope.payload.clone(),
             Trace {
+                command_id: envelope.command_id,
                 correlation_id: envelope.metadata.correlation_id,
                 causation_id: envelope.metadata.causation_id,
             },
         ),
         Err(error) => {
-            tracing::error!(%error, "terminating undecodable command (poison)");
+            tracing::error!(
+                %error,
+                subject = delivered.subject(),
+                delivered_count = ?delivered.delivered_count(),
+                "terminating undecodable command (poison) — no ledger row is possible, the raw frame is not exposed by the consumer"
+            );
             apply(delivered, outcome_for_undecodable()).await;
             return FanOutVerdict::NotAttempted;
         }
@@ -243,6 +250,7 @@ async fn triage(
             tracing::error!(
                 %error,
                 source_event_id = %command.source_event_id,
+                command_id = %trace.command_id,
                 correlation_id = %trace.correlation_id,
                 ?delivered_count,
                 ?sqlstate,
@@ -256,6 +264,7 @@ async fn triage(
                     tracing::error!(
                         %error,
                         source_event_id = %command.source_event_id,
+                        command_id = %trace.command_id,
                         correlation_id = %trace.correlation_id,
                         recipients = command.recipient_ids.len(),
                         ?sqlstate,
@@ -268,6 +277,7 @@ async fn triage(
                     tracing::error!(
                         %error,
                         source_event_id = %command.source_event_id,
+                        command_id = %trace.command_id,
                         correlation_id = %trace.correlation_id,
                         ?sqlstate,
                         "permanently invalid deliver command already on the ledger, terminating the redelivered frame"
@@ -279,6 +289,7 @@ async fn triage(
                         %error,
                         %ledger_error,
                         source_event_id = %command.source_event_id,
+                        command_id = %trace.command_id,
                         correlation_id = %trace.correlation_id,
                         ?sqlstate,
                         "dead-letter ledger unavailable, holding the command on the stream rather than dropping it untraced"
@@ -300,12 +311,14 @@ async fn record_dead_letter(
     let raw = serde_json::to_vec(command).expect("the deliver command serializes");
     let recorded = sqlx::query(
         "INSERT INTO dead_letters
-             (id, source_event_id, recipient_ids, command, sqlstate, correlation_id, causation_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (source_event_id) DO NOTHING
+             (id, command_id, source_event_id, recipient_ids, command, sqlstate,
+              correlation_id, causation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (command_id) DO NOTHING
          RETURNING id",
     )
     .bind(id)
+    .bind(trace.command_id)
     .bind(command.source_event_id)
     .bind(&command.recipient_ids)
     .bind(raw)

@@ -283,85 +283,169 @@ async fn s15_service_fails_loud_when_the_command_stream_is_absent() {
     bare.shutdown().await;
 }
 
+// A command a compliant producer can emit and the contract accepts, but that
+// PostgreSQL can never store: a NUL character is not permitted in a text column
+// (SQLSTATE 22021), and no redelivery will ever change that.
+fn poison(recipients: &[Uuid], marker: &str) -> DeliverNotification {
+    deliver(
+        recipients,
+        &format!("poison\u{0}{marker}"),
+        json!({"why": "nul byte", "marker": marker}),
+    )
+}
+
 #[tokio::test]
 #[serial_test::serial]
-async fn s20_a_permanently_unwritable_command_is_dead_lettered_before_it_is_terminated() {
+async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_event() {
     let ctx = TestContext::setup().await;
-    let recipients = [Uuid::now_v7(), Uuid::now_v7()];
+    let early = [Uuid::now_v7(), Uuid::now_v7()];
+    let late = [Uuid::now_v7()];
 
-    // given: a command a compliant producer can emit and the contract accepts,
-    // but that PostgreSQL can never store — a NUL character is not permitted in
-    // a text column, and no redelivery will ever change that
-    let command = deliver(
-        &recipients,
-        "poison\u{0}template",
-        json!({"why": "nul byte"}),
-    );
+    // given: one source event fanned out as two distinct deliver commands — the
+    // chunked / late-added-recipient shape s14 already exercises. The business
+    // dedup key is (source_event, recipient), so these are two legitimate
+    // commands, and both are poison.
+    let source_event_id = Uuid::now_v7();
+    let mut first = poison(&early, "chunk_one");
+    first.source_event_id = source_event_id;
+    let mut second = poison(&late, "chunk_two");
+    second.source_event_id = source_event_id;
+
+    let first_command_id = Uuid::now_v7();
     let correlation_id = Uuid::now_v7();
     ctx.stack
-        .publish_deliver_correlated(&command, correlation_id)
+        .publish_deliver_envelope(first_command_id, &first, correlation_id)
+        .await;
+    ctx.stack
+        .publish_deliver_envelope(Uuid::now_v7(), &second, Uuid::now_v7())
         .await;
 
-    // then: the abandonment is materialised in the dead-letter ledger before the
-    // frame is terminated — the request is dropped, but never silently
+    // then: TWO audit lines — deduplicating on source_event_id alone would have
+    // terminated the second command with no trace at all
+    assert!(
+        ctx.stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                ctx.stack.dead_letters().await.len() == 2
+            })
+            .await,
+        "every abandoned command must leave its own trace; logs:\n{}",
+        ctx.instance.logs()
+    );
+    let ledger = ctx.stack.dead_letters().await;
+    let recorded = ledger
+        .iter()
+        .find(|row| row.command_id == first_command_id)
+        .expect("the first command has its own line");
+    let other = ledger
+        .iter()
+        .find(|row| row.command_id != first_command_id)
+        .expect("the second command has its own line");
+    assert_eq!(recorded.source_event_id, source_event_id);
+    assert_eq!(other.source_event_id, source_event_id);
+    assert_eq!(
+        recorded.recipient_ids, early,
+        "each line names exactly the recipients its own command abandoned"
+    );
+    assert_eq!(other.recipient_ids, late);
+
+    // then: the trace is faithful — the whole command round-trips, not just the id
+    assert_eq!(
+        recorded.command(),
+        serde_json::to_value(&first).unwrap(),
+        "an operator must be able to re-emit the command verbatim"
+    );
+    assert_eq!(recorded.correlation_id, correlation_id);
+    assert_eq!(
+        recorded.sqlstate.as_deref().map(|code| &code[..2]),
+        Some("22"),
+        "the SQLSTATE that made the write permanently invalid is kept: {:?}",
+        recorded.sqlstate
+    );
+
+    // then: nothing was persisted, and each frame was settled exactly once
+    assert_eq!(ctx.stack.count_rows().await, 0, "no partial fan-out");
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
+        2,
+        "two commands, two terminations — no frame is being retried"
+    );
+
+    // when: the very same frame comes back (a term() the broker never registered)
+    ctx.stack
+        .publish_deliver_envelope(first_command_id, &first, correlation_id)
+        .await;
+    tokio::time::sleep(CONSUME_WAIT).await;
+
+    // then: the ledger is unchanged — one line per command, first trace wins
+    let ledger = ctx.stack.dead_letters().await;
+    assert_eq!(ledger.len(), 2, "a replayed frame adds no audit line");
+    assert_eq!(
+        ledger
+            .iter()
+            .find(|row| row.command_id == first_command_id)
+            .expect("still there")
+            .id,
+        recorded.id,
+        "the first trace is kept, never overwritten"
+    );
+    assert!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER) >= 1,
+        "the replay is logged as already-ledgered, not as a fresh abandonment"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s21_an_unwritable_ledger_holds_the_command_instead_of_terminating_it() {
+    let ctx = TestContext::setup().await;
+    let recipient = [Uuid::now_v7()];
+
+    // given: the dead-letter ledger cannot be written (the ingest role lost its
+    // INSERT grant) — the one guard-rail that must never silently drop a command
+    ctx.stack.revoke_ledger_writes().await;
+    let command = poison(&recipient, "ledger_down");
+    ctx.stack.publish_deliver(&command).await;
+
+    // then: the frame is NAKed and redelivered, never terminated — an untraceable
+    // abandonment is worse than an endless hold, and the hold is loud
+    assert!(
+        ctx.stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                ctx.instance.log_hits(LEDGER_UNAVAILABLE_LOG_MARKER) >= 2
+            })
+            .await,
+        "the command must be retried while the ledger is down; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(ctx.stack.dead_letters().await.len(), 0);
+    assert_eq!(ctx.stack.count_rows().await, 0);
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
+        0,
+        "nothing may be terminated while it cannot be traced"
+    );
+
+    // when: the ledger comes back
+    ctx.stack.restore_ledger_writes().await;
+
+    // then: the held command is finally traced and terminated
     assert!(
         ctx.stack
             .wait_until(RECOVERY_TIMEOUT, || async {
                 ctx.stack.dead_letters().await.len() == 1
             })
             .await,
-        "a terminated command must leave a durable trace; logs:\n{}",
+        "the held command must be recorded once the ledger is writable; logs:\n{}",
         ctx.instance.logs()
     );
-    let dead_letters = ctx.stack.dead_letters().await;
-    let recorded = &dead_letters[0];
-    assert_eq!(recorded.source_event_id, command.source_event_id);
-    assert_eq!(
-        recorded.recipient_ids, recipients,
-        "every recipient the fan-out would have served is recorded, not just the first"
-    );
-    assert_eq!(
-        recorded.sqlstate.as_deref().map(|code| &code[..2]),
-        Some("22"),
-        "the SQLSTATE that made the write permanently invalid is kept for the operator: {:?}",
-        recorded.sqlstate
-    );
-    assert_eq!(
-        recorded.command()["source_event_id"],
-        json!(command.source_event_id),
-        "the raw command is recorded verbatim, so an operator can re-emit it"
-    );
-    assert_eq!(
-        recorded.correlation_id, correlation_id,
-        "the abandonment stays joinable to the producer's trace"
-    );
+    let ledger = ctx.stack.dead_letters().await;
+    assert_eq!(ledger[0].source_event_id, command.source_event_id);
+    assert_eq!(ledger[0].recipient_ids, recipient);
 
-    // then: no notification was persisted, and the frame is gone for good — a
-    // terminated command is not redelivered into a second dead letter
-    assert_eq!(ctx.stack.count_rows().await, 0, "no partial fan-out");
     tokio::time::sleep(CONSUME_WAIT).await;
     assert_eq!(
         ctx.stack.dead_letters().await.len(),
         1,
-        "the frame is terminated, not endlessly redelivered"
-    );
-
-    // when: the same source event reaches the intake a second time (a producer
-    // re-emit, or a term() the broker never registered)
-    ctx.stack
-        .publish_deliver_correlated(&command, Uuid::now_v7())
-        .await;
-    tokio::time::sleep(CONSUME_WAIT).await;
-
-    // then: the ledger holds one audit line per abandoned command, not per frame
-    let dead_letters = ctx.stack.dead_letters().await;
-    assert_eq!(
-        dead_letters.len(),
-        1,
-        "dedup on source_event_id keeps exactly one audit line"
-    );
-    assert_eq!(
-        dead_letters[0].id, recorded.id,
-        "the first trace is the one kept, never overwritten"
+        "once traced, the frame is terminated, not redelivered forever"
     );
 }

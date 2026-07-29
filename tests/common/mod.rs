@@ -13,6 +13,7 @@ use br_notifier_publisher::NotifierPublisher;
 use br_test_harness::{
     BootOutcome, FabricTestNats, GraphqlClient, SpawnedProcess, SseSubscription,
 };
+use br_util_nats_fabric::IntegrationCommand;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -52,6 +53,19 @@ pub const STORAGE_HELD_LOG_MARKER: &str = "storage write failing, commands held 
 // Mirrors `STORAGE_OUTAGE_ALERT_AFTER` in `src/intake.rs`: the number of
 // consecutive transient failures after which the intake reports /readyz DOWN.
 pub const STORAGE_OUTAGE_ALERT_AFTER: usize = 3;
+
+// Mirrors the two poison-path log messages in `src/intake.rs` (`triage`). Same
+// coupling rule as STORAGE_HELD_LOG_MARKER: rename there, rename here.
+pub const DEAD_LETTER_RECORDED_LOG_MARKER: &str = "recorded as a dead letter and terminated";
+pub const DEAD_LETTER_REPEATED_LOG_MARKER: &str = "already on the ledger";
+pub const LEDGER_UNAVAILABLE_LOG_MARKER: &str = "dead-letter ledger unavailable";
+
+// The intake logs JetStream's own redelivery counter on every transient failure.
+// Reading the broker's counter out of the log is a stronger precondition than
+// counting our own log lines: the count comes from JetStream, not from the
+// service loop. The service logs JSON, so the field reads
+// `"delivered_count":"Some(N)"`.
+const DELIVERED_COUNT_FIELD: &str = "\"delivered_count\":\"Some(";
 
 pub struct TestStack {
     pub owner_pool: PgPool,
@@ -179,6 +193,31 @@ impl TestStack {
             .expect("publish the deliver command over the fabric");
     }
 
+    // Publishes a deliver command under a caller-chosen envelope command_id, so a
+    // scenario can replay the exact same frame (what a term() the broker never
+    // registered looks like) instead of a fresh command. Still typed coordinates
+    // through the Fabric — never a hand-built subject.
+    pub async fn publish_deliver_envelope(
+        &self,
+        command_id: Uuid,
+        command: &DeliverNotification,
+        correlation_id: Uuid,
+    ) {
+        let envelope = IntegrationCommand::new(
+            command_id,
+            br_notifier_contract::deliver_command_type(),
+            br_notifier_contract::DELIVER_VERSION,
+            Utc::now(),
+            EventMetadata::new(Actor::Human(UserId::from(Uuid::now_v7())), correlation_id),
+            command.clone(),
+        );
+        self.nats
+            .fabric()
+            .publish_command(&br_notifier_contract::deliver_coords(), &envelope)
+            .await
+            .expect("publish the deliver envelope over the fabric");
+    }
+
     pub async fn publish_dead_subject(&self, subject: &str, bytes: &[u8]) {
         self.nats.publish_dead_subject(subject, bytes).await;
     }
@@ -203,13 +242,27 @@ impl TestStack {
 
     pub async fn dead_letters(&self) -> Vec<DeadLetterRecord> {
         sqlx::query_as::<_, DeadLetterRecord>(
-            "SELECT id, source_event_id, recipient_ids, command, sqlstate,
+            "SELECT id, command_id, source_event_id, recipient_ids, command, sqlstate,
                     correlation_id, causation_id, recorded_at
              FROM dead_letters ORDER BY recorded_at, id",
         )
         .fetch_all(&self.owner_pool)
         .await
         .expect("failed to read dead letters (assertion connection)")
+    }
+
+    pub async fn revoke_ledger_writes(&self) {
+        sqlx::query("REVOKE INSERT ON dead_letters FROM svc_notifier_ingest")
+            .execute(&self.owner_pool)
+            .await
+            .expect("failed to revoke the ledger INSERT grant");
+    }
+
+    pub async fn restore_ledger_writes(&self) {
+        sqlx::query("GRANT INSERT ON dead_letters TO svc_notifier_ingest")
+            .execute(&self.owner_pool)
+            .await
+            .expect("failed to restore the ledger INSERT grant");
     }
 
     pub async fn count_rows(&self) -> usize {
@@ -336,6 +389,15 @@ impl ServiceInstance {
         self.logs().matches(marker).count()
     }
 
+    pub fn max_delivered_count(&self) -> i64 {
+        self.logs()
+            .split(DELIVERED_COUNT_FIELD)
+            .skip(1)
+            .filter_map(|tail| tail.split(')').next()?.trim().parse::<i64>().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn unread_count(value: &Value) -> i64 {
         value["data"]["notifierUnreadCount"]
             .as_i64()
@@ -380,6 +442,7 @@ pub struct NotificationRecord {
 #[derive(Debug, sqlx::FromRow)]
 pub struct DeadLetterRecord {
     pub id: Uuid,
+    pub command_id: Uuid,
     pub source_event_id: Uuid,
     pub recipient_ids: Vec<Uuid>,
     pub command: Vec<u8>,

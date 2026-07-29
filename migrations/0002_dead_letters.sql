@@ -1,5 +1,6 @@
 CREATE TABLE dead_letters (
     id              UUID PRIMARY KEY,
+    command_id      UUID NOT NULL,
     source_event_id UUID NOT NULL,
     recipient_ids   UUID[] NOT NULL,
     command         BYTEA NOT NULL,
@@ -9,7 +10,9 @@ CREATE TABLE dead_letters (
     recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX dead_letters_source_event_uniq ON dead_letters (source_event_id);
+CREATE UNIQUE INDEX dead_letters_command_uniq ON dead_letters (command_id);
+
+CREATE INDEX dead_letters_source_event_idx ON dead_letters (source_event_id);
 
 CREATE INDEX dead_letters_recorded_idx ON dead_letters (recorded_at DESC, id DESC);
 
