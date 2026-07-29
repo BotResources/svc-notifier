@@ -82,22 +82,33 @@ async fn s07c_an_outage_past_the_retired_budget_still_delivers_exactly_once() {
     let ctx = TestContext::setup().await;
     let recipient = Uuid::now_v7();
 
+    // given: a live subscriber is already listening when the outage starts — the
+    // never-lose promise is "the recipient is told", not "the row exists"
+    let mut session = ctx.instance.subscribe(&make_passport(recipient)).await;
+
     // given: the database is down when the command is delivered, and stays down
     let paused = PausedPostgres::pause();
     ctx.stack
         .publish_deliver(&deliver(&[recipient], "outlives_the_budget", json!({})))
         .await;
 
-    // when: the frame is NAKed more times than the retired five-delivery budget
-    // allowed — the old intake terminated the frame here and lost the request
+    // when: JetStream's own redelivery counter passes the retired five-delivery
+    // budget — the old intake terminated the frame here and lost the request.
+    // The counter comes from the broker, not from our loop, so it cannot be
+    // satisfied by the service merely logging more often.
     let redelivered_past_the_budget = br_test_harness::wait_until(OUTAGE_TIMEOUT, || async {
-        ctx.instance.log_hits(STORAGE_HELD_LOG_MARKER) > RETIRED_REDELIVERY_BUDGET
+        ctx.instance.max_delivered_count() > RETIRED_REDELIVERY_BUDGET as i64
     })
     .await;
     assert!(
         redelivered_past_the_budget,
-        "the intake must keep NAKing past the retired budget, logs:\n{}",
+        "JetStream must redeliver past the retired budget (highest delivered_count seen: {}), logs:\n{}",
+        ctx.instance.max_delivered_count(),
         ctx.instance.logs()
+    );
+    assert!(
+        ctx.instance.log_hits(STORAGE_HELD_LOG_MARKER) >= STORAGE_OUTAGE_ALERT_AFTER,
+        "every redelivery must be held, not dropped"
     );
 
     // then: the outage is visible to operators — readiness is DOWN, the pod
@@ -126,6 +137,23 @@ async fn s07c_an_outage_past_the_retired_budget_still_delivers_exactly_once() {
         ctx.stack.rows_for(recipient).await.len(),
         1,
         "exactly one row — the redeliveries stay idempotent"
+    );
+
+    // then: the live path survived the outage too — the subscriber opened before
+    // the pause is told, not just the table written. A pg_notify lost while the
+    // listener was reconnecting would leave the row unannounced forever.
+    let raw = session
+        .expect_event("NotificationAdded after the outage", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
+    assert_eq!(event["__typename"], "NotificationAdded");
+    assert_eq!(event["notification"]["template"], "outlives_the_budget");
+
+    // then: a transient outage leaves no dead letter — nothing was abandoned
+    assert_eq!(
+        ctx.stack.dead_letters().await.len(),
+        0,
+        "a storage outage is held, never dead-lettered"
     );
 
     // then: readiness recovers on its own once the write lands

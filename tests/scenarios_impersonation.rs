@@ -143,3 +143,119 @@ async fn s19_impersonated_mutations_act_on_the_acting_admins_own_notifications()
         "nothing of theirs was marked read"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s19b_impersonated_bulk_mutations_never_reach_the_impersonated_users_inbox() {
+    let ctx = TestContext::setup().await;
+    let (admin, impersonated) = (Uuid::now_v7(), Uuid::now_v7());
+    let acting = make_impersonating_passport(admin, impersonated);
+
+    // given: both inboxes are stocked. The bulk mutations are the only ones with
+    // no id to target, so their whole blast radius is the resolved identity.
+    let mine = [
+        seed_one(&ctx, admin, "admin_bulk_one").await,
+        seed_one(&ctx, admin, "admin_bulk_two").await,
+    ];
+    let theirs = [
+        seed_one(&ctx, impersonated, "impersonated_bulk_one").await,
+        seed_one(&ctx, impersonated, "impersonated_bulk_two").await,
+    ];
+
+    let mut acting_session = ctx.instance.subscribe(&acting).await;
+    let mut impersonated_session = ctx.instance.subscribe(&make_passport(impersonated)).await;
+
+    // when: the administrator marks everything read while impersonating
+    let ack = ctx
+        .instance
+        .graphql(&acting, "mutation { notifierMarkAllAsRead }", json!({}))
+        .await;
+    verdict::expect_ack(&ack, "notifierMarkAllAsRead while impersonating");
+
+    // then: PG — only the administrator's inbox moved
+    assert!(
+        ctx.stack
+            .rows_for(admin)
+            .await
+            .iter()
+            .all(|row| row.read_at.is_some()),
+        "the acting human's own notifications are the ones marked read"
+    );
+    assert!(
+        ctx.stack
+            .rows_for(impersonated)
+            .await
+            .iter()
+            .all(|row| row.read_at.is_none()),
+        "mark-all-as-read must not touch the impersonated user's inbox"
+    );
+
+    // then: the bulk announcement carries the administrator's ids, and the
+    // impersonated user's own session observes nothing
+    let raw = acting_session
+        .expect_event("bulk NotificationsRead", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
+    assert_eq!(event["__typename"], "NotificationsRead");
+    let mut read_ids: Vec<String> = event["ids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ids must be a list: {event}"))
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect();
+    read_ids.sort();
+    let mut expected: Vec<String> = mine.iter().map(Uuid::to_string).collect();
+    expected.sort();
+    assert_eq!(
+        read_ids, expected,
+        "only the acting human's ids are announced"
+    );
+
+    // when: the administrator bulk-deletes, sneaking in the impersonated user's ids
+    let all_ids: Vec<String> = mine
+        .iter()
+        .chain(theirs.iter())
+        .map(Uuid::to_string)
+        .collect();
+    let ack = ctx
+        .instance
+        .graphql(
+            &acting,
+            "mutation($ids: [ID!]!) { notifierDeleteNotifications(ids: $ids) }",
+            json!({"ids": all_ids}),
+        )
+        .await;
+    verdict::expect_ack(&ack, "notifierDeleteNotifications while impersonating");
+
+    // then: PG — the administrator's inbox is emptied, the impersonated user's is intact
+    assert_eq!(ctx.stack.rows_for(admin).await.len(), 0);
+    assert_eq!(
+        ctx.stack.rows_for(impersonated).await.len(),
+        2,
+        "an impersonated id passed to a bulk delete must be invisible, not deleted"
+    );
+
+    let raw = acting_session
+        .expect_event("bulk NotificationsDeleted", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
+    assert_eq!(event["__typename"], "NotificationsDeleted");
+    let mut deleted_ids: Vec<String> = event["ids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ids must be a list: {event}"))
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect();
+    deleted_ids.sort();
+    assert_eq!(
+        deleted_ids, expected,
+        "the impersonated user's ids are absent from the announcement"
+    );
+
+    impersonated_session
+        .expect_silence(
+            "the impersonated user's own session observes neither bulk",
+            CONSUME_WAIT,
+        )
+        .await;
+}
