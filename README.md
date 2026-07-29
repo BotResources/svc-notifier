@@ -120,10 +120,16 @@ contract crate; on the bus it travels as the `payload` of the standard
   list (a poison write abandons every recipient at once, so every one of them is
   named), the raw command bytes, the SQLSTATE, the producer's `correlation_id` /
   `causation_id` and a timestamp — **before** the frame is terminated. The ledger
-  is deduplicated on `source_event_id` (unique index + `ON CONFLICT DO NOTHING`):
-  it holds one audit line per abandoned command, not one per frame, so a `term()`
-  the broker never registered — or a producer re-emit — cannot inflate the audit.
-  The first trace wins and is never overwritten. If the ledger write itself fails, the command is NAKed
+  is deduplicated on the envelope's **`command_id`** (unique index + `ON CONFLICT
+  DO NOTHING`): one audit line per abandoned **command**, not per frame, so a
+  `term()` the broker never registered cannot inflate the audit, and the first
+  trace wins. Deduplicating on `source_event_id` would be **wrong and lossy**: the
+  business dedup key is `(source_event_id, recipient_id)`, so one source event may
+  legitimately arrive as several deliver commands (recipients sent in chunks, a
+  recipient added late — the shape `s14` exercises). Keyed on the source event,
+  the first poison chunk would be recorded and every later one terminated with no
+  trace at all. `source_event_id` keeps a plain (non-unique) index for ops
+  lookups. If the ledger write itself fails, the command is NAKed
   instead of terminated: the intake never drops a request it cannot account for,
   even at the cost of an infinite hold (which the `/readyz` DOWN signal makes
   loud). The command is stored as `BYTEA`, not `JSONB`/`TEXT`, precisely because
@@ -248,6 +254,23 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   ids, and the `read_at` timestamp on a read fact (small, far under the NOTIFY
   payload limit). The read fact carries `read_at` directly so the listener never
   re-reads to learn it.
+- **Bulk facts are chunked to stay under the NOTIFY payload limit.** PostgreSQL
+  caps a `pg_notify` payload at 8000 bytes and raises an error above it — inside
+  the write transaction, that error would **abort the whole mutation**. A bulk
+  `Read` / `Deleted` fact covering more ids than `SIGNAL_ID_CHUNK` (150) is
+  therefore emitted as several signals **within the same transaction**: still
+  atomic with the write, still one announcement per chunk rather than one per row.
+  A client folding by id is unaffected; a client asserting "exactly one event per
+  bulk mutation" is only correct below the chunk size. The bound is pinned by a
+  unit test on the serialized payload, not by arithmetic in a comment.
+- **Known gap — a signal emitted while the listener is reconnecting is lost.**
+  `LISTEN/NOTIFY` has no replay: if the listener's connection drops and a commit
+  lands in the ~1s reconnect window, the row exists and no one is told until the
+  client next fetches a snapshot. `s07c` proves the announcement survives a
+  storage outage that freezes the connection (the common case), but it cannot
+  prove the hard-restart case, where the listener's socket is actually killed.
+  Closing it needs a catch-up watermark on reconnect — a design decision, not a
+  patch; it is not in this service today.
 - Each service instance runs a PG listener under the `svc_notifier_app` role
   (the always-present application connection — an instance without NATS still
   feeds its subscribers from PostgreSQL). For an `Added` fact it re-reads the new
@@ -288,6 +311,13 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   application-layer scoping and the RLS context (`app.current_user_id`) are fed
   from it, so the two layers can never disagree. Proven by
   `scenarios_impersonation` (s17–s19) and by unit tests on `resolve_recipient`.
+- **Defence in depth: the application also filters by recipient.** Every write and
+  re-read that knows the caller's identity carries an explicit
+  `recipient_id = $caller` predicate in its `WHERE`, on top of the RLS policy —
+  `mark_as_read`, `mark_all_as_read`, `delete_notifications` and the listener's
+  row re-read. RLS is the backstop, not the only barrier: a future migration that
+  loosens a policy, or a query issued outside a scoped transaction, must not
+  silently become a cross-recipient write.
 - **Row-level security as the authorization backstop**: resolvers open a transaction,
   inject the caller's transaction-local RLS context, and the policies restrict every
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
@@ -497,6 +527,16 @@ fixed stream is absent the bind errors, the process exits non-zero, and the
 service never becomes ready — `/readyz` stays 503. A dead intake can never sit
 behind a healthy readiness probe (Security Invariant #6: fail loud → readiness
 DOWN).
+
+The intake task is **supervised** for the same reason. It runs on its own tokio
+task, and a task that panics or is cancelled dies silently: the process would
+keep serving `/readyz` 200 while delivery commands piled up unconsumed on the
+stream — the exact "healthy probe over a dead intake" shape the boot gate exists
+to prevent. `supervise_intake` awaits the task handle and, on a panic or a
+cancellation, takes readiness DOWN and triggers the shutdown that makes the
+process exit non-zero. This is also what makes the ledger's one `expect` (the
+command re-serialization in `record_dead_letter`) safe to keep: it cannot become
+a silent stall.
 
 - **Envelope.** The command travels as the standard `IntegrationCommand`
   envelope; its `payload` is the `DeliverNotification` whose wire format is frozen

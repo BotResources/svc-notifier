@@ -53,15 +53,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would make a `TEXT`/`JSONB` ledger write impossible too. The table is
   `FORCE`-RLS with a single ingest-write policy and carries **no** grant to
   `svc_notifier_app` — abandoned commands are operator data, read with the owner
-  role (a `SELECT` under a non-`BYPASSRLS` role returns zero rows *silently*; see
-  the runbook note in the README). The producer's `correlation_id` /
-  `causation_id` are kept as UUID columns so an abandonment stays joinable to the
-  trace that caused it, and the ledger is deduplicated on `source_event_id`
-  (unique index + `ON CONFLICT DO NOTHING`) so a `term()` the broker never
-  registered cannot inflate the audit. Undecodable frames still get no ledger row:
-  the Fabric's `Delivered` exposes no raw bytes. **Retention is deliberately not
-  decided** — no purge ships with this change; it is an operator call recorded as
-  an open question in the README.
+  role (see the runbook note in the README for what each role actually sees). The
+  producer's `correlation_id` / `causation_id` are kept as UUID columns so an
+  abandonment stays joinable to the trace that caused it, and the ledger is
+  deduplicated on the envelope's **`command_id`** (unique index + `ON CONFLICT DO
+  NOTHING`) so a `term()` the broker never registered cannot inflate the audit.
+  The key is `command_id`, not `source_event_id`, on purpose: the business dedup
+  key is `(source_event_id, recipient_id)`, so one source event may legitimately
+  arrive as several deliver commands (chunked recipients, a late addition). Keyed
+  on the source event, the first poison chunk would be recorded and every later
+  one terminated with **no trace at all** — the same loss class this release
+  exists to close, moved onto the poison path. Undecodable frames still get no
+  ledger row: the Fabric's `Delivered` exposes no raw bytes, so there is nothing
+  faithful to record; the error log carries the subject and delivery count as a
+  degraded trace. **Retention is deliberately not decided** — no purge ships with
+  this change; it is an operator call recorded as an open question in the README.
+- **Bulk mutations no longer break above ~200 notifications.** `pg_notify` caps
+  its payload at 8000 bytes and errors above it — inside the write transaction,
+  that error aborted the **whole mutation**, so `notifierMarkAllAsRead` /
+  `notifierDeleteNotifications` failed outright on a large inbox. Bulk `Read` /
+  `Deleted` facts are now emitted in chunks of 150 ids **within the same
+  transaction**: still atomic with the write, one announcement per chunk instead
+  of one per row. A client folding by id is unaffected.
+- **The application filters by recipient, not only RLS.** `mark_as_read`,
+  `mark_all_as_read`, `delete_notifications` and the listener's row re-read
+  received the caller's `recipient_id` but used it only to address the broadcast,
+  leaving row-level security as the single barrier. They now carry an explicit
+  `recipient_id = $caller` predicate as well (principle 15: enforce at both
+  layers), so a loosened policy or a query issued outside a scoped transaction
+  cannot silently become a cross-recipient write.
+- **The intake task is supervised.** It ran on a detached tokio task: a panic or
+  cancellation killed the consumer while the process kept answering `/readyz` 200
+  and delivery commands piled up unconsumed — precisely the "healthy probe over a
+  dead intake" the boot-time stream gate exists to prevent. `supervise_intake`
+  now awaits the task and fails loud (readiness DOWN + non-zero exit) if it ever
+  dies.
 - **Impersonation no longer exposes the impersonated user's notifications.** An
   administrator impersonating a user saw *that user's* notifications in the list,
   the unread count and the live stream, because the recipient was read from the
@@ -77,20 +103,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Migration `0002_dead_letters.sql` — the abandonment ledger for terminated
-  delivery commands (RLS forced, ingest-write policy only).
+  delivery commands (RLS forced, ingest-write policy only, unique on
+  `command_id`).
 - e2e `scenarios_outage::s07c` — an outage held past the retired five-delivery
-  budget: the frame keeps being NAKed, `/readyz` goes DOWN, and when Postgres
-  returns the notification is delivered exactly once and readiness recovers.
-- e2e `scenarios_intake::s20` — a command a compliant producer can emit but
-  PostgreSQL can never store (a NUL character in `template`, SQLSTATE `22021`) is
-  recorded in `dead_letters` with all its recipients and the producer's
-  correlation id, persists no notification, is terminated rather than redelivered
-  forever, and a re-emit of the same `source_event_id` adds no second audit line.
-- e2e `scenarios_impersonation` (s17–s19) — list, unread count, subscription
-  stream, mark-as-read and delete under an impersonated passport.
+  budget, gated on **JetStream's own** `delivered_count` rather than on counting
+  service log lines: the frame keeps being NAKed, `/readyz` goes DOWN, and when
+  Postgres returns the notification is delivered exactly once, a subscriber that
+  opened *before* the outage receives the `NotificationAdded`, no dead letter is
+  written, and readiness recovers.
+- e2e `scenarios_intake::s20` — two distinct poison commands sharing one
+  `source_event_id` (the chunked-recipients shape) leave **two** audit lines, each
+  naming its own recipients; the command round-trips verbatim; replaying the same
+  envelope adds no line.
+- e2e `scenarios_intake::s21` — with the ledger unwritable (the ingest role's
+  INSERT grant revoked), a poison command is NAKed and held, never terminated,
+  and is traced and terminated only once the ledger comes back.
+- e2e `scenarios_impersonation` (s17–s19b) — list, unread count, subscription
+  stream, mark-as-read, delete, and **both bulk mutations** (`markAllAsRead`,
+  `deleteNotifications` — the only ones with no id to target) under an
+  impersonated passport.
 - Unit tests on the new intake failure classification (transient never
   terminates; only SQLSTATE `22`/`23` is poison; an unreachable database is
-  transient) and on `graphql::resolve_recipient`.
+  transient), on the storage gauge's escalation/hysteresis, on
+  `graphql::resolve_recipient`, and on the `pg_notify` chunk payload bound.
 
 ## 1.0.2
 
