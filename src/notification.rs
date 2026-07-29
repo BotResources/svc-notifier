@@ -59,6 +59,8 @@ pub enum NotificationSignal {
 
 pub const NOTIFY_CHANNEL: &str = "notification_events";
 
+pub const SIGNAL_ID_CHUNK: usize = 150;
+
 async fn signal<'e, E>(executor: E, signal: &NotificationSignal) -> Result<(), sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
@@ -69,6 +71,44 @@ where
         .bind(payload)
         .execute(executor)
         .await?;
+    Ok(())
+}
+
+async fn signal_read(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
+    ids: &[Uuid],
+    read_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    for chunk in ids.chunks(SIGNAL_ID_CHUNK) {
+        signal(
+            &mut **tx,
+            &NotificationSignal::Read {
+                recipient_id,
+                ids: chunk.to_vec(),
+                read_at,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn signal_deleted(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
+    ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    for chunk in ids.chunks(SIGNAL_ID_CHUNK) {
+        signal(
+            &mut **tx,
+            &NotificationSignal::Deleted {
+                recipient_id,
+                ids: chunk.to_vec(),
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -164,10 +204,11 @@ pub async fn mark_as_read(
     let row = sqlx::query(
         "UPDATE notifications
          SET read_at = COALESCE(read_at, now())
-         WHERE id = $1
+         WHERE id = $1 AND recipient_id = $2
          RETURNING read_at",
     )
     .bind(id)
+    .bind(recipient_id)
     .fetch_optional(&mut **tx)
     .await?;
     let read_at: Option<DateTime<Utc>> = match row {
@@ -175,15 +216,7 @@ pub async fn mark_as_read(
         None => return Ok(None),
     };
     if let Some(read_at) = read_at {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Read {
-                recipient_id,
-                ids: vec![id],
-                read_at,
-            },
-        )
-        .await?;
+        signal_read(tx, recipient_id, &[id], read_at).await?;
         return Ok(Some(read_at));
     }
     Ok(None)
@@ -197,23 +230,16 @@ pub async fn mark_all_as_read(
     let rows = sqlx::query(
         "UPDATE notifications
          SET read_at = $1
-         WHERE read_at IS NULL
+         WHERE read_at IS NULL AND recipient_id = $2
          RETURNING id",
     )
     .bind(read_at)
+    .bind(recipient_id)
     .fetch_all(&mut **tx)
     .await?;
     let ids: Vec<Uuid> = rows.iter().map(|row| row.get("id")).collect();
     if !ids.is_empty() {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Read {
-                recipient_id,
-                ids: ids.clone(),
-                read_at,
-            },
-        )
-        .await?;
+        signal_read(tx, recipient_id, &ids, read_at).await?;
     }
     Ok((ids, read_at))
 }
@@ -226,20 +252,16 @@ pub async fn delete_notifications(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query("DELETE FROM notifications WHERE id = ANY($1) RETURNING id")
-        .bind(ids)
-        .fetch_all(&mut **tx)
-        .await?;
+    let rows = sqlx::query(
+        "DELETE FROM notifications WHERE id = ANY($1) AND recipient_id = $2 RETURNING id",
+    )
+    .bind(ids)
+    .bind(recipient_id)
+    .fetch_all(&mut **tx)
+    .await?;
     let deleted: Vec<Uuid> = rows.iter().map(|row| row.get("id")).collect();
     if !deleted.is_empty() {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Deleted {
-                recipient_id,
-                ids: deleted.clone(),
-            },
-        )
-        .await?;
+        signal_deleted(tx, recipient_id, &deleted).await?;
     }
     Ok(deleted)
 }
@@ -256,9 +278,10 @@ pub async fn read_notification_for(
         .await?;
     let row = sqlx::query(
         "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
-         FROM notifications WHERE id = $1",
+         FROM notifications WHERE id = $1 AND recipient_id = $2",
     )
     .bind(id)
+    .bind(recipient_id)
     .fetch_optional(&mut *tx)
     .await?;
     let notification = match row {
@@ -304,5 +327,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["type"], "deleted");
+    }
+
+    const PG_NOTIFY_PAYLOAD_LIMIT: usize = 8000;
+
+    #[test]
+    fn a_full_signal_chunk_stays_under_the_pg_notify_payload_limit() {
+        let recipient_id = Uuid::now_v7();
+        let ids: Vec<Uuid> = (0..SIGNAL_ID_CHUNK).map(|_| Uuid::now_v7()).collect();
+
+        let read = serde_json::to_string(&NotificationSignal::Read {
+            recipient_id,
+            ids: ids.clone(),
+            read_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            read.len() < PG_NOTIFY_PAYLOAD_LIMIT,
+            "a bulk read signal of {SIGNAL_ID_CHUNK} ids serialises to {} bytes — over the limit \
+             the whole transaction is aborted by PostgreSQL",
+            read.len()
+        );
+
+        let deleted =
+            serde_json::to_string(&NotificationSignal::Deleted { recipient_id, ids }).unwrap();
+        assert!(
+            deleted.len() < PG_NOTIFY_PAYLOAD_LIMIT,
+            "a bulk delete signal of {SIGNAL_ID_CHUNK} ids serialises to {} bytes",
+            deleted.len()
+        );
     }
 }

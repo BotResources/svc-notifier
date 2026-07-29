@@ -61,12 +61,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ingest_pool = ingest_pool(&ingest_url).await?;
         let fabric = connect_fabric(&nats_url).await?;
         let consumer = intake::bind(&fabric).await?;
-        tokio::spawn(intake::consume(
+        let intake = tokio::spawn(intake::consume(
             consumer,
             ingest_pool,
             readiness.clone(),
             shutdown_tx.clone(),
             shutdown_rx.clone(),
+        ));
+        tokio::spawn(supervise_intake(
+            intake,
+            readiness.clone(),
+            shutdown_tx.clone(),
         ));
     }
 
@@ -107,6 +112,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("intake terminated abnormally — exiting non-zero so K8s reschedules".into());
     }
     Ok(())
+}
+
+async fn supervise_intake(
+    intake: tokio::task::JoinHandle<()>,
+    readiness: ReadinessHandle,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let Err(error) = intake.await else {
+        return;
+    };
+    let reason = if error.is_panic() {
+        "intake task panicked"
+    } else {
+        "intake task was cancelled"
+    };
+    tracing::error!(%error, reason, "intake task died — failing loud so K8s reschedules");
+    readiness.set_not_ready(reason);
+    let _ = shutdown_tx.send(true);
 }
 
 async fn shutdown_signal(mut intake_down: tokio::sync::watch::Receiver<bool>) {
