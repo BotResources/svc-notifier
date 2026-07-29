@@ -42,6 +42,17 @@ pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DURABLE_NAME: &str = "svc-notifier";
 pub const LEGACY_SUBJECT: &str = "notify.deliver";
 
+// Mirrors, verbatim, the intake's transient-failure log message in
+// `src/intake.rs` (`triage`, the FailureClass::Transient arm). The outage
+// scenarios count its occurrences to observe redeliveries from outside the
+// process, so the two strings are coupled and must move together — renaming the
+// log line without renaming this constant turns s07c green for the wrong reason.
+pub const STORAGE_HELD_LOG_MARKER: &str = "storage write failing, commands held for redelivery";
+
+// Mirrors `STORAGE_OUTAGE_ALERT_AFTER` in `src/intake.rs`: the number of
+// consecutive transient failures after which the intake reports /readyz DOWN.
+pub const STORAGE_OUTAGE_ALERT_AFTER: usize = 3;
+
 pub struct TestStack {
     pub owner_pool: PgPool,
     nats: FabricTestNats,
@@ -90,6 +101,10 @@ impl TestStack {
             .expect("failed to connect owner (assertion) pool");
 
         sqlx::query("DELETE FROM notifications")
+            .execute(&owner_pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM dead_letters")
             .execute(&owner_pool)
             .await
             .ok();
@@ -150,6 +165,20 @@ impl TestStack {
             .expect("publish the deliver command over the fabric");
     }
 
+    pub async fn publish_deliver_correlated(
+        &self,
+        command: &DeliverNotification,
+        correlation_id: Uuid,
+    ) {
+        NotifierPublisher::new(self.nats.fabric())
+            .deliver(
+                command,
+                EventMetadata::new(Actor::Human(UserId::from(Uuid::now_v7())), correlation_id),
+            )
+            .await
+            .expect("publish the deliver command over the fabric");
+    }
+
     pub async fn publish_dead_subject(&self, subject: &str, bytes: &[u8]) {
         self.nats.publish_dead_subject(subject, bytes).await;
     }
@@ -170,6 +199,17 @@ impl TestStack {
             .into_iter()
             .filter(|row| row.recipient_id == recipient_id)
             .collect()
+    }
+
+    pub async fn dead_letters(&self) -> Vec<DeadLetterRecord> {
+        sqlx::query_as::<_, DeadLetterRecord>(
+            "SELECT id, source_event_id, recipient_ids, command, sqlstate,
+                    correlation_id, causation_id, recorded_at
+             FROM dead_letters ORDER BY recorded_at, id",
+        )
+        .fetch_all(&self.owner_pool)
+        .await
+        .expect("failed to read dead letters (assertion connection)")
     }
 
     pub async fn count_rows(&self) -> usize {
@@ -199,6 +239,28 @@ impl TestContext {
         let instance = stack.spawn_instance(true).await;
         Self { stack, instance }
     }
+}
+
+pub async fn seed_one(ctx: &TestContext, recipient: Uuid, template: &str) -> Uuid {
+    let before = ctx.stack.rows_for(recipient).await.len();
+    ctx.stack
+        .publish_deliver(&deliver(&[recipient], template, json!({})))
+        .await;
+    assert!(
+        ctx.stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                ctx.stack.rows_for(recipient).await.len() == before + 1
+            })
+            .await,
+        "seeding through the intake failed for template {template}"
+    );
+    ctx.stack
+        .rows_for(recipient)
+        .await
+        .into_iter()
+        .find(|row| row.template == template)
+        .expect("seeded row must exist")
+        .id
 }
 
 pub async fn spawn_against_bare_broker(nats_url: &str) -> BareBootResult {
@@ -266,6 +328,14 @@ impl ServiceInstance {
         self.graphql.get_raw(path).await
     }
 
+    pub fn logs(&self) -> String {
+        self.process.logs()
+    }
+
+    pub fn log_hits(&self, marker: &str) -> usize {
+        self.logs().matches(marker).count()
+    }
+
     pub fn unread_count(value: &Value) -> i64 {
         value["data"]["notifierUnreadCount"]
             .as_i64()
@@ -307,8 +377,33 @@ pub struct NotificationRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+pub struct DeadLetterRecord {
+    pub id: Uuid,
+    pub source_event_id: Uuid,
+    pub recipient_ids: Vec<Uuid>,
+    pub command: Vec<u8>,
+    pub sqlstate: Option<String>,
+    pub correlation_id: Uuid,
+    pub causation_id: Option<Uuid>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl DeadLetterRecord {
+    pub fn command(&self) -> Value {
+        serde_json::from_slice(&self.command).expect("the recorded command is the producer's JSON")
+    }
+}
+
 pub fn make_passport(user_id: Uuid) -> Passport {
     PassportBuilder::new().user_id(user_id).build()
+}
+
+pub fn make_impersonating_passport(admin_id: Uuid, impersonated_id: Uuid) -> Passport {
+    PassportBuilder::new()
+        .user_id(impersonated_id)
+        .impersonator(admin_id)
+        .build()
 }
 
 pub fn make_service_passport(service_account_id: Uuid) -> Passport {

@@ -115,13 +115,51 @@ contract crate; on the bus it travels as the `payload` of the standard
   deserialize (the contract's `RelativeLink` rejects an unsafe link), so it takes the
   undecodable-message path: terminated with an error log, zero rows persisted (no
   partial fan-out), nothing reaches any recipient.
-- **Database failure mid-batch**: the message is NAKed and redelivered (up to the
-  consumer's `max_deliver`, currently 5). Redelivery completes the remaining
-  recipients; already-inserted recipients are not duplicated (the dedup constraint
-  makes the fan-out idempotent). The final delivery the budget allows is the
-  give-up slot: it is terminated without a further write attempt, so an exhausted
-  command is cleanly dropped — no late write lands after recovery, and the
-  documented recovery is the producer re-emitting the same `source_event_id`.
+- **Dead-letter ledger**: a command that decodes but can never be written is
+  recorded in `dead_letters` — `source_event_id`, the **full** `recipient_ids`
+  list (a poison write abandons every recipient at once, so every one of them is
+  named), the raw command bytes, the SQLSTATE, the producer's `correlation_id` /
+  `causation_id` and a timestamp — **before** the frame is terminated. The ledger
+  is deduplicated on `source_event_id` (unique index + `ON CONFLICT DO NOTHING`):
+  it holds one audit line per abandoned command, not one per frame, so a `term()`
+  the broker never registered — or a producer re-emit — cannot inflate the audit.
+  The first trace wins and is never overwritten. If the ledger write itself fails, the command is NAKed
+  instead of terminated: the intake never drops a request it cannot account for,
+  even at the cost of an infinite hold (which the `/readyz` DOWN signal makes
+  loud). The command is stored as `BYTEA`, not `JSONB`/`TEXT`, precisely because
+  the byte sequence that made the notification write impossible would make a
+  text-typed ledger write impossible too. An **undecodable** frame gets no ledger
+  row: the Fabric's `Delivered` surface exposes no raw bytes, so there is nothing
+  faithful to record — the error log is the only trace, and widening that would
+  need a `br-util-nats-fabric` change.
+- **Database failure mid-batch**: the message is NAKed and redelivered — **without
+  any budget**. A transient storage failure (unreachable database, pool timeout,
+  connection loss, any SQLSTATE that a retry could clear) is NAKed for as long as
+  the outage lasts, so an accepted delivery command is never dropped: JetStream
+  holds the frame and redelivers it when storage returns. Redelivery completes the
+  remaining recipients; already-inserted recipients are not duplicated (the dedup
+  constraint makes the fan-out idempotent). Only a **permanently invalid** write —
+  SQLSTATE class `22` (data exception) or `23` (integrity constraint violation),
+  which no retry can clear — is terminated as poison, and never before its
+  abandonment has been recorded in the **dead-letter ledger** (below).
+- **The never-lose guarantee is bounded by the stream's retention**, which is a
+  deployment-side declaration, not a service-side one: `INTEGRATION_CMD` is
+  `retention: limits` with `maxAge` 168h (7 days) and `maxBytes` 512 MiB in
+  production today. A storage outage lasting days — or a stream saturating its
+  byte limit and discarding old frames — would evict a held command despite the
+  service holding it correctly. That is an **operator incident**, not a normal
+  mode: the `/readyz` DOWN signal below raises it hours to days before the
+  retention edge is anywhere near.
+- **Outage visibility.** After three consecutive transient failures the service
+  reports `/readyz` DOWN with an operator-facing reason, so a pod that cannot
+  write leaves the load-balancer rotation instead of quietly piling work up.
+  Readiness is restored by whichever comes first: the next successful write, or a
+  bounded storage probe armed at escalation (`SELECT 1` every 5s, stops on the
+  first answer, at most one in flight). The probe is the one place this service
+  polls rather than subscribes — PostgreSQL offers no push channel for "I am back",
+  and the probe exists so a quiet service does not stay out of rotation waiting for
+  traffic it will not receive. It only ever clears a `NotReady` it recognises as its
+  own (the storage-outage reason), so it can never mask an unrelated fail-loud.
 
 `template` is a routing/rendering key and `payload` is producer data. The service
 validates neither against an allowed list or schema today (see "Open questions");
@@ -241,6 +279,15 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   *before* a transaction is opened (notifications are recipient-scoped, and a service
   is never a recipient). Proven by
   `scenarios_authn::service_passport_queries_and_mutations_are_forbidden`.
+- **The recipient is the acting human, never the impersonated one.** A notification
+  belongs to the human who is really acting: on an impersonated passport the
+  recipient resolves to `impersonator_id()`, not to `user_id`. An administrator
+  impersonating a user keeps seeing and acting on their *own* notifications —
+  list, unread count, live stream, mark-as-read and delete alike. Recipient
+  resolution happens in **one** place (`graphql::resolve_recipient`), and both the
+  application-layer scoping and the RLS context (`app.current_user_id`) are fed
+  from it, so the two layers can never disagree. Proven by
+  `scenarios_impersonation` (s17–s19) and by unit tests on `resolve_recipient`.
 - **Row-level security as the authorization backstop**: resolvers open a transaction,
   inject the caller's transaction-local RLS context, and the policies restrict every
   select/update/delete to `recipient_id = current user`. RLS is `FORCE`d — even the
@@ -258,7 +305,23 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
     re-read to the signal's recipient, so it reads exactly the rows that recipient
     could read — no role bypasses RLS at runtime.
   - `svc_notifier_ingest` — the NATS consumer (a system component, not a user);
-    INSERT plus the SELECT needed for `RETURNING`, no user-scoped read path.
+    INSERT plus the SELECT needed for `RETURNING`, no user-scoped read path. It is
+    also the only runtime role that may write `dead_letters`; that table carries no
+    grant to `svc_notifier_app` at all — an abandoned command is operator data, not
+    user data, and is read with the owner role.
+    **Runbook — read `dead_letters` as the owner role.** The table is `FORCE` RLS
+    with a single `svc_notifier_ingest` policy and no grant at all to
+    `svc_notifier_app`. Verified behaviour, per role: `svc_notifier_app` →
+    `ERROR: permission denied for table dead_letters` (loud, no grant);
+    `svc_notifier_owner` (`BYPASSRLS`) → reads every row — **this is the ops
+    path**; `svc_notifier_ingest` → reads every row too (its policy is
+    `USING (true)`), but it is the service's own runtime role, not an operator
+    seat. The trap to know about is the *third* case, which no role hits today but
+    the next one might: a role granted `SELECT` **without** a matching policy gets
+    **zero rows, silently** under `FORCE` RLS — no error. So never read this table
+    through a freshly-granted role and conclude "nothing was abandoned"; an empty
+    result under anything but the owner means "not allowed to see", not "empty".
+    Decode the payload with `convert_from(command, 'UTF8')`.
   - Migrations run at startup under a separate owner role, then that pool closes;
     the owner role is never used for a runtime read.
 
@@ -352,7 +415,8 @@ harness-only and is never handed to the service.
   connection, never through the app) and on the GraphQL surface (what a
   recipient's session observes: query, unread count, subscription push). They
   cover cross-session event propagation, reconnect, redelivery idempotence,
-  DB-outage NAK/recovery/exhaustion, a two-instance scenario proving pushes
+  DB-outage NAK/recovery (including an outage longer than the retired redelivery
+  budget), impersonation isolation, a two-instance scenario proving pushes
   derive from committed PG state, and **service-level fail-loud** when the fixed
   `INTEGRATION_CMD` stream is absent (`s15`: a real svc-notifier spawned against a
   broker missing the stream exits non-zero and never serves `/readyz`). All
@@ -438,17 +502,24 @@ DOWN).
   envelope; its `payload` is the `DeliverNotification` whose wire format is frozen
   and tested in `br-notifier-contract`. Producers publish through
   `br-notifier-publisher`, which wraps the payload in the envelope.
-- **Poison handling.** An **undecodable** frame (invalid JSON, or a payload the
-  contract rejects fail-closed — e.g. an unsafe `link`) is **terminated** (`term`),
-  never acked: an ack would lie to JetStream that the frame was processed and would
-  hide the poison from advisories. A transient **fan-out** failure is NAKed with a
-  short delay and redelivered up to `MAX_DELIVER` (5); past the budget the frame is
-  terminated (no late write), and the documented recovery is the producer re-emitting
-  the same `source_event_id`. The decode-vs-fan-out outcome logic is unit-tested
-  directly in `intake::tests`.
-- **`ack_wait`.** The intake uses the Fabric default (30s). A finite
-  delivery-budget e2e cannot be exercised within a sane timeout at that
-  `ack_wait`, so the budget logic is proven by unit tests rather than e2e.
+- **Poison handling — by failure class, never by a delivery count.** A frame is
+  terminated only when retrying it is pointless *by nature*: an **undecodable**
+  frame (invalid JSON, or a payload the contract rejects fail-closed — e.g. an
+  unsafe `link`) and a **permanently invalid write** (SQLSTATE class `22` / `23`),
+  the latter only once it has been recorded in the `dead_letters` ledger.
+  Terminating is never acking: an ack would lie to JetStream that the frame was
+  processed and would hide the poison from advisories. Every other fan-out failure
+  is **transient** and is NAKed with a short delay for redelivery, however long the
+  outage lasts (within the stream's retention) — the intake has no delivery budget,
+  because a producer's ack must mean the notification will be delivered.
+  Classification is conservative: when in doubt, transient. The decode / transient /
+  poison outcome logic is unit-tested directly in `intake::tests`, and the ledger is
+  pinned end-to-end by
+  `scenarios_intake::s20_a_permanently_unwritable_command_is_dead_lettered_before_it_is_terminated`.
+- **`ack_wait`.** The intake uses the Fabric default (30s). Redelivery is driven by
+  the 1s NAK delay, not by `ack_wait`, so an outage longer than the retired
+  five-delivery budget is exercised end-to-end in
+  `scenarios_outage::s07c_an_outage_past_the_retired_budget_still_delivers_exactly_once`.
 
 ## Open questions
 
@@ -458,6 +529,14 @@ DOWN).
 - **Allowed-template list** — the service accepts any `template` string. The list of
   valid templates is per-project policy and belongs in configuration; it must never
   be hard-coded in the generic contract crate.
+- **`dead_letters` retention / TTL — undecided, operator's call.** The ledger has
+  **no purge today**: a row lives until someone deletes it. Each row stores the
+  producer's command verbatim, and `payload` is arbitrary producer data that may
+  well be personal, so this is a retention question, not just a disk question.
+  It pairs with the `INTEGRATION_CMD` retention noted under "Intake semantics":
+  that one bounds how long a *held* command survives, this one how long an
+  *abandoned* one is kept. Both are deployment-side decisions the service must not
+  take on its own.
 
 ## License & contributing
 

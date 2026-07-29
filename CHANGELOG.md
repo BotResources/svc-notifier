@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A storage outage can no longer drop a delivery command.** The intake used to
+  terminate a frame once `delivered_count` passed a fixed budget of five, so a
+  Postgres outage lasting past the fifth redelivery silently destroyed the
+  request: no notification, no debt recorded, and the producer's ack already
+  consumed. The budget is retired. The fan-out failure now carries a **failure
+  class** instead of a bare boolean: a **transient** failure (unreachable storage,
+  pool timeout, connection loss, any SQLSTATE a retry could clear) is NAKed for
+  redelivery *forever*, so JetStream holds the frame until storage returns; only a
+  **poison** frame — undecodable, or a permanently invalid write (SQLSTATE class
+  `22` data exception / `23` integrity constraint violation) — is terminated,
+  because retrying it can never succeed. Classification is conservative: anything
+  unrecognised is transient. A sustained outage is now visible to operators —
+  after three consecutive transient failures the service reports `/readyz` DOWN
+  (with an operator-facing reason) and restores readiness on its own, on whichever
+  comes first: the next successful write, or a bounded storage probe (`SELECT 1`
+  every 5s, stops on the first answer, never more than one in flight) armed at
+  escalation so a quiet service does not stay out of rotation waiting for traffic.
+  The probe grants **one** restoration per real write (hysteresis): under a
+  *partial* outage — reads answering while writes fail (statement timeout, disk
+  full, read-only replica, a durably failing ledger write) — a probe-restored
+  readiness that is immediately taken back down by the next failed write does not
+  re-arm the probe, so the endpoints cannot oscillate UP/DOWN on a ~5s period and
+  tear every SSE subscription each cycle. Readiness then stays DOWN until a write
+  actually succeeds.
+  Escalation is idempotent rather than a one-shot at the threshold, so an external
+  `set_ready()` cannot leave the gauge stuck above it; recovery only ever clears a
+  `NotReady` carrying the storage-outage reason, so it can never mask an unrelated
+  fail-loud. The never-lose guarantee is bounded by the `INTEGRATION_CMD`
+  retention declared deployment-side (7 days / 512 MiB in production today) — an
+  outage approaching that is an operator incident the readiness signal raises long
+  in advance.
+- **A terminated command now leaves a durable trace.** Terminating a permanently
+  invalid write destroyed the request — for *every* recipient of the fan-out at
+  once — with nothing but a log line. A new `dead_letters` table records the
+  `source_event_id`, the full `recipient_ids` list, the raw command bytes and the
+  SQLSTATE **before** the frame is terminated; if the ledger write itself fails,
+  the command is NAKed rather than terminated, so the intake never drops a request
+  it cannot account for. The command is stored as `BYTEA` deliberately: the byte
+  sequence that made the notification write impossible (a NUL character, say)
+  would make a `TEXT`/`JSONB` ledger write impossible too. The table is
+  `FORCE`-RLS with a single ingest-write policy and carries **no** grant to
+  `svc_notifier_app` — abandoned commands are operator data, read with the owner
+  role (a `SELECT` under a non-`BYPASSRLS` role returns zero rows *silently*; see
+  the runbook note in the README). The producer's `correlation_id` /
+  `causation_id` are kept as UUID columns so an abandonment stays joinable to the
+  trace that caused it, and the ledger is deduplicated on `source_event_id`
+  (unique index + `ON CONFLICT DO NOTHING`) so a `term()` the broker never
+  registered cannot inflate the audit. Undecodable frames still get no ledger row:
+  the Fabric's `Delivered` exposes no raw bytes. **Retention is deliberately not
+  decided** — no purge ships with this change; it is an operator call recorded as
+  an open question in the README.
+- **Impersonation no longer exposes the impersonated user's notifications.** An
+  administrator impersonating a user saw *that user's* notifications in the list,
+  the unread count and the live stream, because the recipient was read from the
+  passport's `user_id` and the impersonator field was ignored. Recipient
+  resolution is now centralised in one function that prefers `impersonator_id()`
+  when present — the acting human always sees and acts on their own notifications
+  — and both the GraphQL scoping and the RLS session variable
+  (`app.current_user_id`) are fed from that single resolution, so the application
+  layer and the database layer can never diverge. Mark-as-read and delete follow:
+  reaching for an impersonated user's notification is a `NOT_FOUND`, never a
+  silent cross-user write.
+
+### Added
+
+- Migration `0002_dead_letters.sql` — the abandonment ledger for terminated
+  delivery commands (RLS forced, ingest-write policy only).
+- e2e `scenarios_outage::s07c` — an outage held past the retired five-delivery
+  budget: the frame keeps being NAKed, `/readyz` goes DOWN, and when Postgres
+  returns the notification is delivered exactly once and readiness recovers.
+- e2e `scenarios_intake::s20` — a command a compliant producer can emit but
+  PostgreSQL can never store (a NUL character in `template`, SQLSTATE `22021`) is
+  recorded in `dead_letters` with all its recipients and the producer's
+  correlation id, persists no notification, is terminated rather than redelivered
+  forever, and a re-emit of the same `source_event_id` adds no second audit line.
+- e2e `scenarios_impersonation` (s17–s19) — list, unread count, subscription
+  stream, mark-as-read and delete under an impersonated passport.
+- Unit tests on the new intake failure classification (transient never
+  terminates; only SQLSTATE `22`/`23` is poison; an unreachable database is
+  transient) and on `graphql::resolve_recipient`.
+
 ## 1.0.2
 
 ### Changed

@@ -7,28 +7,6 @@ use common::*;
 use serde_json::json;
 use uuid::Uuid;
 
-async fn seed_one(ctx: &TestContext, recipient: Uuid, template: &str) -> Uuid {
-    let before = ctx.stack.rows_for(recipient).await.len();
-    ctx.stack
-        .publish_deliver(&deliver(&[recipient], template, json!({})))
-        .await;
-    assert!(
-        ctx.stack
-            .wait_until(RECOVERY_TIMEOUT, || async {
-                ctx.stack.rows_for(recipient).await.len() == before + 1
-            })
-            .await,
-        "seeding through the intake failed for template {template}"
-    );
-    ctx.stack
-        .rows_for(recipient)
-        .await
-        .into_iter()
-        .find(|row| row.template == template)
-        .expect("seeded row must exist")
-        .id
-}
-
 #[tokio::test]
 #[serial_test::serial]
 async fn s05_sdl_route_serves_the_schema_for_the_gateway_composer() {

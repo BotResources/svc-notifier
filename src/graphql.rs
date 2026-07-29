@@ -28,11 +28,17 @@ fn passport<'a>(ctx: &Context<'a>) -> Result<&'a Passport> {
         .map_err(|_| EdgeError::internal("missing passport in context"))
 }
 
-fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
-    match passport(ctx)? {
-        Passport::Human { user_id, .. } => Ok(Recipient(*user_id)),
-        Passport::Service { .. } => Err(EdgeError::forbidden()),
+fn resolve_recipient(passport: &Passport) -> Option<Recipient> {
+    match passport {
+        Passport::Human { user_id, .. } => {
+            Some(Recipient(passport.impersonator_id().unwrap_or(*user_id)))
+        }
+        Passport::Service { .. } => None,
     }
+}
+
+fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
+    resolve_recipient(passport(ctx)?).ok_or_else(EdgeError::forbidden)
 }
 
 fn require_human(ctx: &Context<'_>) -> Result<()> {
@@ -201,9 +207,8 @@ impl SubscriptionRoot {
         ctx: &Context<'_>,
     ) -> impl Stream<Item = NotifierNotificationEvent> + use<> {
         let receiver = match (ctx.data::<AppState>(), ctx.data::<Passport>()) {
-            (Ok(state), Ok(Passport::Human { user_id, .. })) => {
-                Some(state.subscribers.subscribe(*user_id))
-            }
+            (Ok(state), Ok(passport)) => resolve_recipient(passport)
+                .map(|recipient| state.subscribers.subscribe(recipient.0)),
             _ => None,
         };
         futures::stream::iter(receiver)
@@ -256,4 +261,46 @@ fn parse_id(id: Option<ID>) -> Result<Option<Uuid>> {
 
 fn require_id(id: &ID) -> Result<Uuid> {
     Uuid::parse_str(id.as_str()).map_err(|_| EdgeError::bad_user_input())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use br_core_auth::{AuthMethod, PassportClaims};
+
+    fn human(user_id: Uuid, impersonator: Option<Uuid>) -> Passport {
+        Passport::human(
+            user_id,
+            false,
+            true,
+            AuthMethod::Jwt,
+            impersonator,
+            PassportClaims::new(),
+        )
+    }
+
+    #[test]
+    fn a_direct_human_is_their_own_recipient() {
+        let user_id = Uuid::now_v7();
+        let resolved = resolve_recipient(&human(user_id, None)).expect("a human is a recipient");
+        assert_eq!(resolved.0, user_id);
+    }
+
+    #[test]
+    fn an_impersonating_admin_stays_their_own_recipient() {
+        let admin_id = Uuid::now_v7();
+        let impersonated_id = Uuid::now_v7();
+        let resolved = resolve_recipient(&human(impersonated_id, Some(admin_id)))
+            .expect("an impersonating admin is a recipient");
+        assert_eq!(
+            resolved.0, admin_id,
+            "the acting human owns the notifications, never the impersonated user"
+        );
+    }
+
+    #[test]
+    fn a_service_is_never_a_recipient() {
+        let passport = Passport::service(Uuid::now_v7(), PassportClaims::new());
+        assert!(resolve_recipient(&passport).is_none());
+    }
 }

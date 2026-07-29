@@ -282,3 +282,86 @@ async fn s15_service_fails_loud_when_the_command_stream_is_absent() {
 
     bare.shutdown().await;
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s20_a_permanently_unwritable_command_is_dead_lettered_before_it_is_terminated() {
+    let ctx = TestContext::setup().await;
+    let recipients = [Uuid::now_v7(), Uuid::now_v7()];
+
+    // given: a command a compliant producer can emit and the contract accepts,
+    // but that PostgreSQL can never store — a NUL character is not permitted in
+    // a text column, and no redelivery will ever change that
+    let command = deliver(
+        &recipients,
+        "poison\u{0}template",
+        json!({"why": "nul byte"}),
+    );
+    let correlation_id = Uuid::now_v7();
+    ctx.stack
+        .publish_deliver_correlated(&command, correlation_id)
+        .await;
+
+    // then: the abandonment is materialised in the dead-letter ledger before the
+    // frame is terminated — the request is dropped, but never silently
+    assert!(
+        ctx.stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                ctx.stack.dead_letters().await.len() == 1
+            })
+            .await,
+        "a terminated command must leave a durable trace; logs:\n{}",
+        ctx.instance.logs()
+    );
+    let dead_letters = ctx.stack.dead_letters().await;
+    let recorded = &dead_letters[0];
+    assert_eq!(recorded.source_event_id, command.source_event_id);
+    assert_eq!(
+        recorded.recipient_ids, recipients,
+        "every recipient the fan-out would have served is recorded, not just the first"
+    );
+    assert_eq!(
+        recorded.sqlstate.as_deref().map(|code| &code[..2]),
+        Some("22"),
+        "the SQLSTATE that made the write permanently invalid is kept for the operator: {:?}",
+        recorded.sqlstate
+    );
+    assert_eq!(
+        recorded.command()["source_event_id"],
+        json!(command.source_event_id),
+        "the raw command is recorded verbatim, so an operator can re-emit it"
+    );
+    assert_eq!(
+        recorded.correlation_id, correlation_id,
+        "the abandonment stays joinable to the producer's trace"
+    );
+
+    // then: no notification was persisted, and the frame is gone for good — a
+    // terminated command is not redelivered into a second dead letter
+    assert_eq!(ctx.stack.count_rows().await, 0, "no partial fan-out");
+    tokio::time::sleep(CONSUME_WAIT).await;
+    assert_eq!(
+        ctx.stack.dead_letters().await.len(),
+        1,
+        "the frame is terminated, not endlessly redelivered"
+    );
+
+    // when: the same source event reaches the intake a second time (a producer
+    // re-emit, or a term() the broker never registered)
+    ctx.stack
+        .publish_deliver_correlated(&command, Uuid::now_v7())
+        .await;
+    tokio::time::sleep(CONSUME_WAIT).await;
+
+    // then: the ledger holds one audit line per abandoned command, not per frame
+    let dead_letters = ctx.stack.dead_letters().await;
+    assert_eq!(
+        dead_letters.len(),
+        1,
+        "dedup on source_event_id keeps exactly one audit line"
+    );
+    assert_eq!(
+        dead_letters[0].id, recorded.id,
+        "the first trace is the one kept, never overwritten"
+    );
+}
