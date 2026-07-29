@@ -122,6 +122,17 @@ impl TestStack {
             .execute(&owner_pool)
             .await
             .ok();
+        // s21 takes the ledger's INSERT grant away to prove the intake holds a
+        // command it cannot trace. A panic between its revoke and its restore
+        // would otherwise leave the grant off for good: every later run of s20
+        // would fail and s21 itself would pass for the wrong reason. Restoring
+        // it here — idempotently, before every scenario — makes the fixture
+        // self-healing rather than trusting an unwind. It is a no-op on a fresh
+        // database, where the migration issues the grant itself.
+        sqlx::query("GRANT INSERT ON dead_letters TO svc_notifier_ingest")
+            .execute(&owner_pool)
+            .await
+            .ok();
 
         let nats = FabricTestNats::start().await;
 
