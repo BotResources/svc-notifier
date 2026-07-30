@@ -1,25 +1,28 @@
 use std::time::Duration;
 
-use br_notifier_contract::{DeliverNotification, deliver_coords};
-use br_util_axum_readiness::{Readiness, ReadinessHandle};
+use br_notifier_contract::{DeliverNotification, RelativeLink, deliver_coords};
+use br_util_axum_readiness::ReadinessHandle;
 use br_util_nats_fabric::{
     CommandConsumer, Delivered, Fabric, FabricError, IntegrationCommand, MessageOutcome,
 };
+use metrics::{counter, gauge};
+use serde::Deserialize;
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::notification::insert_notification;
+use crate::notification::insert_notifications;
 
 const DURABLE_NAME: &str = "svc-notifier";
 const NAK_DELAY: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 10;
-const STORAGE_OUTAGE_ALERT_AFTER: u32 = 3;
-const STORAGE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
-const STORAGE_OUTAGE_REASON: &str =
-    "storage unreachable — delivery commands are held on the stream for redelivery";
 const PERMANENTLY_INVALID_SQLSTATE_CLASSES: [&str; 2] = ["22", "23"];
+
+const DEAD_LETTERS_TOTAL: &str = "notifier_intake_dead_letters_total";
+const TRANSIENT_FAILURES_TOTAL: &str = "notifier_intake_transient_failures_total";
+const CONSECUTIVE_TRANSIENT_FAILURES: &str = "notifier_intake_consecutive_transient_failures";
+const UNDECODABLE_FRAMES_TOTAL: &str = "notifier_intake_undecodable_frames_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureClass {
@@ -28,10 +31,29 @@ enum FailureClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FanOutVerdict {
+enum Verdict {
     Written,
     Failed(FailureClass),
     NotAttempted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadLetterReason {
+    PayloadShapeRejected,
+    RelativeLinkRejected,
+    NoRecipients,
+    StorageRejected,
+}
+
+impl DeadLetterReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PayloadShapeRejected => "payload_shape_rejected",
+            Self::RelativeLinkRejected => "relative_link_rejected",
+            Self::NoRecipients => "no_recipients",
+            Self::StorageRejected => "storage_rejected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,23 +63,50 @@ struct Trace {
     causation_id: Option<Uuid>,
 }
 
-pub async fn bind(fabric: &Fabric) -> Result<CommandConsumer<DeliverNotification>, IntakeError> {
+#[derive(Debug)]
+struct Rejection {
+    reason: DeadLetterReason,
+    detail: String,
+}
+
+struct Abandoned<'a> {
+    trace: Trace,
+    reason: DeadLetterReason,
+    detail: String,
+    sqlstate: Option<&'a str>,
+    source_event_id: Option<Uuid>,
+    recipient_ids: &'a [Uuid],
+    command: &'a Value,
+    delivered_count: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDeliver {
+    source_event_id: Uuid,
+    recipient_ids: Vec<Uuid>,
+    template: String,
+    payload: Value,
+    #[serde(default)]
+    link: Option<String>,
+}
+
+pub async fn bind(fabric: &Fabric) -> Result<CommandConsumer<Value>, IntakeError> {
     let consumer = fabric
-        .ensure_command_consumer::<DeliverNotification>(&deliver_coords(), DURABLE_NAME)
+        .ensure_command_consumer::<Value>(&deliver_coords(), DURABLE_NAME)
         .await?;
     tracing::info!(durable = DURABLE_NAME, "intake consumer bound");
     Ok(consumer)
 }
 
 pub async fn consume(
-    mut consumer: CommandConsumer<DeliverNotification>,
+    mut consumer: CommandConsumer<Value>,
     ingest_pool: PgPool,
     readiness: ReadinessHandle,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut consecutive_errors: u32 = 0;
-    let mut storage = StorageGauge::new(readiness.clone(), ingest_pool.clone());
+    let mut transient_streak: u64 = 0;
     loop {
         tokio::select! {
             biased;
@@ -66,7 +115,7 @@ pub async fn consume(
                 Ok(Some(delivered)) => {
                     consecutive_errors = 0;
                     let verdict = handle(&ingest_pool, delivered).await;
-                    storage.record(verdict);
+                    transient_streak = observe(verdict, transient_streak);
                 }
                 Ok(None) => {
                     fail_loud(&readiness, &shutdown_tx, "intake stream closed (durable or stream gone)");
@@ -92,118 +141,25 @@ fn fail_loud(readiness: &ReadinessHandle, shutdown_tx: &watch::Sender<bool>, rea
     let _ = shutdown_tx.send(true);
 }
 
-struct StorageGauge {
-    readiness: ReadinessHandle,
-    pool: PgPool,
-    consecutive_failures: u32,
-    probe: Option<JoinHandle<()>>,
-    probe_spent: bool,
-}
-
-impl StorageGauge {
-    fn new(readiness: ReadinessHandle, pool: PgPool) -> Self {
-        Self {
-            readiness,
-            pool,
-            consecutive_failures: 0,
-            probe: None,
-            probe_spent: false,
-        }
-    }
-
-    fn record(&mut self, verdict: FanOutVerdict) {
-        match verdict {
-            FanOutVerdict::NotAttempted => {}
-            FanOutVerdict::Failed(FailureClass::Transient) => {
-                self.consecutive_failures += 1;
-                if self.consecutive_failures < STORAGE_OUTAGE_ALERT_AFTER {
-                    return;
-                }
-                if self.consecutive_failures == STORAGE_OUTAGE_ALERT_AFTER {
-                    tracing::error!(
-                        failures = self.consecutive_failures,
-                        "storage outage — the intake holds every delivery on the stream until it clears"
-                    );
-                }
-                self.readiness.set_not_ready(STORAGE_OUTAGE_REASON);
-                self.arm_probe();
-            }
-            FanOutVerdict::Written => {
-                self.clear_outage();
-                self.probe_spent = false;
-            }
-            FanOutVerdict::Failed(FailureClass::Poison) => self.clear_outage(),
-        }
-    }
-
-    fn clear_outage(&mut self) {
-        if self.consecutive_failures >= STORAGE_OUTAGE_ALERT_AFTER {
-            tracing::info!("storage reachable again — intake resumed");
-            restore_readiness(&self.readiness);
-        }
-        self.disarm_probe();
-        self.consecutive_failures = 0;
-    }
-
-    fn arm_probe(&mut self) {
-        if self.probe_spent {
-            return;
-        }
-        if self
-            .probe
-            .as_ref()
-            .is_some_and(|probe| !probe.is_finished())
-        {
-            return;
-        }
-        self.probe = Some(tokio::spawn(probe_storage(
-            self.readiness.clone(),
-            self.pool.clone(),
-        )));
-        self.probe_spent = true;
-    }
-
-    fn disarm_probe(&mut self) {
-        if let Some(probe) = self.probe.take() {
-            probe.abort();
-        }
+fn transient_streak_after(verdict: Verdict, streak: u64) -> u64 {
+    match verdict {
+        Verdict::NotAttempted => streak,
+        Verdict::Written | Verdict::Failed(FailureClass::Poison) => 0,
+        Verdict::Failed(FailureClass::Transient) => streak + 1,
     }
 }
 
-impl Drop for StorageGauge {
-    fn drop(&mut self) {
-        self.disarm_probe();
+fn observe(verdict: Verdict, streak: u64) -> u64 {
+    if verdict == Verdict::Failed(FailureClass::Transient) {
+        counter!(TRANSIENT_FAILURES_TOTAL).increment(1);
     }
+    let streak = transient_streak_after(verdict, streak);
+    gauge!(CONSECUTIVE_TRANSIENT_FAILURES).set(streak as f64);
+    streak
 }
 
-async fn probe_storage(readiness: ReadinessHandle, pool: PgPool) {
-    loop {
-        tokio::time::sleep(STORAGE_PROBE_INTERVAL).await;
-        match sqlx::query("SELECT 1").execute(&pool).await {
-            Ok(_) => {
-                tracing::info!(
-                    "storage probe answered — readiness restored without waiting for traffic"
-                );
-                restore_readiness(&readiness);
-                return;
-            }
-            Err(error) => tracing::debug!(%error, "storage probe still failing"),
-        }
-    }
-}
-
-fn restore_readiness(readiness: &ReadinessHandle) {
-    match readiness.snapshot() {
-        Readiness::NotReady { reason } if reason == STORAGE_OUTAGE_REASON => readiness.set_ready(),
-        _ => {}
-    }
-}
-
-async fn handle(
-    pool: &PgPool,
-    delivered: Delivered<IntegrationCommand<DeliverNotification>>,
-) -> FanOutVerdict {
-    let (command, trace) = match delivered.payload() {
+async fn handle(pool: &PgPool, delivered: Delivered<IntegrationCommand<Value>>) -> Verdict {
+    let (payload, trace) = match delivered.payload() {
         Ok(envelope) => (
             envelope.payload.clone(),
             Trace {
@@ -213,33 +169,110 @@ async fn handle(
             },
         ),
         Err(error) => {
+            counter!(UNDECODABLE_FRAMES_TOTAL).increment(1);
             tracing::error!(
                 %error,
                 subject = delivered.subject(),
                 delivered_count = ?delivered.delivered_count(),
-                "terminating undecodable command (poison) — no ledger row is possible, the raw frame is not exposed by the consumer"
+                "undecodable command envelope, held on the stream for redelivery — a frame that cannot be recorded on the ledger is never terminated"
             );
-            apply(delivered, outcome_for_undecodable()).await;
-            return FanOutVerdict::NotAttempted;
+            apply(delivered, outcome_for_undecodable_envelope()).await;
+            return Verdict::NotAttempted;
         }
     };
 
     let delivered_count = delivered.delivered_count();
-    let failure = match fan_out(pool, &command).await {
-        Ok(()) => None,
-        Err(error) => Some(triage(pool, &command, trace, delivered_count, &error).await),
+    let failure = match validate(&payload) {
+        Err(rejection) => {
+            let recipient_ids = traced_recipient_ids(&payload);
+            let abandoned = Abandoned {
+                trace,
+                reason: rejection.reason,
+                detail: rejection.detail,
+                sqlstate: None,
+                source_event_id: traced_source_event_id(&payload),
+                recipient_ids: &recipient_ids,
+                command: &payload,
+                delivered_count,
+            };
+            Some(abandon(pool, &abandoned).await)
+        }
+        Ok(command) => match fan_out(pool, &command).await {
+            Ok(written) => {
+                tracing::info!(
+                    source_event_id = %command.source_event_id,
+                    command_id = %trace.command_id,
+                    correlation_id = %trace.correlation_id,
+                    recipients = command.recipient_ids.len(),
+                    written,
+                    "deliver command fanned out"
+                );
+                None
+            }
+            Err(error) => {
+                Some(triage(pool, &command, &payload, trace, delivered_count, &error).await)
+            }
+        },
     };
 
     apply(delivered, outcome_for(failure)).await;
     match failure {
-        None => FanOutVerdict::Written,
-        Some(class) => FanOutVerdict::Failed(class),
+        None => Verdict::Written,
+        Some(class) => Verdict::Failed(class),
     }
+}
+
+fn validate(payload: &Value) -> Result<DeliverNotification, Rejection> {
+    let raw: RawDeliver = serde_json::from_value(payload.clone()).map_err(|error| Rejection {
+        reason: DeadLetterReason::PayloadShapeRejected,
+        detail: error.to_string(),
+    })?;
+    let link = match raw.link {
+        Some(candidate) => Some(RelativeLink::parse(candidate).map_err(|error| Rejection {
+            reason: DeadLetterReason::RelativeLinkRejected,
+            detail: error.to_string(),
+        })?),
+        None => None,
+    };
+    if raw.recipient_ids.is_empty() {
+        return Err(Rejection {
+            reason: DeadLetterReason::NoRecipients,
+            detail: "the command names no recipient".to_owned(),
+        });
+    }
+    Ok(DeliverNotification {
+        source_event_id: raw.source_event_id,
+        recipient_ids: raw.recipient_ids,
+        template: raw.template,
+        payload: raw.payload,
+        link,
+    })
+}
+
+fn traced_source_event_id(payload: &Value) -> Option<Uuid> {
+    payload
+        .get("source_event_id")?
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn traced_recipient_ids(payload: &Value) -> Vec<Uuid> {
+    payload
+        .get("recipient_ids")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn triage(
     pool: &PgPool,
     command: &DeliverNotification,
+    payload: &Value,
     trace: Trace,
     delivered_count: Option<i64>,
     error: &sqlx::Error,
@@ -259,72 +292,90 @@ async fn triage(
             FailureClass::Transient
         }
         FailureClass::Poison => {
-            match record_dead_letter(pool, command, trace, sqlstate.as_deref()).await {
-                Ok(Some(dead_letter_id)) => {
-                    tracing::error!(
-                        %error,
-                        source_event_id = %command.source_event_id,
-                        command_id = %trace.command_id,
-                        correlation_id = %trace.correlation_id,
-                        recipients = command.recipient_ids.len(),
-                        ?sqlstate,
-                        %dead_letter_id,
-                        "permanently invalid deliver command, recorded as a dead letter and terminated"
-                    );
-                    FailureClass::Poison
-                }
-                Ok(None) => {
-                    tracing::error!(
-                        %error,
-                        source_event_id = %command.source_event_id,
-                        command_id = %trace.command_id,
-                        correlation_id = %trace.correlation_id,
-                        ?sqlstate,
-                        "permanently invalid deliver command already on the ledger, terminating the redelivered frame"
-                    );
-                    FailureClass::Poison
-                }
-                Err(ledger_error) => {
-                    tracing::error!(
-                        %error,
-                        %ledger_error,
-                        source_event_id = %command.source_event_id,
-                        command_id = %trace.command_id,
-                        correlation_id = %trace.correlation_id,
-                        ?sqlstate,
-                        "dead-letter ledger unavailable, holding the command on the stream rather than dropping it untraced"
-                    );
-                    FailureClass::Transient
-                }
-            }
+            let abandoned = Abandoned {
+                trace,
+                reason: DeadLetterReason::StorageRejected,
+                detail: error.to_string(),
+                sqlstate: sqlstate.as_deref(),
+                source_event_id: Some(command.source_event_id),
+                recipient_ids: &command.recipient_ids,
+                command: payload,
+                delivered_count,
+            };
+            abandon(pool, &abandoned).await
+        }
+    }
+}
+
+async fn abandon(pool: &PgPool, abandoned: &Abandoned<'_>) -> FailureClass {
+    match record_dead_letter(pool, abandoned).await {
+        Ok(Some(dead_letter_id)) => {
+            counter!(DEAD_LETTERS_TOTAL, "reason" => abandoned.reason.as_str()).increment(1);
+            tracing::error!(
+                reason = abandoned.reason.as_str(),
+                detail = abandoned.detail,
+                source_event_id = ?abandoned.source_event_id,
+                command_id = %abandoned.trace.command_id,
+                correlation_id = %abandoned.trace.correlation_id,
+                recipients = abandoned.recipient_ids.len(),
+                delivered_count = ?abandoned.delivered_count,
+                sqlstate = ?abandoned.sqlstate,
+                %dead_letter_id,
+                "permanently invalid deliver command, recorded as a dead letter and terminated"
+            );
+            FailureClass::Poison
+        }
+        Ok(None) => {
+            tracing::error!(
+                reason = abandoned.reason.as_str(),
+                detail = abandoned.detail,
+                source_event_id = ?abandoned.source_event_id,
+                command_id = %abandoned.trace.command_id,
+                correlation_id = %abandoned.trace.correlation_id,
+                sqlstate = ?abandoned.sqlstate,
+                "permanently invalid deliver command already on the ledger, terminating the redelivered frame"
+            );
+            FailureClass::Poison
+        }
+        Err(ledger_error) => {
+            tracing::error!(
+                %ledger_error,
+                reason = abandoned.reason.as_str(),
+                detail = abandoned.detail,
+                source_event_id = ?abandoned.source_event_id,
+                command_id = %abandoned.trace.command_id,
+                correlation_id = %abandoned.trace.correlation_id,
+                sqlstate = ?abandoned.sqlstate,
+                "dead-letter ledger unavailable, holding the command on the stream rather than dropping it untraced"
+            );
+            FailureClass::Transient
         }
     }
 }
 
 async fn record_dead_letter(
     pool: &PgPool,
-    command: &DeliverNotification,
-    trace: Trace,
-    sqlstate: Option<&str>,
+    abandoned: &Abandoned<'_>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let id = Uuid::now_v7();
-    let raw = serde_json::to_vec(command).expect("the deliver command serializes");
+    let raw = serde_json::to_vec(abandoned.command).expect("a decoded payload re-serializes");
     let recorded = sqlx::query(
         "INSERT INTO dead_letters
-             (id, command_id, source_event_id, recipient_ids, command, sqlstate,
+             (id, command_id, source_event_id, recipient_ids, command, reason, sqlstate,
               correlation_id, causation_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (command_id) DO NOTHING
          RETURNING id",
     )
     .bind(id)
-    .bind(trace.command_id)
-    .bind(command.source_event_id)
-    .bind(&command.recipient_ids)
+    .bind(abandoned.trace.command_id)
+    .bind(abandoned.source_event_id)
+    .bind(abandoned.recipient_ids)
     .bind(raw)
-    .bind(sqlstate)
-    .bind(trace.correlation_id)
-    .bind(trace.causation_id)
+    .bind(abandoned.reason.as_str())
+    .bind(abandoned.sqlstate)
+    .bind(abandoned.trace.correlation_id)
+    .bind(abandoned.trace.causation_id)
     .fetch_optional(pool)
     .await?
     .map(|row| row.get("id"));
@@ -339,8 +390,8 @@ fn outcome_for(failure: Option<FailureClass>) -> MessageOutcome {
     }
 }
 
-fn outcome_for_undecodable() -> MessageOutcome {
-    outcome_for(Some(FailureClass::Poison))
+fn outcome_for_undecodable_envelope() -> MessageOutcome {
+    MessageOutcome::Nak(Some(NAK_DELAY))
 }
 
 fn classify(error: &sqlx::Error) -> FailureClass {
@@ -374,30 +425,22 @@ fn classify_sqlstate(sqlstate: Option<&str>) -> FailureClass {
     }
 }
 
-async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<(), sqlx::Error> {
-    if command.recipient_ids.is_empty() {
-        return Ok(());
-    }
+async fn fan_out(pool: &PgPool, command: &DeliverNotification) -> Result<usize, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    for recipient_id in &command.recipient_ids {
-        insert_notification(
-            &mut tx,
-            command.source_event_id,
-            *recipient_id,
-            &command.template,
-            &command.payload,
-            command.link.as_ref(),
-        )
-        .await?;
-    }
+    let written = insert_notifications(
+        &mut tx,
+        command.source_event_id,
+        &command.recipient_ids,
+        &command.template,
+        &command.payload,
+        command.link.as_ref(),
+    )
+    .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(written)
 }
 
-async fn apply(
-    delivered: Delivered<IntegrationCommand<DeliverNotification>>,
-    outcome: MessageOutcome,
-) {
+async fn apply(delivered: Delivered<IntegrationCommand<Value>>, outcome: MessageOutcome) {
     let result = match outcome {
         MessageOutcome::Ack => delivered.ack().await,
         MessageOutcome::Nak(delay) => delivered.nak(delay).await,
@@ -421,6 +464,17 @@ pub enum IntakeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn wire(link: Value) -> Value {
+        json!({
+            "source_event_id": "0196a000-0000-7000-8000-000000000001",
+            "recipient_ids": ["0196a000-0000-7000-8000-000000000002"],
+            "template": "meeting_scheduled",
+            "payload": {"meeting_id": "m-1"},
+            "link": link,
+        })
+    }
 
     #[test]
     fn a_successful_fan_out_acks() {
@@ -445,8 +499,108 @@ mod tests {
     }
 
     #[test]
-    fn an_undecodable_frame_is_terminated_not_acked() {
-        assert_eq!(outcome_for_undecodable(), MessageOutcome::Term);
+    fn an_undecodable_envelope_is_held_never_terminated() {
+        assert_eq!(
+            outcome_for_undecodable_envelope(),
+            MessageOutcome::Nak(Some(NAK_DELAY)),
+            "no frame is destroyed without a committed ledger row, and an envelope we cannot read \
+             carries no id to record"
+        );
+    }
+
+    #[test]
+    fn a_valid_command_survives_the_permissive_decode_unchanged() {
+        let command = validate(&wire(json!("/meetings/m-1"))).expect("the frame is valid");
+        assert_eq!(
+            command.source_event_id.to_string(),
+            "0196a000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(command.recipient_ids.len(), 1);
+        assert_eq!(command.template, "meeting_scheduled");
+        assert_eq!(command.payload, json!({"meeting_id": "m-1"}));
+        assert_eq!(
+            command.link.map(|link| link.as_str().to_owned()),
+            Some("/meetings/m-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_out_of_domain_link_is_a_traceable_rejection_not_a_decode_failure() {
+        for unsafe_link in ["https://evil.com", "//evil.com", "javascript:alert(1)", ""] {
+            let rejection = validate(&wire(json!(unsafe_link)))
+                .err()
+                .unwrap_or_else(|| panic!("{unsafe_link:?} must be refused"));
+            assert_eq!(
+                rejection.reason,
+                DeadLetterReason::RelativeLinkRejected,
+                "the refusal must name the link, so the ledger row says why: {unsafe_link:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_the_contract_does_not_describe_is_a_traceable_rejection() {
+        for shape in [
+            json!({"recipient_ids": [], "template": "t", "payload": {}}),
+            json!({"source_event_id": "not-a-uuid", "recipient_ids": [], "template": "t", "payload": {}}),
+            json!({"source_event_id": "0196a000-0000-7000-8000-000000000001", "recipient_ids": ["nope"], "template": "t", "payload": {}}),
+            json!({"source_event_id": "0196a000-0000-7000-8000-000000000001", "recipient_ids": [], "template": 42, "payload": {}}),
+            json!("a bare string"),
+        ] {
+            let rejection = validate(&shape)
+                .err()
+                .unwrap_or_else(|| panic!("{shape} must be refused"));
+            assert_eq!(rejection.reason, DeadLetterReason::PayloadShapeRejected);
+        }
+    }
+
+    #[test]
+    fn a_command_naming_no_recipient_is_recorded_rather_than_silently_acked() {
+        let empty = json!({
+            "source_event_id": "0196a000-0000-7000-8000-000000000001",
+            "recipient_ids": [],
+            "template": "meeting_scheduled",
+            "payload": {},
+        });
+        let rejection = validate(&empty).expect_err("a producer bug, not a no-op");
+        assert_eq!(rejection.reason, DeadLetterReason::NoRecipients);
+    }
+
+    #[test]
+    fn every_ledger_reason_has_a_stable_code() {
+        for (reason, code) in [
+            (
+                DeadLetterReason::PayloadShapeRejected,
+                "payload_shape_rejected",
+            ),
+            (
+                DeadLetterReason::RelativeLinkRejected,
+                "relative_link_rejected",
+            ),
+            (DeadLetterReason::NoRecipients, "no_recipients"),
+            (DeadLetterReason::StorageRejected, "storage_rejected"),
+        ] {
+            assert_eq!(reason.as_str(), code);
+        }
+    }
+
+    #[test]
+    fn a_rejected_frame_still_yields_the_ids_the_ledger_needs() {
+        let refused = wire(json!("https://evil.com"));
+        assert_eq!(
+            traced_source_event_id(&refused).map(|id| id.to_string()),
+            Some("0196a000-0000-7000-8000-000000000001".to_owned())
+        );
+        assert_eq!(traced_recipient_ids(&refused).len(), 1);
+    }
+
+    #[test]
+    fn unreadable_ids_never_block_the_ledger_row() {
+        let mangled = json!({"source_event_id": 7, "recipient_ids": ["nope", 3]});
+        assert_eq!(traced_source_event_id(&mangled), None);
+        assert!(traced_recipient_ids(&mangled).is_empty());
+        assert_eq!(traced_source_event_id(&json!("scalar")), None);
+        assert!(traced_recipient_ids(&json!("scalar")).is_empty());
     }
 
     #[test]
@@ -489,130 +643,27 @@ mod tests {
         }
     }
 
-    fn gauge(readiness: &ReadinessHandle) -> StorageGauge {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unreachable:unreachable@127.0.0.1:1/unreachable")
-            .expect("a lazy pool never dials");
-        StorageGauge::new(readiness.clone(), pool)
-    }
-
-    fn sustain_outage(storage: &mut StorageGauge) {
-        for _ in 0..STORAGE_OUTAGE_ALERT_AFTER {
-            storage.record(FanOutVerdict::Failed(FailureClass::Transient));
+    #[test]
+    fn the_transient_streak_counts_consecutive_failures_and_resets_on_an_answer() {
+        let mut streak = 0;
+        for expected in 1..=5 {
+            streak = transient_streak_after(Verdict::Failed(FailureClass::Transient), streak);
+            assert_eq!(streak, expected);
         }
-    }
-
-    #[tokio::test]
-    async fn a_storage_outage_takes_readiness_down_and_restores_it_on_recovery() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        sustain_outage(&mut storage);
-        assert!(!readiness.is_ready(), "a sustained outage must be visible");
-
-        storage.record(FanOutVerdict::Written);
-        assert_eq!(storage.consecutive_failures, 0);
-        assert!(readiness.is_ready(), "a completed write clears the outage");
-    }
-
-    #[tokio::test]
-    async fn a_brief_hiccup_never_takes_readiness_down() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        for _ in 0..STORAGE_OUTAGE_ALERT_AFTER - 1 {
-            storage.record(FanOutVerdict::Failed(FailureClass::Transient));
-        }
-        assert!(readiness.is_ready());
-    }
-
-    #[tokio::test]
-    async fn an_undecodable_frame_says_nothing_about_storage() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        sustain_outage(&mut storage);
-        storage.record(FanOutVerdict::NotAttempted);
         assert_eq!(
-            storage.consecutive_failures, STORAGE_OUTAGE_ALERT_AFTER,
-            "a frame that never reached storage must not clear the outage"
+            transient_streak_after(Verdict::Written, streak),
+            0,
+            "a completed write ends the streak"
         );
-        assert!(!readiness.is_ready());
-    }
-
-    #[tokio::test]
-    async fn an_outage_that_outlives_an_external_set_ready_escalates_again() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        sustain_outage(&mut storage);
-        readiness.set_ready();
-
-        storage.record(FanOutVerdict::Failed(FailureClass::Transient));
-        assert!(
-            !readiness.is_ready(),
-            "escalation is idempotent, not a one-shot at the threshold"
-        );
-    }
-
-    #[tokio::test]
-    async fn recovery_never_clobbers_a_readiness_held_down_for_another_reason() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        sustain_outage(&mut storage);
-        readiness.set_not_ready("intake terminated abnormally");
-
-        storage.record(FanOutVerdict::Written);
-        assert!(
-            !readiness.is_ready(),
-            "only the storage outage may clear the storage outage"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_sustained_outage_never_stacks_probes() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        sustain_outage(&mut storage);
-        let armed = storage.probe.as_ref().expect("the probe is armed").id();
-
-        storage.record(FanOutVerdict::Failed(FailureClass::Transient));
         assert_eq!(
-            storage
-                .probe
-                .as_ref()
-                .expect("the probe is still armed")
-                .id(),
-            armed,
-            "a second escalation must reuse the live probe"
+            transient_streak_after(Verdict::Failed(FailureClass::Poison), streak),
+            0,
+            "storage answered — it refused the row, which is not an outage"
         );
-
-        storage.record(FanOutVerdict::Written);
-        assert!(storage.probe.is_none(), "a real write disarms the probe");
-    }
-
-    #[tokio::test]
-    async fn a_partial_outage_stays_down_after_the_probe_has_spent_its_one_restoration() {
-        let readiness = ReadinessHandle::ready();
-        let mut storage = gauge(&readiness);
-        sustain_outage(&mut storage);
-        assert!(!readiness.is_ready());
-
-        storage.disarm_probe();
-        restore_readiness(&readiness);
-        assert!(readiness.is_ready(), "the probe answered and stood down");
-
-        storage.record(FanOutVerdict::Failed(FailureClass::Transient));
-        assert!(
-            !readiness.is_ready(),
-            "writes still failing takes readiness back down"
-        );
-        assert!(
-            storage.probe.is_none(),
-            "no second probe: reads answering while writes fail must not oscillate the endpoints"
-        );
-
-        storage.record(FanOutVerdict::Written);
-        assert!(readiness.is_ready());
-        assert!(
-            !storage.probe_spent,
-            "only a real write re-arms the silent-recovery path"
+        assert_eq!(
+            transient_streak_after(Verdict::NotAttempted, streak),
+            streak,
+            "a frame that never reached storage says nothing about it"
         );
     }
 }

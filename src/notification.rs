@@ -61,16 +61,31 @@ pub const NOTIFY_CHANNEL: &str = "notification_events";
 
 pub const SIGNAL_ID_CHUNK: usize = 150;
 
-async fn signal<'e, E>(executor: E, signal: &NotificationSignal) -> Result<(), sqlx::Error>
+pub const SIGNALS_PER_STATEMENT: usize = 150;
+
+async fn signal<'e, E>(executor: E, signals: &[NotificationSignal]) -> Result<(), sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let payload = serde_json::to_string(signal).expect("signal serialization cannot fail");
-    sqlx::query("SELECT pg_notify($1, $2)")
+    let payloads: Vec<String> = signals
+        .iter()
+        .map(|signal| serde_json::to_string(signal).expect("signal serialization cannot fail"))
+        .collect();
+    sqlx::query("SELECT pg_notify($1, payload) FROM unnest($2::text[]) AS payload")
         .bind(NOTIFY_CHANNEL)
-        .bind(payload)
+        .bind(&payloads)
         .execute(executor)
         .await?;
+    Ok(())
+}
+
+async fn signal_all(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    signals: &[NotificationSignal],
+) -> Result<(), sqlx::Error> {
+    for batch in signals.chunks(SIGNALS_PER_STATEMENT) {
+        signal(&mut **tx, batch).await?;
+    }
     Ok(())
 }
 
@@ -80,18 +95,15 @@ async fn signal_read(
     ids: &[Uuid],
     read_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    for chunk in ids.chunks(SIGNAL_ID_CHUNK) {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Read {
-                recipient_id,
-                ids: chunk.to_vec(),
-                read_at,
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    let signals: Vec<NotificationSignal> = ids
+        .chunks(SIGNAL_ID_CHUNK)
+        .map(|chunk| NotificationSignal::Read {
+            recipient_id,
+            ids: chunk.to_vec(),
+            read_at,
+        })
+        .collect();
+    signal_all(tx, &signals).await
 }
 
 async fn signal_deleted(
@@ -99,55 +111,49 @@ async fn signal_deleted(
     recipient_id: Uuid,
     ids: &[Uuid],
 ) -> Result<(), sqlx::Error> {
-    for chunk in ids.chunks(SIGNAL_ID_CHUNK) {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Deleted {
-                recipient_id,
-                ids: chunk.to_vec(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    let signals: Vec<NotificationSignal> = ids
+        .chunks(SIGNAL_ID_CHUNK)
+        .map(|chunk| NotificationSignal::Deleted {
+            recipient_id,
+            ids: chunk.to_vec(),
+        })
+        .collect();
+    signal_all(tx, &signals).await
 }
 
-pub async fn insert_notification(
+pub async fn insert_notifications(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     source_event_id: Uuid,
-    recipient_id: Uuid,
+    recipient_ids: &[Uuid],
     template: &str,
     payload: &serde_json::Value,
     link: Option<&RelativeLink>,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let id = Uuid::now_v7();
-    let inserted: Option<Uuid> = sqlx::query(
+) -> Result<usize, sqlx::Error> {
+    let ids: Vec<Uuid> = recipient_ids.iter().map(|_| Uuid::now_v7()).collect();
+    let rows = sqlx::query(
         "INSERT INTO notifications (id, source_event_id, recipient_id, template, payload, link)
-         VALUES ($1, $2, $3, $4, $5, $6)
+         SELECT unnest($1::uuid[]), $2, unnest($3::uuid[]), $4, $5, $6
          ON CONFLICT (source_event_id, recipient_id) DO NOTHING
-         RETURNING id",
+         RETURNING id, recipient_id",
     )
-    .bind(id)
+    .bind(&ids)
     .bind(source_event_id)
-    .bind(recipient_id)
+    .bind(recipient_ids)
     .bind(template)
     .bind(payload)
     .bind(link.map(RelativeLink::as_str))
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(|row| row.get("id"));
+    .fetch_all(&mut **tx)
+    .await?;
 
-    if let Some(new_id) = inserted {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Added {
-                recipient_id,
-                id: new_id,
-            },
-        )
-        .await?;
-    }
-    Ok(inserted)
+    let signals: Vec<NotificationSignal> = rows
+        .iter()
+        .map(|row| NotificationSignal::Added {
+            recipient_id: row.get("recipient_id"),
+            id: row.get("id"),
+        })
+        .collect();
+    signal_all(tx, &signals).await?;
+    Ok(signals.len())
 }
 
 pub struct Page {
