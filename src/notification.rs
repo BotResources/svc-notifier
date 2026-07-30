@@ -177,7 +177,17 @@ pub async fn list_notifications(
     recipient_id: Uuid,
     first: i64,
     after: Option<Uuid>,
-) -> Result<Page, sqlx::Error> {
+) -> Result<Option<Page>, sqlx::Error> {
+    if let Some(cursor) = after {
+        let anchor = sqlx::query("SELECT 1 FROM notifications WHERE id = $1 AND recipient_id = $2")
+            .bind(cursor)
+            .bind(recipient_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if anchor.is_none() {
+            return Ok(None);
+        }
+    }
     let limit = first.clamp(1, 100);
     let rows = sqlx::query(
         "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
@@ -204,10 +214,10 @@ pub async fn list_notifications(
         .map(Notification::from_row)
         .collect::<Result<Vec<_>, _>>()
         .map_err(corrupt)?;
-    Ok(Page {
+    Ok(Some(Page {
         nodes,
         has_next_page,
-    })
+    }))
 }
 
 pub async fn unread_count(
@@ -224,30 +234,46 @@ pub async fn unread_count(
     Ok(row.get("n"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    Transitioned,
+    AlreadyRead,
+}
+
 pub async fn mark_as_read(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     recipient_id: Uuid,
     id: Uuid,
-) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+) -> Result<Option<ReadOutcome>, sqlx::Error> {
     let row = sqlx::query(
-        "UPDATE notifications
-         SET read_at = COALESCE(read_at, now())
-         WHERE id = $1 AND recipient_id = $2
-         RETURNING read_at",
+        "WITH before AS (
+             SELECT id, read_at FROM notifications
+             WHERE id = $1 AND recipient_id = $2
+         ), transitioned AS (
+             UPDATE notifications SET read_at = now()
+             WHERE id = $1 AND recipient_id = $2 AND read_at IS NULL
+             RETURNING id, read_at
+         )
+         SELECT COALESCE(transitioned.read_at, before.read_at) AS read_at,
+                transitioned.id IS NOT NULL AS transitioned
+         FROM before LEFT JOIN transitioned ON transitioned.id = before.id",
     )
     .bind(id)
     .bind(recipient_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let read_at: Option<DateTime<Utc>> = match row {
-        Some(row) => row.get("read_at"),
-        None => return Ok(None),
+    let Some(row) = row else {
+        return Ok(None);
     };
-    if let Some(read_at) = read_at {
-        signal_read(tx, recipient_id, &[id], read_at).await?;
-        return Ok(Some(read_at));
+    let transitioned: bool = row.get("transitioned");
+    let read_at: Option<DateTime<Utc>> = row.get("read_at");
+    match read_at {
+        Some(read_at) if transitioned => {
+            signal_read(tx, recipient_id, &[id], read_at).await?;
+            Ok(Some(ReadOutcome::Transitioned))
+        }
+        _ => Ok(Some(ReadOutcome::AlreadyRead)),
     }
-    Ok(None)
 }
 
 pub async fn mark_all_as_read(

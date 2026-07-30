@@ -11,8 +11,8 @@ use br_core_auth::Passport;
 use br_util_graphql::EdgeError;
 
 use crate::notification::{
-    Notification, delete_notifications, list_notifications, mark_all_as_read, mark_as_read,
-    unread_count,
+    Notification, ReadOutcome, delete_notifications, list_notifications, mark_all_as_read,
+    mark_as_read, unread_count,
 };
 use crate::realtime::{ClientEvent, Subscribers};
 
@@ -121,6 +121,7 @@ impl QueryRoot {
             .await
             .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
+        let page = page.ok_or_else(EdgeError::not_found)?;
         Ok(NotificationConnection {
             nodes: page.nodes.iter().map(NotificationNode::from).collect(),
             has_next_page: page.has_next_page,
@@ -148,8 +149,11 @@ impl MutationRoot {
             .await
             .map_err(db_error)?
         {
-            Some(_) => {
+            Some(outcome) => {
                 tx.commit().await.map_err(db_error)?;
+                if outcome == ReadOutcome::AlreadyRead {
+                    tracing::debug!(%id, "mark-as-read replayed on an already-read notification");
+                }
                 Ok(true)
             }
             None => Err(EdgeError::not_found()),
