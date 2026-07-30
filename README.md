@@ -104,7 +104,10 @@ contract crate; on the bus it travels as the `payload` of the standard
 ### Intake semantics (the receiver's promises)
 
 - **Fan-out**: one command produces one notification per entry in `recipient_ids`,
-  written by a **single set-based `INSERT`** (`SELECT unnest(...)`), not one
+  written by a **single set-based `INSERT`** — the minted ids and the recipient ids
+  are zipped by one `FROM unnest($1::uuid[], $3::uuid[]) AS fan_out(id,
+  recipient_id)`, so the pairing is guaranteed lockstep and a length mismatch fails
+  the statement instead of NULL-padding a row — not one
   statement per recipient. A thousand-recipient command is one round trip, so a
   large fan-out cannot spend the consumer's `ack_wait` inside its own transaction
   and provoke a redelivery mid-write. The `Added` announcements ride batched
@@ -115,7 +118,8 @@ contract crate; on the bus it travels as the `payload` of the standard
 - **Permissive decode, strict validation.** The consumer deserializes the
   `IntegrationCommand` envelope with a **raw JSON payload**, then validates that
   payload strictly in the service (field shape, `RelativeLink::parse`, at least one
-  recipient). The order is deliberate: the command's ids and its verbatim bytes are
+  recipient). The order is deliberate: the command's ids, its issuing actor and the
+  payload's JSON value are
   recovered **before** the service judges it, so nothing it refuses can be refused
   untraceably. The contract crate is unchanged — `br-notifier-publisher` producers
   still cannot construct an unsafe `link` — only the receiving side is
@@ -130,18 +134,29 @@ contract crate; on the bus it travels as the `payload` of the standard
   publisher cannot emit one): **NAKed and held forever, never terminated.** There
   is no id to key a ledger row on, and the service never destroys a frame it
   cannot account for. The error log carries the subject and the delivery count,
-  and the `notifier_intake_undecodable_frames_total` counter makes the condition
-  alertable rather than silent.
+  and the `notifier_intake_undecodable_deliveries_total` counter makes the
+  condition alertable rather than silent. That counter is **per delivery**, not per
+  frame: one stuck envelope increments it on every redelivery, so a flat-but-rising
+  curve is exactly the signal — a single frame nobody can read, held forever.
+  **Known gap, unresolved:** held frames occupy the consumer's ack-pending budget.
+  The Fabric's `max_ack_pending` is 256, so 256 distinct undecodable envelopes held
+  simultaneously would fill it and **stall the intake entirely** — no further
+  delivery command would be dispatched until an operator drains them. Reaching it
+  takes a producer emitting non-JSON at scale, which a typed publisher cannot do;
+  the trade against destroying untraceable frames is deliberate, and the counter
+  above is the warning. Closing it needs an operator drain path, which does not
+  ship today.
 - **Dead-letter ledger**: no command is ever terminated without a **committed**
   ledger row — that is the invariant the whole poison path exists to keep. A
   command that is refused, or that decodes but can never be written, is recorded
   in `dead_letters` — the `reason` code, `source_event_id`, the **full**
   `recipient_ids` list (an abandonment drops every recipient at once, so every one
-  of them is named), the raw command bytes, the SQLSTATE when the database
-  supplied one, the producer's `correlation_id` / `causation_id` and a timestamp —
+  of them is named), the command payload, the SQLSTATE when the database
+  supplied one, the producer's `correlation_id` / `causation_id`, the envelope's
+  `actor_kind` / `actor_id` (who issued it) and a timestamp —
   **before** the frame is terminated. A refused payload may carry no readable
-  `source_event_id`; the column is nullable for exactly that case, and the
-  verbatim bytes keep the trace faithful regardless. The ledger
+  `source_event_id`; the column is nullable for exactly that case, and the stored
+  payload keeps the trace faithful regardless. The ledger
   is deduplicated on the envelope's **`command_id`** (unique index + `ON CONFLICT
   DO NOTHING`): one audit line per abandoned **command**, not per frame, so a
   `term()` the broker never registered cannot inflate the audit, and the first
@@ -153,10 +168,15 @@ contract crate; on the bus it travels as the `payload` of the standard
   trace at all. `source_event_id` keeps a plain (non-unique) index for ops
   lookups. If the ledger write itself fails, the command is NAKed
   instead of terminated: the intake never drops a request it cannot account for,
-  even at the cost of an infinite hold (which the dead-letter and transient-failure
-  metrics below make loud). The command is stored as `BYTEA`, not `JSONB`/`TEXT`,
-  precisely because the byte sequence that made the notification write impossible
-  would make a text-typed ledger write impossible too.
+  even at the cost of an infinite hold (which the dead-letter, ledger-failure and
+  transient-failure metrics below make loud). What the `command` column holds is
+  the payload's **JSON value, re-serialized faithfully** — the same data, with
+  object keys in serde's order and numbers normalized — not the producer's original
+  byte sequence, which the decode already consumed. The column is `BYTEA` as a
+  **defensive** choice, not a necessity: `serde_json` output is valid UTF-8 without
+  NUL, so `TEXT`/`JSONB` would accept it today; `BYTEA` keeps the ledger writable
+  whatever a future encoding change produces, and costs nothing since no query
+  looks inside the stored command.
 - **Database failure mid-batch**: the message is NAKed and redelivered — **without
   any budget**. A transient storage failure (unreachable database, pool timeout,
   connection loss, any SQLSTATE that a retry could clear) is NAKed for as long as
@@ -185,10 +205,14 @@ contract crate; on the bus it travels as the `payload` of the standard
 
   | Metric | Type | Meaning |
   |---|---|---|
-  | `notifier_intake_consecutive_transient_failures` | gauge | commands currently being held; non-zero and rising = storage outage |
+  | `notifier_intake_consecutive_transient_failures` | gauge | commands currently being held; non-zero and rising = storage outage. Initialised to `0` when the consumer binds, so the series exists before the first failure |
   | `notifier_intake_transient_failures_total` | counter | every held redelivery |
   | `notifier_intake_dead_letters_total{reason}` | counter | abandonments, by stable reason code |
-  | `notifier_intake_undecodable_frames_total` | counter | envelopes held because they cannot be read at all |
+  | `notifier_intake_undecodable_deliveries_total` | counter | **deliveries** of an envelope that cannot be read at all, held on the stream — the same stuck frame counts on every redelivery |
+  | `notifier_intake_ledger_failures_total` | counter | dead-letter writes that failed, degrading an abandonment to a hold. A revoked grant or a broken ledger, **not** a storage outage — it would otherwise hide in the transient counter |
+
+  Every series carries a HELP description (`describe_counter!` /
+  `describe_gauge!`), so `/metrics` documents itself.
 
   Readiness stays reserved for what it means: the process cannot serve. It goes
   DOWN (with a non-zero exit, so K8s reschedules) when the intake is structurally
@@ -257,12 +281,30 @@ Service passports are rejected with the same `FORBIDDEN` verdict the queries and
 mutations return — notifications are recipient-scoped and a service is never a
 recipient, and a refusal must be legible rather than an empty stream.
 
-**A lagging subscriber is disconnected, never silently truncated.** Each session
+**A lagging subscriber is disconnected on a verdict it can read, never silently
+truncated.** Each session
 has a bounded broadcast buffer; a client that cannot keep up overflows it. Rather
 than skip the facts it missed — which would leave the client folding a stream that
-has lost state, diverging silently and forever — the service **ends the stream** on
-the first lag. The client's normal reconnect protocol (below) then rebuilds an
-exact snapshot. This is the same repair path a deploy already exercises.
+has lost state, diverging silently and forever — the service emits a **terminal
+error** and ends the stream on the first lag:
+
+```json
+{"errors":[{"message":"INVALID_STATE","extensions":{
+  "code":"INVALID_STATE","reason":"subscription_lagged","params":{"lost_events":"37"}}}]}
+```
+
+`lost_events` is the number of facts the buffer dropped. The client contract is:
+**on `subscription_lagged`, reconnect and re-run the snapshot protocol below** —
+the same repair path a deploy already exercises. Ending the stream without a
+verdict would not do: a completed SSE stream and a truncated one look identical to
+an Apollo client, which would keep serving a cache it can no longer trust.
+
+`INVALID_STATE` / `subscription_lagged` is a deliberate mapping onto the closed
+`br-util-graphql` `ErrorCode` set (no service-local code exists, by doctrine): the
+lag is neither a bad request (`BAD_USER_INPUT`) nor a service fault (`INTERNAL`) —
+the *session's state* is no longer usable, which is what `INVALID_STATE` means. The
+stable string clients key on is the **reason code**, `subscription_lagged`; the
+`ErrorCode` only says which family it belongs to.
 
 ### Reconnect protocol (contract)
 
@@ -321,7 +363,15 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   says); the re-read runs in a transaction scoped to the signal's recipient, so it
   obeys the same row-level-security policy as every user-facing read — the listener
   has no privileged, RLS-bypassing read path. The event is then routed to that
-  recipient's local subscription connections. This re-read is the only builder of an
+  recipient's local subscription connections. **The re-read only happens when
+  somebody is listening**: the dispatch first asks the local subscriber registry
+  whether the signal's recipient has an open stream, and skips the whole
+  transaction otherwise. The listener loop is single and serial, so re-reading for
+  an offline recipient would move a large fan-out's per-recipient round trips
+  straight from the write path onto the realtime path — for events that are then
+  dropped for lack of a channel. The same check **evicts** a recipient's broadcast
+  channel once its last stream closes, so the registry tracks live sessions rather
+  than every recipient the process has ever served. This re-read is the only builder of an
   `Added` push, so its recipient-isolation is proven at the envelope by
   `scenarios_intake::s02_multi_recipient_fans_out_one_row_each_and_isolates_subscribers`
   (each recipient's `Added` carries only its own row) and
@@ -396,10 +446,14 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
     **zero rows, silently** under `FORCE` RLS — no error. So never read this table
     through a freshly-granted role and conclude "nothing was abandoned"; an empty
     result under anything but the owner means "not allowed to see", not "empty".
-    Decode the payload with `convert_from(command, 'UTF8')`, and triage by
+    Decode the payload with `convert_from(command, 'UTF8')` (it is `serde_json`
+    output — valid UTF-8, and the same JSON value the producer sent, re-serialized),
+    and triage by
     `reason` (`storage_rejected`, `relative_link_rejected`,
     `payload_shape_rejected`, `no_recipients` — the same codes the
-    `notifier_intake_dead_letters_total` counter is labelled with).
+    `notifier_intake_dead_letters_total` counter is labelled with). `actor_kind` /
+    `actor_id` name the issuer of the refused command, and `correlation_id` joins it
+    back to the trace that caused it.
   - Migrations run at startup under a separate owner role, then that pool closes;
     the owner role is never used for a runtime read.
 
@@ -505,10 +559,13 @@ harness-only and is never handed to the service.
   contract does not describe and a recipient-less command each map to their stable
   ledger `reason`, and an unreadable envelope maps to NAK-and-hold rather than
   `term`. `br-notifier-contract`'s own tests pin the producer side (an unsafe
-  `link` cannot be constructed). A live-intake e2e of a deliberately-refused frame
-  is publishable through the Fabric — `publish_command<T: Serialize>` is generic
-  over the payload, so a suite can ship a permissive payload struct without any new
-  harness affordance. The ledger row it produces is the assertion.
+  `link` cannot be constructed). Live-intake proof is `tests/scenarios_refusal.rs`,
+  which publishes deliberately-refused frames through the Fabric (`publish_command<T:
+  Serialize>` is generic over the payload, so the suite ships its own permissive
+  payload struct and needs no harness affordance): `s22` an out-of-domain `link`,
+  `s23` a shape the contract does not describe, `s24` a command naming nobody, and
+  `s21b` a refused payload held — never terminated — while the ledger is
+  unwritable. The ledger row each produces is the assertion.
 - The suite runs against real Postgres and real NATS JetStream — no infra
   mocks. The outage scenarios additionally need the `docker` CLI (they pause
   the Postgres container). Bring the harness up first:
@@ -589,7 +646,8 @@ a silent stall.
   and tested in `br-notifier-contract`. Producers publish through
   `br-notifier-publisher`, which wraps the payload in the envelope. The consumer
   reads that envelope with a **raw JSON payload** and applies the contract's rules
-  itself, so a payload it must refuse still yields its ids and its bytes.
+  itself, so a payload it must refuse still yields its ids, its issuing actor and
+  its JSON value.
 - **Poison handling — by failure class, never by a delivery count.** A frame is
   terminated only when retrying it is pointless *by nature*, and **only after a
   `dead_letters` row has committed**: a **refused payload** (unsafe `link`,
@@ -612,7 +670,8 @@ a silent stall.
   — with the ledger's INSERT grant revoked, a poison
   command is NAKed and held, never terminated, and is traced and terminated only
   once the ledger comes back. `s21` is the executable form of the invariant: no
-  `term()` without a committed row.
+  `term()` without a committed row; `scenarios_refusal` (`s22`–`s24`, `s21b`) is
+  the same invariant on the refusal path.
 - **`ack_wait`.** The intake uses the Fabric default (30s). Redelivery is driven by
   the 1s NAK delay, not by `ack_wait`, so an outage longer than the retired
   five-delivery budget is exercised end-to-end in
@@ -628,7 +687,7 @@ a silent stall.
   be hard-coded in the generic contract crate.
 - **`dead_letters` retention / TTL — undecided, operator's call.** The ledger has
   **no purge today**: a row lives until someone deletes it. Each row stores the
-  producer's command verbatim, and `payload` is arbitrary producer data that may
+  producer's command in full, and `payload` is arbitrary producer data that may
   well be personal, so this is a retention question, not just a disk question.
   It pairs with the `INTEGRATION_CMD` retention noted under "Intake semantics":
   that one bounds how long a *held* command survives, this one how long an

@@ -16,6 +16,7 @@ repository = "https://github.com/BotResources/svc-notifier"
 br-notifier-contract = { path = "crates/br-notifier-contract" }
 br-notifier-publisher = { path = "crates/br-notifier-publisher" }
 br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v1.2.0", version = "1.2.0" }
+br-core-events = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-events", tag = "v1.2.0", version = "1.2.0" }
 br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v1.2.0", version = "1.2.0" }
 br-util-axum-readiness = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-readiness", tag = "v1.2.0", version = "1.2.0" }
 br-util-graphql = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-graphql", tag = "v1.2.0", version = "1.2.0", features = ["graphql"] }

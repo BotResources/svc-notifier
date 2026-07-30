@@ -3484,6 +3484,7 @@ dependencies = [
  "async-graphql",
  "axum",
  "br-core-auth",
+ "br-core-events",
  "br-core-integration",
  "br-notifier-contract",
  "br-notifier-publisher",

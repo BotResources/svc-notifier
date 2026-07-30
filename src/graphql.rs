@@ -4,6 +4,7 @@ use futures::{Stream, StreamExt};
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use uuid::Uuid;
 
 use br_core_auth::Passport;
@@ -202,7 +203,7 @@ impl SubscriptionRoot {
     async fn notifier_notification_events(
         &self,
         ctx: &Context<'_>,
-    ) -> Result<impl Stream<Item = NotifierNotificationEvent> + use<>> {
+    ) -> Result<impl Stream<Item = Result<NotifierNotificationEvent>> + use<>> {
         let state = ctx
             .data::<AppState>()
             .map_err(|_| EdgeError::internal("missing app state in context"))?;
@@ -211,18 +212,30 @@ impl SubscriptionRoot {
     }
 }
 
+const SUBSCRIPTION_LAGGED: &str = "subscription_lagged";
+
 fn until_first_lag(
     receiver: broadcast::Receiver<ClientEvent>,
-) -> impl Stream<Item = NotifierNotificationEvent> {
-    BroadcastStream::new(receiver)
-        .take_while(|delivery| {
-            let lagged = delivery.is_err();
-            if lagged {
-                tracing::warn!("subscriber lagged behind the broadcast buffer, ending the stream");
+) -> impl Stream<Item = Result<NotifierNotificationEvent>> {
+    futures::stream::unfold(Some(BroadcastStream::new(receiver)), |open| async move {
+        let mut deliveries = open?;
+        match deliveries.next().await? {
+            Ok(event) => Some((Ok(into_union(event)), Some(deliveries))),
+            Err(BroadcastStreamRecvError::Lagged(lost_events)) => {
+                tracing::warn!(
+                    lost_events,
+                    "subscriber lagged behind the broadcast buffer, ending the stream on a lagged verdict"
+                );
+                Some((Err(lagged(lost_events)), None))
             }
-            futures::future::ready(!lagged)
-        })
-        .filter_map(|delivery| async move { delivery.ok().map(into_union) })
+        }
+    })
+}
+
+fn lagged(lost_events: u64) -> EdgeError {
+    EdgeError::invalid_state()
+        .with_reason(SUBSCRIPTION_LAGGED)
+        .with_param("lost_events", lost_events.to_string())
 }
 
 fn into_union(event: ClientEvent) -> NotifierNotificationEvent {
@@ -304,6 +317,44 @@ mod tests {
             resolved.0, admin_id,
             "the acting human owns the notifications, never the impersonated user"
         );
+    }
+
+    #[test]
+    fn a_lagged_stream_ends_on_a_verdict_the_client_can_key_on() {
+        let verdict = lagged(12);
+        assert_eq!(
+            verdict.code().as_str(),
+            "INVALID_STATE",
+            "a truncated stream is an unusable session, not a client mistake nor a server bug"
+        );
+        assert_eq!(verdict.reason_code(), Some(SUBSCRIPTION_LAGGED));
+        assert_eq!(
+            verdict.params().get("lost_events").map(String::as_str),
+            Some("12"),
+            "the client is told how much it lost before it resnapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overflowed_stream_serves_the_verdict_and_then_ends() {
+        let (sender, receiver) = broadcast::channel(2);
+        for _ in 0..3 {
+            sender
+                .send(ClientEvent::Deleted { ids: Vec::new() })
+                .expect("the receiver is open");
+        }
+
+        let served: Vec<_> = until_first_lag(receiver).collect().await;
+
+        assert_eq!(
+            served.len(),
+            1,
+            "a truncated stream must stop, never keep serving a fold that lost facts"
+        );
+        let Some(Err(verdict)) = served.into_iter().next() else {
+            panic!("the lag must surface as a verdict the client can read");
+        };
+        assert_eq!(verdict.reason_code(), Some(SUBSCRIPTION_LAGGED));
     }
 
     #[test]

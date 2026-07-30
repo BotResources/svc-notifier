@@ -57,6 +57,16 @@ pub enum NotificationSignal {
     },
 }
 
+impl NotificationSignal {
+    pub const fn recipient_id(&self) -> Uuid {
+        match self {
+            Self::Added { recipient_id, .. }
+            | Self::Read { recipient_id, .. }
+            | Self::Deleted { recipient_id, .. } => *recipient_id,
+        }
+    }
+}
+
 pub const NOTIFY_CHANNEL: &str = "notification_events";
 
 pub const SIGNAL_ID_CHUNK: usize = 150;
@@ -132,7 +142,8 @@ pub async fn insert_notifications(
     let ids: Vec<Uuid> = recipient_ids.iter().map(|_| Uuid::now_v7()).collect();
     let rows = sqlx::query(
         "INSERT INTO notifications (id, source_event_id, recipient_id, template, payload, link)
-         SELECT unnest($1::uuid[]), $2, unnest($3::uuid[]), $4, $5, $6
+         SELECT fan_out.id, $2, fan_out.recipient_id, $4, $5, $6
+         FROM unnest($1::uuid[], $3::uuid[]) AS fan_out(id, recipient_id)
          ON CONFLICT (source_event_id, recipient_id) DO NOTHING
          RETURNING id, recipient_id",
     )

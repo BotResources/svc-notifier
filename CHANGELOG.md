@@ -19,9 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class** instead of a bare boolean: a **transient** failure (unreachable storage,
   pool timeout, connection loss, any SQLSTATE a retry could clear) is NAKed for
   redelivery *forever*, so JetStream holds the frame until storage returns; only a
-  **poison** frame — undecodable, or a permanently invalid write (SQLSTATE class
-  `22` data exception / `23` integrity constraint violation) — is terminated,
-  because retrying it can never succeed. Classification is conservative: anything
+  **poison** frame — a refused payload, or a permanently invalid write (SQLSTATE
+  class `22` data exception / `23` integrity constraint violation) — is terminated,
+  and only after a `dead_letters` row is committed,
+  because retrying it can never succeed. An envelope that cannot be decoded at all
+  is *never* terminated: it is NAKed and held forever (see below). Classification
+  is conservative: anything
   unrecognised is transient. A sustained outage is visible to operators through
   **metrics, not readiness**: `notifier_intake_consecutive_transient_failures`
   (gauge, reset by the first completed write) plus
@@ -37,17 +40,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Terminating destroyed the request — for *every* recipient of the fan-out at
   once — with nothing but a log line. A new `dead_letters` table records the
   abandonment `reason`, the `source_event_id`, the full `recipient_ids` list, the
-  raw command bytes and the SQLSTATE **before** the frame is terminated; if the
+  command payload and the SQLSTATE **before** the frame is terminated; if the
   ledger write itself fails,
   the command is NAKed rather than terminated, so the intake never drops a request
-  it cannot account for. The command is stored as `BYTEA` deliberately: the byte
-  sequence that made the notification write impossible (a NUL character, say)
-  would make a `TEXT`/`JSONB` ledger write impossible too. The table is
+  it cannot account for. What is stored is the payload's **JSON value,
+  re-serialized faithfully** — the same data, with object keys in serde's order and
+  numbers normalized, not the producer's original byte sequence. The column is
+  `BYTEA` as a defensive choice, not a necessity: `serde_json` output is valid
+  UTF-8 without NUL, so `TEXT`/`JSONB` would accept it; `BYTEA` keeps the ledger
+  writable whatever a future encoding change produces, and costs nothing since
+  nothing queries inside the stored command. The table is
   `FORCE`-RLS with a single ingest-write policy and carries **no** grant to
   `svc_notifier_app` — abandoned commands are operator data, read with the owner
   role (see the runbook note in the README for what each role actually sees). The
   producer's `correlation_id` / `causation_id` are kept as UUID columns so an
-  abandonment stays joinable to the trace that caused it, and the ledger is
+  abandonment stays joinable to the trace that caused it, its `actor_kind` /
+  `actor_id` name **who** issued the refused command (migration `0004`), and the
+  ledger is
   deduplicated on the envelope's **`command_id`** (unique index + `ON CONFLICT DO
   NOTHING`) so a `term()` the broker never registered cannot inflate the audit.
   The key is `command_id`, not `source_event_id`, on purpose: the business dedup
@@ -66,7 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that made *all* of a producer's frames undecodable. The consumer now
   deserializes the `IntegrationCommand` envelope with a **raw JSON payload** and
   validates that payload strictly in the service, so the `command_id`,
-  `correlation_id`, the ids it can read and the verbatim bytes are recovered
+  `correlation_id`, the issuing actor, the ids it can read and the payload's JSON
+  value are recovered
   **before** the frame is judged. A refused payload — unsafe `link`
   (`relative_link_rejected`), a shape the contract does not describe
   (`payload_shape_rejected`), or **no recipient at all** (`no_recipients`, until
@@ -78,25 +88,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses. The one residual class, an envelope that is not valid JSON at all (a
   typed publisher cannot emit one), is **NAKed and held forever, never
   terminated**: it carries no id to key a ledger row on, and a frame that cannot
-  be accounted for is not destroyed. It is counted by
-  `notifier_intake_undecodable_frames_total`.
+  be accounted for is not destroyed. Every one of its redeliveries is counted by
+  `notifier_intake_undecodable_deliveries_total` (a per-delivery counter, hence
+  the `deliveries` in the name: one stuck frame makes it climb forever, which is
+  precisely the alert).
 - **A large fan-out no longer races its own `ack_wait`.** The intake inserted one
   row and emitted one `pg_notify` per recipient, serialized inside a single
   transaction on a one-at-a-time consume loop; at ~1000 recipients that work
   approached the consumer's 30s `ack_wait` and invited a redelivery *during* the
   write. The fan-out is now a single set-based
-  `INSERT ... SELECT unnest($1::uuid[]), ...  ON CONFLICT DO NOTHING RETURNING`,
+  `INSERT ... SELECT ... FROM unnest($1::uuid[], $3::uuid[]) AS fan_out(id,
+  recipient_id) ON CONFLICT DO NOTHING RETURNING` — the two arrays are zipped by
+  one `unnest`, so a length mismatch fails the statement instead of NULL-padding a
+  row,
   and the `Added` announcements ride batched `pg_notify` statements (150 payloads
   per statement) in the same transaction. Dedup semantics are unchanged: ids stay
   client-minted UUIDv7, first write wins, a replay alters nothing.
-- **A lagging subscriber is disconnected instead of silently truncated.** The
-  subscription discarded `BroadcastStream`'s `Lagged(n)`, so a client whose buffer
+- **A lagging subscriber is disconnected on a verdict it can read, instead of
+  silently truncated.** The subscription discarded `BroadcastStream`'s `Lagged(n)`,
+  so a client whose buffer
   overflowed kept folding a stream that had lost facts and diverged from the
   server forever — against the spec's "a reconnecting client rebuilds state
-  without loss". The stream now **ends** on the first lag, and the client's normal
-  reconnect + snapshot protocol repairs the state. A `Passport::Service` on the
+  without loss". The stream now emits a **terminal error** and ends on the first
+  lag: `INVALID_STATE` with the stable reason code **`subscription_lagged`** and a
+  `lost_events` param carrying the number of facts skipped (which used to be
+  discarded outright, and is now logged too). Ending the stream silently was not
+  enough — an Apollo client cannot tell a normal completion from a truncation, and
+  would sit on a stale cache instead of resnapshotting. `INVALID_STATE` is the
+  closest code in the closed `br-util-graphql` `ErrorCode` set: the session's state
+  is no longer usable, which is neither a client input error (`BAD_USER_INPUT`) nor
+  a service fault (`INTERNAL`); the reason code is what clients key on. The
+  contract for the client is: on `subscription_lagged`, reconnect and re-run the
+  snapshot protocol. A `Passport::Service` on the
   subscription is now a `FORBIDDEN` verdict too, like every query and mutation,
   instead of an empty stream that completes immediately.
+- **The listener no longer re-reads a row nobody is watching.** Every `Added`
+  signal made the single PG-listener loop open a transaction, set the RLS context,
+  `SELECT` the row and commit — four round trips — *before* discovering that the
+  recipient has no open subscription, in which case the event was dropped. On a
+  large fan-out to mostly-offline recipients that serialized work moved the
+  bottleneck straight from the write path onto the realtime path. The dispatch now
+  asks `Subscribers::active` first and skips the re-read entirely when nobody is
+  connected. The same call **evicts** the recipient's broadcast channel when its
+  last receiver is gone: the registry used to keep one channel per recipient that
+  ever subscribed, for the life of the process (principle 20 — cleanup when idle).
 - **Bulk mutations no longer break above ~200 notifications.** `pg_notify` caps
   its payload at 8000 bytes and errors above it — inside the write transaction,
   that error aborted the **whole mutation**, so `notifierMarkAllAsRead` /
@@ -141,12 +176,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migration `0003_dead_letter_reason.sql` — the ledger's stable `reason` code
   (indexed), and a nullable `source_event_id` for the refused payloads that carry
   no readable one.
+- Migration `0004_dead_letter_actor.sql` — the envelope's `actor_kind` /
+  `actor_id` on the ledger (indexed on the id), so an abandonment names **who**
+  issued the command and not only which trace it belonged to. Additive and
+  nullable: table-level `INSERT`/`SELECT` grants to `svc_notifier_ingest` cover
+  new columns, and the RLS posture is untouched.
 - Prometheus metrics on the intake, the replacement for the readiness escalation:
   `notifier_intake_dead_letters_total{reason}`,
   `notifier_intake_transient_failures_total`,
-  `notifier_intake_consecutive_transient_failures` (gauge) and
-  `notifier_intake_undecodable_frames_total`, on the existing
-  `br-util-observability` `/metrics` wiring.
+  `notifier_intake_consecutive_transient_failures` (gauge, initialised to `0` at
+  bind so the series exists before the first outage),
+  `notifier_intake_undecodable_deliveries_total` and
+  `notifier_intake_ledger_failures_total` (a failed ledger write — a revoked grant,
+  say — must not read as a Postgres outage on the transient counter), on the
+  existing `br-util-observability` `/metrics` wiring. Every series carries a HELP
+  description (`describe_counter!` / `describe_gauge!`).
 - e2e `scenarios_outage::s07c` — an outage held past the retired five-delivery
   budget, gated on **JetStream's own** `delivered_count` rather than on counting
   service log lines: the frame keeps being NAKed and, when Postgres returns, the
@@ -154,11 +198,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outage receives the `NotificationAdded`, and no dead letter is written.
 - e2e `scenarios_intake::s20` — two distinct poison commands sharing one
   `source_event_id` (the chunked-recipients shape) leave **two** audit lines, each
-  naming its own recipients; the command round-trips verbatim; replaying the same
-  envelope adds no line.
+  naming its own recipients; the stored command round-trips to the same JSON value;
+  replaying the same envelope adds no line.
 - e2e `scenarios_intake::s21` — with the ledger unwritable (the ingest role's
   INSERT grant revoked), a poison command is NAKed and held, never terminated,
   and is traced and terminated only once the ledger comes back.
+- e2e `scenarios_refusal` — the executable proof of the refusal ledger:
+  `s22` an out-of-domain `link` refuses the whole request and leaves a trace,
+  `s23` a payload the contract does not describe is recorded with whatever ids are
+  readable, `s24` a command naming nobody is a producer bug on the ledger and not
+  a silent no-op, and `s21b` a refused payload is held — never terminated — while
+  the ledger is unwritable.
 - e2e `scenarios_impersonation` (s17–s19b) — list, unread count, subscription
   stream, mark-as-read, delete, and **both bulk mutations** (`markAllAsRead`,
   `deleteNotifications` — the only ones with no id to target) under an
@@ -169,7 +219,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it unchanged; an unsafe link, an undescribed shape and a recipient-less command
   each map to their stable ledger reason; a refused frame still yields the ids the
   ledger needs; an unreadable envelope is held, never terminated), on the
-  transient-failure streak, on `graphql::resolve_recipient`, and on the
+  ledger's actor-kind labels, on the
+  transient-failure streak, on `graphql::resolve_recipient`, on the
+  `subscription_lagged` verdict a truncated stream ends with, on the subscriber
+  registry (an unwatched recipient is inactive, the last stream closing evicts its
+  channel), and on the
   `pg_notify` chunk payload bound.
 
 ## 1.0.2

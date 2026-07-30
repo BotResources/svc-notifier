@@ -1,11 +1,12 @@
 use std::time::Duration;
 
+use br_core_events::Actor;
 use br_notifier_contract::{DeliverNotification, RelativeLink, deliver_coords};
 use br_util_axum_readiness::ReadinessHandle;
 use br_util_nats_fabric::{
     CommandConsumer, Delivered, Fabric, FabricError, IntegrationCommand, MessageOutcome,
 };
-use metrics::{counter, gauge};
+use metrics::{counter, describe_counter, describe_gauge, gauge};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -22,7 +23,8 @@ const PERMANENTLY_INVALID_SQLSTATE_CLASSES: [&str; 2] = ["22", "23"];
 const DEAD_LETTERS_TOTAL: &str = "notifier_intake_dead_letters_total";
 const TRANSIENT_FAILURES_TOTAL: &str = "notifier_intake_transient_failures_total";
 const CONSECUTIVE_TRANSIENT_FAILURES: &str = "notifier_intake_consecutive_transient_failures";
-const UNDECODABLE_FRAMES_TOTAL: &str = "notifier_intake_undecodable_frames_total";
+const UNDECODABLE_DELIVERIES_TOTAL: &str = "notifier_intake_undecodable_deliveries_total";
+const LEDGER_FAILURES_TOTAL: &str = "notifier_intake_ledger_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureClass {
@@ -61,6 +63,15 @@ struct Trace {
     command_id: Uuid,
     correlation_id: Uuid,
     causation_id: Option<Uuid>,
+    actor_kind: &'static str,
+    actor_id: Uuid,
+}
+
+const fn actor_kind(actor: &Actor) -> &'static str {
+    match actor {
+        Actor::Human(_) => "human",
+        Actor::Service(_) => "service",
+    }
 }
 
 #[derive(Debug)]
@@ -91,11 +102,36 @@ struct RawDeliver {
 }
 
 pub async fn bind(fabric: &Fabric) -> Result<CommandConsumer<Value>, IntakeError> {
+    describe_intake_metrics();
     let consumer = fabric
         .ensure_command_consumer::<Value>(&deliver_coords(), DURABLE_NAME)
         .await?;
     tracing::info!(durable = DURABLE_NAME, "intake consumer bound");
     Ok(consumer)
+}
+
+fn describe_intake_metrics() {
+    describe_counter!(
+        DEAD_LETTERS_TOTAL,
+        "Delivery commands abandoned on the dead-letter ledger and terminated, by stable reason code"
+    );
+    describe_counter!(
+        TRANSIENT_FAILURES_TOTAL,
+        "Deliveries held on the stream after a storage failure a retry could clear"
+    );
+    describe_gauge!(
+        CONSECUTIVE_TRANSIENT_FAILURES,
+        "Consecutive transient storage failures, reset by the first completed write — non-zero and rising means a storage outage"
+    );
+    describe_counter!(
+        UNDECODABLE_DELIVERIES_TOTAL,
+        "Deliveries of an envelope that cannot be read at all, held on the stream — every redelivery of the same frame counts again"
+    );
+    describe_counter!(
+        LEDGER_FAILURES_TOTAL,
+        "Dead-letter ledger writes that failed, degrading an abandonment to a hold — a lost grant, not a storage outage"
+    );
+    gauge!(CONSECUTIVE_TRANSIENT_FAILURES).set(0.0);
 }
 
 pub async fn consume(
@@ -166,10 +202,12 @@ async fn handle(pool: &PgPool, delivered: Delivered<IntegrationCommand<Value>>) 
                 command_id: envelope.command_id,
                 correlation_id: envelope.metadata.correlation_id,
                 causation_id: envelope.metadata.causation_id,
+                actor_kind: actor_kind(&envelope.metadata.actor),
+                actor_id: envelope.metadata.actor.id(),
             },
         ),
         Err(error) => {
-            counter!(UNDECODABLE_FRAMES_TOTAL).increment(1);
+            counter!(UNDECODABLE_DELIVERIES_TOTAL).increment(1);
             tracing::error!(
                 %error,
                 subject = delivered.subject(),
@@ -332,12 +370,14 @@ async fn abandon(pool: &PgPool, abandoned: &Abandoned<'_>) -> FailureClass {
                 source_event_id = ?abandoned.source_event_id,
                 command_id = %abandoned.trace.command_id,
                 correlation_id = %abandoned.trace.correlation_id,
+                delivered_count = ?abandoned.delivered_count,
                 sqlstate = ?abandoned.sqlstate,
                 "permanently invalid deliver command already on the ledger, terminating the redelivered frame"
             );
             FailureClass::Poison
         }
         Err(ledger_error) => {
+            counter!(LEDGER_FAILURES_TOTAL).increment(1);
             tracing::error!(
                 %ledger_error,
                 reason = abandoned.reason.as_str(),
@@ -362,8 +402,8 @@ async fn record_dead_letter(
     let recorded = sqlx::query(
         "INSERT INTO dead_letters
              (id, command_id, source_event_id, recipient_ids, command, reason, sqlstate,
-              correlation_id, causation_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+              correlation_id, causation_id, actor_kind, actor_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (command_id) DO NOTHING
          RETURNING id",
     )
@@ -376,6 +416,8 @@ async fn record_dead_letter(
     .bind(abandoned.sqlstate)
     .bind(abandoned.trace.correlation_id)
     .bind(abandoned.trace.causation_id)
+    .bind(abandoned.trace.actor_kind)
+    .bind(abandoned.trace.actor_id)
     .fetch_optional(pool)
     .await?
     .map(|row| row.get("id"));
@@ -582,6 +624,13 @@ mod tests {
         ] {
             assert_eq!(reason.as_str(), code);
         }
+    }
+
+    #[test]
+    fn every_actor_kind_has_a_stable_ledger_label() {
+        let id = Uuid::now_v7();
+        assert_eq!(actor_kind(&Actor::Human(id.into())), "human");
+        assert_eq!(actor_kind(&Actor::Service(id.into())), "service");
     }
 
     #[test]
