@@ -128,8 +128,22 @@ contract crate; on the bus it travels as the `payload` of the standard
   refusal), a payload the contract does not describe, or a command naming **no
   recipient** (a producer bug, never a silent no-op): recorded in `dead_letters`
   with a stable `reason` (`relative_link_rejected`, `payload_shape_rejected`,
-  `no_recipients`) and **then** terminated. Zero rows persisted, no partial
-  fan-out, nothing reaches any recipient — but the abandonment is on the ledger.
+  `no_recipients`, `template_rejected`) and **then** terminated. Zero rows
+  persisted, no partial fan-out, nothing reaches any recipient — but the
+  abandonment is on the ledger.
+- **Refused `template`** — a template is a rendering key, so the intake refuses up
+  front what no renderer could key on: an **empty or whitespace-only** template,
+  and any template carrying a **control character**. The NUL is the one PostgreSQL
+  itself refuses (SQLSTATE class `22`): such a template used to reach the `INSERT`
+  and be abandoned as a `storage_rejected` accident. The rest of the control range
+  is refused with it — PostgreSQL would store a newline happily, and a rendering
+  key containing one is a producer bug that deserves the same named reason rather
+  than a silently stored, unrenderable notification. Both are now a clean
+  `template_rejected` refusal decided before any write. The rule is deliberately
+  narrow: it is **not** a naming policy. Any non-empty, control-free string is
+  accepted — dots, accents, CJK, even surrounding whitespace — because the allowed
+  template *list* is per-project configuration and must never be hard-coded here
+  (see "Open questions").
 - **Undecodable envelope** (not valid JSON at the envelope level — a typed
   publisher cannot emit one): **NAKed and held forever, never terminated.** There
   is no id to key a ledger row on, and the service never destroys a frame it
@@ -138,14 +152,26 @@ contract crate; on the bus it travels as the `payload` of the standard
   condition alertable rather than silent. That counter is **per delivery**, not per
   frame: one stuck envelope increments it on every redelivery, so a flat-but-rising
   curve is exactly the signal — a single frame nobody can read, held forever.
-  **Known gap, unresolved:** held frames occupy the consumer's ack-pending budget.
-  The Fabric's `max_ack_pending` is 256, so 256 distinct undecodable envelopes held
-  simultaneously would fill it and **stall the intake entirely** — no further
-  delivery command would be dispatched until an operator drains them. Reaching it
-  takes a producer emitting non-JSON at scale, which a typed publisher cannot do;
-  the trade against destroying untraceable frames is deliberate, and the counter
-  above is the warning. Closing it needs an operator drain path, which does not
-  ship today.
+  **Known gap, unresolved — and its real shape.** A held frame is never removed,
+  so undecodable envelopes accumulate on the stream until an operator drains them.
+  What that costs is **intake throughput, not a hard stall**: the loop settles
+  every delivery (`ack` / `nak` / `term`) before its next `recv()`, and a `nak` is
+  an explicit settlement — it releases the delivery and schedules redelivery after
+  `NAK_DELAY` (1s). So this consumer never holds more than one unsettled delivery,
+  and the Fabric's `max_ack_pending` of 256 is **not** the ceiling here: it bounds
+  delivered-but-unsettled messages, which a NAKed frame is not. (Stated explicitly
+  because the opposite — "256 held frames fill `max_ack_pending` and freeze the
+  intake" — is a plausible reading of the same configuration, and acting on it
+  would send an operator after the wrong thing.) The actual bound is arithmetic: N
+  stuck envelopes cost N redeliveries per second of loop turns and log volume,
+  interleaved with real work, so a large N delays legitimate commands and can
+  swamp the logs long before anything breaks. `notifier_intake_undecodable_deliveries_total`
+  rising with a flat `..._dead_letters_total` is that condition, and it is the
+  alert to wire. Reaching a painful N takes a producer emitting non-JSON at scale,
+  which a typed publisher cannot do. Closing it properly needs an operator drain
+  path (or a raw-frame ledger row — see the harness gap below); neither ships
+  today, and the trade against destroying frames we cannot account for is
+  deliberate.
 - **Dead-letter ledger**: no command is ever terminated without a **committed**
   ledger row — that is the invariant the whole poison path exists to keep. A
   command that is refused, or that decodes but can never be written, is recorded
@@ -177,6 +203,28 @@ contract crate; on the bus it travels as the `payload` of the standard
   NUL, so `TEXT`/`JSONB` would accept it today; `BYTEA` keeps the ledger writable
   whatever a future encoding change produces, and costs nothing since no query
   looks inside the stored command.
+- **Dead-letter retention — 90 days, purged by the service.** The ledger is a
+  **diagnostic** surface, not an archive: it exists so an operator can see what was
+  refused, re-emit it, and close the incident. A row stores the producer's command
+  in full, and `payload` is arbitrary producer data that may well be personal, so
+  keeping it forever is a data-protection liability, not merely a disk cost. A
+  daily task (`purge_dead_letters`, interval `PURGE_INTERVAL`, first pass on
+  startup) deletes every row whose `recorded_at` is older than
+  `DEAD_LETTER_RETENTION_DAYS` (90) and logs how many it removed. It runs through
+  the **ingest** role — the same least-privilege runtime role that writes the
+  ledger, never the owner — which is why migration `0002` grants it `DELETE`.
+  A failed pass (a missing grant, a database that will not answer) is logged as an
+  error and retried at the next tick; it does **not** take `/readyz` DOWN, for the
+  same reason a storage outage does not: pulling the pod out of the Service
+  endpoints over housekeeping would cut the healthy read and subscription surface
+  with it. The task is watched like the live ones, so its death is loud rather than
+  silent — only its consequences differ. What to alert on is
+  `notifier_intake_dead_letters_total`, which counts **committed ledger rows** and
+  nothing else: a replayed frame that hits the `ON CONFLICT DO NOTHING` no-op never
+  increments it, so its rate is a rate of *new* abandonments, not of redeliveries.
+  Retention is deliberately **not** a deployment knob today: 90 days is one
+  operator decision recorded in one constant, and a second knob would only let a
+  cluster drift from it silently.
 - **Database failure mid-batch**: the message is NAKed and redelivered — **without
   any budget**. A transient storage failure (unreachable database, pool timeout,
   connection loss, any SQLSTATE that a retry could clear) is NAKed for as long as
@@ -207,7 +255,7 @@ contract crate; on the bus it travels as the `payload` of the standard
   |---|---|---|
   | `notifier_intake_consecutive_transient_failures` | gauge | commands currently being held; non-zero and rising = storage outage. Initialised to `0` when the consumer binds, so the series exists before the first failure |
   | `notifier_intake_transient_failures_total` | counter | every held redelivery |
-  | `notifier_intake_dead_letters_total{reason}` | counter | abandonments, by stable reason code |
+  | `notifier_intake_dead_letters_total{reason}` | counter | abandonments, by stable reason code. Counts **committed ledger rows**: a replayed frame deduplicated by `command_id` adds nothing, so the rate is one of new abandonments, not of redeliveries |
   | `notifier_intake_undecodable_deliveries_total` | counter | **deliveries** of an envelope that cannot be read at all, held on the stream — the same stuck frame counts on every redelivery |
   | `notifier_intake_ledger_failures_total` | counter | dead-letter writes that failed, degrading an abandonment to a hold. A revoked grant or a broken ledger, **not** a storage outage — it would otherwise hide in the transient counter |
 
@@ -233,7 +281,13 @@ only ever see or touch their own notifications.
 ### Queries
 
 - `notifierNotifications(first: Int = 20, after: ID): NotificationConnection` —
-  newest-first pagination (`nodes`, `hasNextPage`).
+  newest-first pagination (`nodes`, `hasNextPage`). `first` is clamped to 1..=100.
+  **A cursor that no longer resolves is a `NOT_FOUND` error, not an empty page**:
+  `after` names a notification, and that notification may have been deleted (by
+  another session, or by this one on a page it has already left) between two
+  requests. Answering zero nodes would read as "you have reached the end" and
+  silently hide everything past the deleted anchor. The documented recovery is the
+  one the stream already prescribes: restart from the first page.
 - `notifierUnreadCount: Int!`
 
 The notification type carries `id`, `template`, `payload`, `link`, `readAt`,
@@ -356,6 +410,18 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
   prove the hard-restart case, where the listener's socket is actually killed.
   Closing it needs a catch-up watermark on reconnect — a design decision, not a
   patch; it is not in this service today.
+- **Both live tasks are supervised, and the maintenance one is watched.** The intake and the realtime listener are the
+  two halves of "everything is live", and both run on their own tokio task, where a
+  panic or a cancellation dies **silently** — the process would keep answering
+  `/readyz` 200 with no one feeding the subscribers. The listener holds reachable
+  panics of its own (four mutex `expect`s on the subscriber registry, which a
+  panicking sibling would poison), so the boot-time stream gate is not enough on
+  its own. One `supervise` awaits each task handle and, on a panic or a
+  cancellation, takes readiness DOWN and triggers the non-zero exit — the same
+  fail-loud shape for both, so neither half can outlive the other unnoticed. The
+  dead-letter retention pass is watched by the same shape minus the escalation
+  (`watch_maintenance`): its death is logged loudly, but it never touches readiness
+  — housekeeping stopping is not the process failing to serve.
 - Each service instance runs a PG listener under the `svc_notifier_app` role
   (the always-present application connection — an instance without NATS still
   feeds its subscribers from PostgreSQL). For an `Added` fact it re-reads the new
@@ -431,8 +497,10 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
     could read — no role bypasses RLS at runtime.
   - `svc_notifier_ingest` — the NATS consumer (a system component, not a user);
     INSERT plus the SELECT needed for `RETURNING`, no user-scoped read path. It is
-    also the only runtime role that may write `dead_letters`; that table carries no
-    grant to `svc_notifier_app` at all — an abandoned command is operator data, not
+    also the only runtime role that may write `dead_letters` — and, since the
+    retention pass runs in the service, the only one that may `DELETE` from it
+    (migration `0002`); the owner role is never handed a runtime path. That table
+    carries no grant to `svc_notifier_app` at all — an abandoned command is operator data, not
     user data, and is read with the owner role.
     **Runbook — read `dead_letters` as the owner role.** The table is `FORCE` RLS
     with a single `svc_notifier_ingest` policy and no grant at all to
@@ -450,7 +518,7 @@ PostgreSQL is the single source of truth; the subscription stream is **fed by PG
     output — valid UTF-8, and the same JSON value the producer sent, re-serialized),
     and triage by
     `reason` (`storage_rejected`, `relative_link_rejected`,
-    `payload_shape_rejected`, `no_recipients` — the same codes the
+    `payload_shape_rejected`, `no_recipients`, `template_rejected` — the same codes the
     `notifier_intake_dead_letters_total` counter is labelled with). `actor_kind` /
     `actor_id` name the issuer of the refused command, and `correlation_id` joins it
     back to the trace that caused it.
@@ -682,17 +750,28 @@ a silent stall.
 - **Hard vs soft delete** — delete currently removes the row. Soft delete would
   enable a trash/undo UX and tombstones; decide before any cascade-on-user-deletion
   work.
-- **Allowed-template list** — the service accepts any `template` string. The list of
-  valid templates is per-project policy and belongs in configuration; it must never
-  be hard-coded in the generic contract crate.
-- **`dead_letters` retention / TTL — undecided, operator's call.** The ledger has
-  **no purge today**: a row lives until someone deletes it. Each row stores the
-  producer's command in full, and `payload` is arbitrary producer data that may
-  well be personal, so this is a retention question, not just a disk question.
-  It pairs with the `INTEGRATION_CMD` retention noted under "Intake semantics":
-  that one bounds how long a *held* command survives, this one how long an
-  *abandoned* one is kept. Both are deployment-side decisions the service must not
-  take on its own.
+- **Allowed-template list** — the service accepts any `template` string that
+  PostgreSQL can store (see the `template_rejected` refusal under "Intake
+  semantics"; that rule mirrors a storage constraint, not a policy). The list of
+  *valid* templates is per-project policy and belongs in configuration; it must
+  never be hard-coded in the generic contract crate.
+- **Upstream harness gap — the undecodable-envelope path has no e2e.** Every
+  scenario publishes through the Fabric with typed coordinates, which is the
+  discipline; the consequence is that no scenario can produce a frame whose
+  *envelope* is unreadable, because a typed publisher cannot emit one. Proving that
+  path end-to-end (held forever, never terminated, counter rising) needs exactly one
+  new primitive in `br-e2e-harness`: a `publish_command_bytes(coords, &[u8])` on
+  `FabricTestNats` that puts arbitrary bytes on a rendered coordinate subject —
+  still coordinate-typed, only the *payload* raw, so it does not reopen
+  hand-built subjects. Until then the path is covered by unit tests
+  (`intake::tests::an_undecodable_envelope_is_held_never_terminated`) and by the
+  counter, and that is stated rather than hidden. Deliberately **not** worked
+  around here: a local raw-publish hatch in this suite is the foot-gun the
+  operator already ruled out.
+- **`INTEGRATION_CMD` retention** stays a deployment-side decision (see "Intake
+  semantics"): it bounds how long a *held* command survives. Its counterpart —
+  how long an *abandoned* command is kept — is now settled in the service; see
+  "Dead-letter retention" above.
 
 ## License & contributing
 

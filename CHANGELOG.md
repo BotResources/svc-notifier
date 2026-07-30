@@ -11,6 +11,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The realtime listener is supervised like the intake.** Only the intake had a
+  supervisor: the listener — the other half of "everything is live" — ran on a
+  detached task where a panic died silently, leaving the process answering
+  `/readyz` 200 with nobody feeding the subscribers. It holds reachable panics of
+  its own (four mutex `expect`s on the subscriber registry). One `supervise`
+  now covers both tasks: panic or cancellation takes readiness DOWN and exits
+  non-zero.
+- **`template` is validated instead of abandoned.** A template no renderer could
+  key on — empty, whitespace-only, or carrying a control character — used to reach
+  the `INSERT`. The NUL case failed there on a SQLSTATE class `22` and was recorded
+  as a `storage_rejected` accident; the others were stored as unrenderable
+  notifications. Both are now refused up front with a fifth stable reason code,
+  `template_rejected`, closing the main poison vector by the front door. The rule
+  stays narrow — any non-empty, control-free string is still accepted (dots,
+  accents, CJK, surrounding whitespace), because the allowed-template *list* is
+  per-project configuration, not a service rule.
+- **A replayed `notifierMarkAsRead` no longer re-announces the read.** The
+  mutation emitted `NotificationsRead` on every call, including when the
+  notification was already read, so a client decrementing its unread badge per
+  announcement drifted negative. The transition is now detected in one statement
+  and the fact is emitted only when the state actually changed; the replay is
+  still acked (idempotent, not an error) and `read_at` never moves.
+- **A stale pagination cursor is refused instead of answered with an empty page.**
+  Paging from a notification that has since been deleted matched no anchor row and
+  returned zero nodes — which reads to a client as "you have reached the end",
+  silently hiding everything after it. It now returns `NOT_FOUND`; the recovery is
+  to restart from the first page.
+
+### Changed
+
+- The unbounded-hold bar in `s07c` sits at three times the retired five-delivery
+  budget instead of just above it. At six redeliveries it coincided with the old
+  ceiling, so a *different* bounded budget reintroduced at, say, ten would have
+  satisfied it and the scenario would have gone green over the regression it
+  exists to catch.
+- The poison vehicle in `s20`/`s21` moved from an unstorable `template` to an
+  unstorable `payload` (a NUL inside the JSON, which `jsonb` refuses with SQLSTATE
+  22P05). Those scenarios are about a write **PostgreSQL** refuses; with the
+  template now refused up front by the service, the old vehicle no longer reached
+  the `INSERT` at all and would have quietly re-pointed them at the new refusal
+  path.
+- The undecodable-envelope ceiling is documented accurately. The previous note
+  claimed held frames fill the consumer's `max_ack_pending` (256) and freeze the
+  intake. They do not: `nak` is an explicit settlement, so a held frame is not
+  delivered-but-unsettled, and this loop never holds more than one unsettled
+  delivery. The real bound is arithmetic — N stuck envelopes cost N redeliveries
+  per second of loop turns and log volume, taxing throughput — and
+  `notifier_intake_undecodable_deliveries_total` rising against a flat
+  `..._dead_letters_total` is the condition to alert on. No behaviour changed; the
+  runbook did, because the old number would have sent an operator after the wrong
+  thing.
+
 - **A storage outage can no longer drop a delivery command.** The intake used to
   terminate a frame once `delivered_count` passed a fixed budget of five, so a
   Postgres outage lasting past the fifth redelivery silently destroyed the
@@ -170,6 +222,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dead-letter retention — 90 days, purged by the service** (operator decision).
+  The ledger is a diagnostic surface, not an archive: each row carries the
+  producer's command in full, so arbitrary — possibly personal — producer data
+  accumulated forever. A daily task deletes every row past
+  `DEAD_LETTER_RETENTION_DAYS` (90) and logs how many it removed, running through
+  the **ingest** role, never the owner; migration `0002` grants that role its
+  `DELETE`. A failed pass is logged as an error and retried at the next tick, and
+  deliberately does **not** take readiness DOWN — housekeeping stopping is not the
+  process failing to serve — while the task itself is watched, so its death is
+  loud. `notifier_intake_dead_letters_total` is the alertable counter: it counts
+  committed ledger rows only, so a replayed frame hitting the `ON CONFLICT` no-op
+  never inflates it.
+- e2e `scenarios_intake::s32` — the retention edge, asserted a day either side of
+  the 90-day window, plus the failure posture: with the `DELETE` grant revoked the
+  pass says so in the logs, `/readyz` stays UP and the read surface keeps serving.
+- e2e `scenarios_refusal::s31` — an unusable `template` (empty, NUL) is on the
+  ledger under `template_rejected`, with no SQLSTATE, nothing stored and nothing
+  announced. The storage-refusal series stays flat: the refusal is the service's,
+  not the database's.
+- The suite's silence proofs are now proofs. Nine `expect_silence` assertions rode
+  sessions never shown to be live — a stream the service never registered is
+  silent for the wrong reason, and those assertions would have held with the
+  isolation they defend removed. Each one now proves its session first, the way
+  s25 already did: where the scenario already sends the watched recipient a
+  notification, that push is the proof (the seed simply moves after the
+  subscribe); everywhere else a `subscribe_live` warm-up publishes one real
+  delivery, reads it off the stream, deletes it through the recipient's own
+  mutation and reads that too — handing the inbox back exactly as it found it, so
+  the scenarios that count that very inbox can use it.
+- e2e `scenarios_surface::s26` — the list is newest-first, asserted as a sequence
+  and across a cursor walk. Every other scenario sorts before comparing, so
+  inverting the `ORDER BY` stayed green everywhere; this is the only place the
+  spec's ordering clause is pinned.
+- e2e `scenarios_surface::s27` — marking read twice: one fact, one `read_at`, an
+  acked replay, and never a return to unread.
+- e2e `scenarios_surface::s28` — a cursor whose notification was deleted is
+  refused by code, and restarting from the top shows what it would have hidden.
+- e2e `scenarios_surface::s29` — row-level security proven **alone**: reads and a
+  blanket `UPDATE` issued as the RLS-subject app role with **no** recipient
+  predicate at all, with no context, the wrong identity, and the right one. The
+  application predicates added earlier could otherwise mask a broken policy.
+- e2e `scenarios_surface::s30` — the published edge as a closed world: the exact
+  set of query, mutation and subscription root fields, no create-shaped verb
+  anywhere, every field BC-prefixed. It proves by absence that a client can never
+  make a notification exist.
+- e2e `scenarios_impersonation::s19b` — both bulk mutations under impersonation.
 - Migration `0002_dead_letters.sql` — the abandonment ledger for terminated
   delivery commands (RLS forced, ingest-write policy only, unique on
   `command_id`).
