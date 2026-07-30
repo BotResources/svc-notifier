@@ -93,6 +93,12 @@ async fn s19_impersonated_mutations_act_on_the_acting_admins_own_notifications()
     let to_delete = seed_one(&ctx, admin, "admin_disposable").await;
     let theirs = seed_one(&ctx, impersonated, "impersonated_own").await;
 
+    // given: both live streams are open before anything is mutated — the
+    // acting administrator's own, and the impersonated user's. A unitary
+    // mutation must be announced on the first and be inaudible on the second.
+    let mut acting_session = ctx.instance.subscribe(&acting).await;
+    let mut impersonated_session = ctx.instance.subscribe(&make_passport(impersonated)).await;
+
     // when: the administrator marks their own notification as read while
     // impersonating
     let ack = ctx
@@ -100,6 +106,18 @@ async fn s19_impersonated_mutations_act_on_the_acting_admins_own_notifications()
         .graphql(&acting, MARK_AS_READ, json!({"id": mine.to_string()}))
         .await;
     verdict::expect_ack(&ack, "notifierMarkAsRead on the acting admin's own");
+
+    // then: the acting session is told, with the acting human's own id
+    let raw = acting_session
+        .expect_event("NotificationsRead for the acting admin", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
+    assert_eq!(event["__typename"], "NotificationsRead");
+    assert_eq!(
+        event["ids"],
+        json!([mine.to_string()]),
+        "the announcement carries the acting human's id, never the impersonated user's: {event}"
+    );
 
     // then: reaching for the impersonated user's notification is a not-found —
     // the application layer and the RLS context resolve the same identity
@@ -128,6 +146,24 @@ async fn s19_impersonated_mutations_act_on_the_acting_admins_own_notifications()
         "NOT_FOUND"
     );
 
+    // then: the delete is announced on the acting session, again with the
+    // acting human's own id
+    let raw = acting_session
+        .expect_event("NotificationsDeleted for the acting admin", SSE_TIMEOUT)
+        .await;
+    let event = notifier_event(&raw);
+    assert_eq!(event["__typename"], "NotificationsDeleted");
+    assert_eq!(event["ids"], json!([to_delete.to_string()]));
+
+    // then: the impersonated user's own session heard neither mutation — not
+    // the one that succeeded, not the one that was refused on their behalf
+    impersonated_session
+        .expect_silence(
+            "an impersonated user is never told about their impersonator's reading habits",
+            CONSUME_WAIT,
+        )
+        .await;
+
     // then: PG — the administrator's own rows moved, the impersonated user's
     // row is untouched
     let admin_rows = ctx.stack.rows_for(admin).await;
@@ -142,6 +178,25 @@ async fn s19_impersonated_mutations_act_on_the_acting_admins_own_notifications()
         impersonated_rows[0].read_at.is_none(),
         "nothing of theirs was marked read"
     );
+
+    // then: re-reading under the acting identity shows the new state — one
+    // notification left, read, and nothing owed to the badge
+    let listed = ctx.instance.graphql(&acting, LIST_QUERY, json!({})).await;
+    let nodes = listed["data"]["notifierNotifications"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no nodes in {listed}"));
+    assert_eq!(
+        nodes.len(),
+        1,
+        "only the read notification remains: {listed}"
+    );
+    assert_eq!(nodes[0]["id"], json!(mine.to_string()));
+    assert!(
+        nodes[0]["readAt"].is_string(),
+        "the query reflects the mark-as-read: {listed}"
+    );
+    let count = ctx.instance.graphql(&acting, UNREAD_QUERY, json!({})).await;
+    assert_eq!(ServiceInstance::unread_count(&count), 0);
 }
 
 #[tokio::test]

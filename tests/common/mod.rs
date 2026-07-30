@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use br_core_auth::{Passport, PassportBuilder};
+use br_core_auth::{Passport, PassportBuilder, PassportHeader};
 use br_core_integration::{Actor, EventMetadata, UserId};
 use br_notifier_contract::DeliverNotification;
 use br_notifier_publisher::NotifierPublisher;
@@ -21,6 +21,18 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 static PORT_COUNTER: OnceLock<AtomicU16> = OnceLock::new();
+
+// Ok(None) while the table does not exist yet (first run, before migrations);
+// Ok(Some(granted)) once it does.
+async fn ledger_insert_granted(pool: &PgPool) -> Result<Option<bool>, sqlx::Error> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT has_table_privilege('svc_notifier_ingest', 'dead_letters', 'INSERT')
+         WHERE to_regclass('dead_letters') IS NOT NULL",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| row.0))
+}
 
 fn next_port() -> u16 {
     PORT_COUNTER
@@ -50,21 +62,51 @@ pub const LEGACY_SUBJECT: &str = "notify.deliver";
 // log line without renaming this constant turns s07c green for the wrong reason.
 pub const STORAGE_HELD_LOG_MARKER: &str = "storage write failing, commands held for redelivery";
 
-// Mirrors `STORAGE_OUTAGE_ALERT_AFTER` in `src/intake.rs`: the number of
-// consecutive transient failures after which the intake reports /readyz DOWN.
-pub const STORAGE_OUTAGE_ALERT_AFTER: usize = 3;
-
-// Mirrors the two poison-path log messages in `src/intake.rs` (`triage`). Same
-// coupling rule as STORAGE_HELD_LOG_MARKER: rename there, rename here.
+// Mirrors the two poison-path log messages in `src/intake.rs` (`abandon`). Same
+// coupling rule as STORAGE_HELD_LOG_MARKER: rename there, rename here. Every
+// scenario asserting one of these is zero also asserts a sibling marker is
+// non-zero in the same run, so a renamed log line can never pass for silence.
 pub const DEAD_LETTER_RECORDED_LOG_MARKER: &str = "recorded as a dead letter and terminated";
 pub const DEAD_LETTER_REPEATED_LOG_MARKER: &str = "already on the ledger";
 pub const LEDGER_UNAVAILABLE_LOG_MARKER: &str = "dead-letter ledger unavailable";
 
-// The intake logs JetStream's own redelivery counter on every transient failure.
-// Reading the broker's counter out of the log is a stronger precondition than
-// counting our own log lines: the count comes from JetStream, not from the
-// service loop. The service logs JSON, so the field reads
-// `"delivered_count":"Some(N)"`.
+// Mirrors `NAK_DELAY` in `src/intake.rs`: the redelivery delay a held frame is
+// NAKed with. A frame the intake terminated never comes back, so waiting out
+// several of these cycles is how a scenario proves a `term()` from outside the
+// process — there is no other observable difference between "terminated" and
+// "not redelivered yet".
+pub const NAK_DELAY: Duration = Duration::from_secs(1);
+pub const TERM_OBSERVATION_WINDOW: Duration = Duration::from_secs(NAK_DELAY.as_secs() * 4);
+
+// The number of consecutive held redeliveries a scenario waits for before it
+// calls a storage outage observable. It mirrors no service constant — the
+// readiness escalation that used to own one was removed (operator decision) and
+// the condition now lives on `/metrics`, where the alerting threshold is a
+// deployment decision. This is the suite's own bar for "the gauge is rising".
+pub const OUTAGE_ALERT_THRESHOLD: usize = 3;
+
+// The intake metrics the operator alerts on (`/metrics`, Prometheus exposition).
+// Same coupling rule as the log markers: renaming one in `src/intake.rs` without
+// renaming it here silently retires an alert.
+pub const DEAD_LETTERS_TOTAL_METRIC: &str = "notifier_intake_dead_letters_total";
+pub const TRANSIENT_FAILURES_TOTAL_METRIC: &str = "notifier_intake_transient_failures_total";
+pub const CONSECUTIVE_TRANSIENT_FAILURES_METRIC: &str =
+    "notifier_intake_consecutive_transient_failures";
+
+// The stable dead-letter reason codes (`src/intake.rs`, `DeadLetterReason`).
+// The ledger's `reason` column is an operator contract: a runbook greps these.
+pub const REASON_RELATIVE_LINK_REJECTED: &str = "relative_link_rejected";
+pub const REASON_PAYLOAD_SHAPE_REJECTED: &str = "payload_shape_rejected";
+pub const REASON_NO_RECIPIENTS: &str = "no_recipients";
+pub const REASON_STORAGE_REJECTED: &str = "storage_rejected";
+
+// The intake logs JetStream's own redelivery counter on both settlement paths a
+// scenario cares about: a held frame (transient failure) and an abandoned one.
+// Reading the broker's counter out of the log beats counting our own log lines
+// in both directions — an outage scenario needs it to rise past any budget, and
+// a termination scenario needs it to stay at one, which is an absence stated as
+// a positive number and therefore immune to a renamed log line. The service logs
+// JSON, so the field reads `"delivered_count":"Some(N)"`.
 const DELIVERED_COUNT_FIELD: &str = "\"delivered_count\":\"Some(";
 
 pub struct TestStack {
@@ -133,6 +175,18 @@ impl TestStack {
             .execute(&owner_pool)
             .await
             .ok();
+        // …and verify the repair actually held. The GRANT above is best-effort
+        // (`.ok()`) because it runs before the very first migration has created
+        // the table; once the table exists, a silently-failed repair would let
+        // every ledger scenario pass for the wrong reason (nothing recorded,
+        // because nothing could be). Skipped while the table is still absent.
+        if let Ok(Some(granted)) = ledger_insert_granted(&owner_pool).await {
+            assert!(
+                granted,
+                "the ingest role must be able to write dead_letters before a scenario starts — \
+                 the self-healing GRANT did not take"
+            );
+        }
 
         let nats = FabricTestNats::start().await;
 
@@ -190,20 +244,6 @@ impl TestStack {
             .expect("publish the deliver command over the fabric");
     }
 
-    pub async fn publish_deliver_correlated(
-        &self,
-        command: &DeliverNotification,
-        correlation_id: Uuid,
-    ) {
-        NotifierPublisher::new(self.nats.fabric())
-            .deliver(
-                command,
-                EventMetadata::new(Actor::Human(UserId::from(Uuid::now_v7())), correlation_id),
-            )
-            .await
-            .expect("publish the deliver command over the fabric");
-    }
-
     // Publishes a deliver command under a caller-chosen envelope command_id, so a
     // scenario can replay the exact same frame (what a term() the broker never
     // registered looks like) instead of a fresh command. Still typed coordinates
@@ -212,15 +252,32 @@ impl TestStack {
         &self,
         command_id: Uuid,
         command: &DeliverNotification,
-        correlation_id: Uuid,
+        trace: Trace,
     ) {
+        self.publish_payload_envelope(
+            command_id,
+            &serde_json::to_value(command).expect("a typed command serializes"),
+            trace,
+        )
+        .await;
+    }
+
+    // The refused-payload vehicle. A producer bug does not arrive as a typed
+    // `DeliverNotification` — it arrives as a well-formed envelope carrying a
+    // payload the contract refuses (an out-of-domain link, a shape the contract
+    // does not describe, no recipient at all). `Fabric::publish_command` is
+    // generic over the payload, so a raw `serde_json::Value` rides the very same
+    // typed coordinates as a compliant command — no raw subject, no new harness
+    // affordance, and the frame is byte-for-byte what a misbehaving producer
+    // would put on the wire.
+    pub async fn publish_payload_envelope(&self, command_id: Uuid, payload: &Value, trace: Trace) {
         let envelope = IntegrationCommand::new(
             command_id,
             br_notifier_contract::deliver_command_type(),
             br_notifier_contract::DELIVER_VERSION,
             Utc::now(),
-            EventMetadata::new(Actor::Human(UserId::from(Uuid::now_v7())), correlation_id),
-            command.clone(),
+            trace.metadata(),
+            payload.clone(),
         );
         self.nats
             .fabric()
@@ -253,7 +310,7 @@ impl TestStack {
 
     pub async fn dead_letters(&self) -> Vec<DeadLetterRecord> {
         sqlx::query_as::<_, DeadLetterRecord>(
-            "SELECT id, command_id, source_event_id, recipient_ids, command, sqlstate,
+            "SELECT id, command_id, source_event_id, recipient_ids, command, reason, sqlstate,
                     correlation_id, causation_id, recorded_at
              FROM dead_letters ORDER BY recorded_at, id",
         )
@@ -388,6 +445,82 @@ impl ServiceInstance {
         SseSubscription::open(&self.base_url, passport, EVENTS_SUBSCRIPTION).await
     }
 
+    // The refusal counterpart of `subscribe`. A subscription the service refuses
+    // answers one SSE frame carrying a GraphQL error and then ends the stream —
+    // `SseSubscription` is a handle over a *live* stream and fails loud on an
+    // error frame, so the refusal verdict is read from the raw response instead.
+    // Returns the frame's payload, ready for `verdict::expect_code_shaped`.
+    pub async fn subscribe_refused(&self, passport: &Passport) -> Value {
+        // A refused subscription ends its stream; a subscription that was
+        // *accepted* would hold the connection open forever. The bounded read is
+        // therefore part of the assertion: a hang means the caller was let in.
+        let response = tokio::time::timeout(
+            SSE_TIMEOUT,
+            self.graphql.post_raw(
+                "/graphql",
+                &[
+                    ("X-Passport", passport.to_header().as_str()),
+                    ("Accept", "text/event-stream"),
+                ],
+                json!({ "query": EVENTS_SUBSCRIPTION }),
+            ),
+        )
+        .await;
+        let (status, body) = response.unwrap_or_else(|_| {
+            panic!("the subscription was not refused — the stream stayed open past {SSE_TIMEOUT:?}")
+        });
+        assert!(
+            status.is_success(),
+            "a refused subscription is a GraphQL verdict on an open stream, not a transport \
+             failure: {status} {body}"
+        );
+        let body = body.as_str().unwrap_or_default().to_string();
+        let frames: Vec<Value> = body
+            .split("\n\n")
+            .filter_map(|block| {
+                let data = block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:"))?
+                    .trim();
+                serde_json::from_str::<Value>(data).ok()
+            })
+            .collect();
+        assert_eq!(
+            frames.len(),
+            1,
+            "a refused subscription answers exactly one frame, then ends: {body}"
+        );
+        frames.into_iter().next().expect("one frame")
+    }
+
+    // Reads one sample out of the Prometheus exposition: the value of `name`
+    // whose label set contains every (key, value) in `labels`. None when the
+    // metric was never touched — an untouched counter is simply absent, which is
+    // itself an assertable fact.
+    pub async fn metric(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        let (_, body) = self.get("/metrics").await;
+        body.lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| {
+                let (head, value) = line.rsplit_once(' ')?;
+                let (metric, rendered_labels) = match head.split_once('{') {
+                    Some((metric, rest)) => (metric, rest.trim_end_matches('}')),
+                    None => (head, ""),
+                };
+                (metric == name).then_some((rendered_labels.to_string(), value.to_string()))
+            })
+            .find(|(rendered_labels, _)| {
+                labels
+                    .iter()
+                    .all(|(key, value)| rendered_labels.contains(&format!("{key}=\"{value}\"")))
+            })
+            .and_then(|(_, value)| value.parse().ok())
+    }
+
+    pub async fn metric_or_zero(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
+        self.metric(name, labels).await.unwrap_or(0.0)
+    }
+
     pub async fn get(&self, path: &str) -> (reqwest::StatusCode, String) {
         self.graphql.get_raw(path).await
     }
@@ -454,9 +587,12 @@ pub struct NotificationRecord {
 pub struct DeadLetterRecord {
     pub id: Uuid,
     pub command_id: Uuid,
-    pub source_event_id: Uuid,
+    // Nullable since migration 0003: a payload the contract refuses may carry no
+    // readable source_event_id, and the ledger row must land regardless.
+    pub source_event_id: Option<Uuid>,
     pub recipient_ids: Vec<Uuid>,
     pub command: Vec<u8>,
+    pub reason: String,
     pub sqlstate: Option<String>,
     pub correlation_id: Uuid,
     pub causation_id: Option<Uuid>,
@@ -466,6 +602,45 @@ pub struct DeadLetterRecord {
 impl DeadLetterRecord {
     pub fn command(&self) -> Value {
         serde_json::from_slice(&self.command).expect("the recorded command is the producer's JSON")
+    }
+}
+
+// The producer's causality triple, carried verbatim on the envelope metadata.
+// A dead-letter row claims to let an operator re-emit the command as it was, so
+// scenarios pin what the ledger recorded against what was published.
+#[derive(Debug, Clone, Copy)]
+pub struct Trace {
+    pub actor_id: Uuid,
+    pub correlation_id: Uuid,
+    pub causation_id: Option<Uuid>,
+}
+
+impl Trace {
+    pub fn caused_by(causation_id: Uuid) -> Self {
+        Self {
+            actor_id: Uuid::now_v7(),
+            correlation_id: Uuid::now_v7(),
+            causation_id: Some(causation_id),
+        }
+    }
+
+    pub fn fresh() -> Self {
+        Self {
+            actor_id: Uuid::now_v7(),
+            correlation_id: Uuid::now_v7(),
+            causation_id: None,
+        }
+    }
+
+    fn metadata(self) -> EventMetadata {
+        let metadata = EventMetadata::new(
+            Actor::Human(UserId::from(self.actor_id)),
+            self.correlation_id,
+        );
+        match self.causation_id {
+            Some(causation_id) => metadata.with_causation(causation_id),
+            None => metadata,
+        }
     }
 }
 

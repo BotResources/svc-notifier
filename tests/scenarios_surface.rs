@@ -170,6 +170,122 @@ async fn s10_mark_all_as_read_emits_exactly_one_bulk_event() {
     );
 }
 
+// One more notification than fits in a single announcement. The service caps a
+// bulk fact at SIGNAL_ID_CHUNK (150) ids per PostgreSQL NOTIFY payload — above
+// 8000 bytes PostgreSQL raises inside the write transaction and would abort the
+// whole mutation — so a bulk read of 151 notifications must arrive as several
+// announcements. The contract a client folds against is therefore the UNION of
+// the ids announced, not "exactly one event": complete, without duplicates, and
+// still atomic with the write.
+const BEYOND_ONE_ANNOUNCEMENT: usize = 151;
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s10b_mark_all_as_read_past_the_chunk_bound_announces_every_id_exactly_once() {
+    let ctx = TestContext::setup().await;
+    let recipient = Uuid::now_v7();
+    let passport = make_passport(recipient);
+
+    // given: more unread notifications than one announcement can carry, every
+    // one of them delivered through the real intake — one deliver command per
+    // business fact, exactly as a producer would emit them
+    for index in 0..BEYOND_ONE_ANNOUNCEMENT {
+        ctx.stack
+            .publish_deliver(&deliver(
+                &[recipient],
+                "chunk_bound",
+                json!({"index": index}),
+            ))
+            .await;
+    }
+    assert!(
+        ctx.stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                ctx.stack.rows_for(recipient).await.len() == BEYOND_ONE_ANNOUNCEMENT
+            })
+            .await,
+        "the intake must have written all {BEYOND_ONE_ANNOUNCEMENT} notifications, got {}",
+        ctx.stack.rows_for(recipient).await.len()
+    );
+    let mut expected: Vec<String> = ctx
+        .stack
+        .rows_for(recipient)
+        .await
+        .iter()
+        .map(|row| row.id.to_string())
+        .collect();
+    expected.sort();
+
+    let mut session = ctx.instance.subscribe(&passport).await;
+
+    // when: the recipient marks everything read in one gesture
+    let ack = ctx
+        .instance
+        .graphql(&passport, "mutation { notifierMarkAllAsRead }", json!({}))
+        .await;
+    verdict::expect_ack(&ack, "notifierMarkAllAsRead past the chunk bound");
+
+    // then: collecting every announcement until the stream falls silent yields
+    // each affected id exactly once — a client folding by id lands on the same
+    // state whatever the chunking does
+    let mut announced: Vec<String> = Vec::new();
+    let mut announcements = 0;
+    while let Some(raw) = session.next_event(SSE_TIMEOUT).await {
+        announcements += 1;
+        let event = notifier_event(&raw);
+        assert_eq!(
+            event["__typename"], "NotificationsRead",
+            "only read facts follow a mark-all-as-read: {event}"
+        );
+        assert!(
+            event["readAt"].is_string(),
+            "every chunk carries the read timestamp, so no client must re-read to learn it: {event}"
+        );
+        announced.extend(
+            event["ids"]
+                .as_array()
+                .unwrap_or_else(|| panic!("ids must be a list: {event}"))
+                .iter()
+                .map(|id| id.as_str().unwrap().to_string()),
+        );
+    }
+    assert!(
+        announcements > 1,
+        "past the chunk bound the fact travels as several announcements — one 151-id \
+         payload would exceed the NOTIFY limit and abort the mutation; got {announcements} \
+         announcement(s) for {} ids",
+        announced.len()
+    );
+    let mut folded = announced.clone();
+    folded.sort();
+    folded.dedup();
+    assert_eq!(
+        folded.len(),
+        announced.len(),
+        "no id is announced twice across the chunks"
+    );
+    assert_eq!(
+        folded, expected,
+        "the union of the announcements is exactly the set of affected notifications — \
+         nothing missing, nothing invented"
+    );
+
+    // then: storage and the badge agree with what was announced
+    assert!(
+        ctx.stack
+            .rows_for(recipient)
+            .await
+            .iter()
+            .all(|row| row.read_at.is_some()),
+        "every row is read — the chunking is inside one transaction, not several"
+    );
+    let count = ctx
+        .instance
+        .graphql(&passport, UNREAD_QUERY, json!({}))
+        .await;
+    assert_eq!(ServiceInstance::unread_count(&count), 0);
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn s11_bulk_delete_skips_foreign_ids_and_emits_only_owned_ones() {

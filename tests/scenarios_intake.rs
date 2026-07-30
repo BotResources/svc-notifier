@@ -2,6 +2,7 @@ mod common;
 
 use br_notifier_contract::{DeliverNotification, RelativeLink};
 use br_test_harness::BareFabricNats;
+use chrono::Utc;
 use common::*;
 use serde_json::json;
 use uuid::Uuid;
@@ -301,6 +302,12 @@ async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_even
     let early = [Uuid::now_v7(), Uuid::now_v7()];
     let late = [Uuid::now_v7()];
 
+    // given: a recipient named by the first command has a session open before
+    // anything is published — an abandonment must be silent on every channel a
+    // recipient can observe, not merely absent from the table
+    let abandoned_recipient = make_passport(early[0]);
+    let mut abandoned_session = ctx.instance.subscribe(&abandoned_recipient).await;
+
     // given: one source event fanned out as two distinct deliver commands — the
     // chunked / late-added-recipient shape s14 already exercises. The business
     // dedup key is (source_event, recipient), so these are two legitimate
@@ -312,12 +319,13 @@ async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_even
     second.source_event_id = source_event_id;
 
     let first_command_id = Uuid::now_v7();
-    let correlation_id = Uuid::now_v7();
+    let causing_event_id = Uuid::now_v7();
+    let trace = Trace::caused_by(causing_event_id);
     ctx.stack
-        .publish_deliver_envelope(first_command_id, &first, correlation_id)
+        .publish_deliver_envelope(first_command_id, &first, trace)
         .await;
     ctx.stack
-        .publish_deliver_envelope(Uuid::now_v7(), &second, Uuid::now_v7())
+        .publish_deliver_envelope(Uuid::now_v7(), &second, Trace::fresh())
         .await;
 
     // then: TWO audit lines — deduplicating on source_event_id alone would have
@@ -340,13 +348,14 @@ async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_even
         .iter()
         .find(|row| row.command_id != first_command_id)
         .expect("the second command has its own line");
-    assert_eq!(recorded.source_event_id, source_event_id);
-    assert_eq!(other.source_event_id, source_event_id);
+    assert_eq!(recorded.source_event_id, Some(source_event_id));
+    assert_eq!(other.source_event_id, Some(source_event_id));
     assert_eq!(
         recorded.recipient_ids, early,
         "each line names exactly the recipients its own command abandoned"
     );
     assert_eq!(other.recipient_ids, late);
+    assert_eq!(recorded.reason, REASON_STORAGE_REJECTED);
 
     // then: the trace is faithful — the whole command round-trips, not just the id
     assert_eq!(
@@ -354,7 +363,25 @@ async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_even
         serde_json::to_value(&first).unwrap(),
         "an operator must be able to re-emit the command verbatim"
     );
-    assert_eq!(recorded.correlation_id, correlation_id);
+    // then: the causality the producer published is kept whole — re-emitting the
+    // command verbatim is only half the promise if the chain it belonged to is
+    // lost, and the row must say when the abandonment happened
+    assert_eq!(recorded.correlation_id, trace.correlation_id);
+    assert_eq!(
+        recorded.causation_id,
+        Some(causing_event_id),
+        "the event that caused the command is part of the trace"
+    );
+    assert_eq!(
+        other.causation_id, None,
+        "a command with no declared cause records none, rather than inventing one"
+    );
+    let age = Utc::now() - recorded.recorded_at;
+    assert!(
+        age >= chrono::Duration::zero() && age < chrono::Duration::minutes(5),
+        "recorded_at must be the moment of the abandonment, got {} (age {age})",
+        recorded.recorded_at
+    );
     assert_eq!(
         recorded.sqlstate.as_deref().map(|code| &code[..2]),
         Some("22"),
@@ -370,9 +397,56 @@ async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_even
         "two commands, two terminations — no frame is being retried"
     );
 
+    // then: the termination is real, not merely "not redelivered yet". A frame
+    // the broker still holds comes back every NAK_DELAY; after several such
+    // cycles neither has. The zero below is discriminant twice over: the same
+    // marker is asserted non-zero further down, once the replay arrives, and
+    // JetStream's own delivery counter — a positive number, not an absence —
+    // says each frame was settled on its first delivery.
+    tokio::time::sleep(TERM_OBSERVATION_WINDOW).await;
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER),
+        0,
+        "a terminated frame never re-enters triage; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(
+        ctx.instance.max_delivered_count(),
+        1,
+        "both frames were settled on their first delivery; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
+        2,
+        "still exactly two abandonments after several redelivery cycles"
+    );
+    assert_eq!(ctx.stack.dead_letters().await.len(), 2);
+
+    // then: the recipients the abandoned command named observe nothing at all —
+    // no push, no row in their list, no unread badge. An abandonment is silent
+    // on the recipient's side and loud on the operator's.
+    abandoned_session
+        .expect_silence("an abandoned command reaches no recipient", CONSUME_WAIT)
+        .await;
+    let listed = ctx
+        .instance
+        .graphql(&abandoned_recipient, LIST_QUERY, json!({}))
+        .await;
+    assert_eq!(
+        listed["data"]["notifierNotifications"]["nodes"],
+        json!([]),
+        "an abandoned command leaves no notification behind: {listed}"
+    );
+    let count = ctx
+        .instance
+        .graphql(&abandoned_recipient, UNREAD_QUERY, json!({}))
+        .await;
+    assert_eq!(ServiceInstance::unread_count(&count), 0);
+
     // when: the very same frame comes back (a term() the broker never registered)
     ctx.stack
-        .publish_deliver_envelope(first_command_id, &first, correlation_id)
+        .publish_deliver_envelope(first_command_id, &first, trace)
         .await;
     tokio::time::sleep(CONSUME_WAIT).await;
 
@@ -425,6 +499,16 @@ async fn s21_an_unwritable_ledger_holds_the_command_instead_of_terminating_it() 
         "nothing may be terminated while it cannot be traced"
     );
 
+    // then: the hold is on /metrics too — an unwritable ledger degrades the
+    // class to transient, which is exactly the condition operators alert on
+    assert!(
+        ctx.instance
+            .metric_or_zero(CONSECUTIVE_TRANSIENT_FAILURES_METRIC, &[])
+            .await
+            >= 1.0,
+        "an untraceable abandonment must be visible as a held command"
+    );
+
     // when: the ledger comes back
     ctx.stack.restore_ledger_writes().await;
 
@@ -439,13 +523,29 @@ async fn s21_an_unwritable_ledger_holds_the_command_instead_of_terminating_it() 
         ctx.instance.logs()
     );
     let ledger = ctx.stack.dead_letters().await;
-    assert_eq!(ledger[0].source_event_id, command.source_event_id);
+    assert_eq!(ledger[0].source_event_id, Some(command.source_event_id));
     assert_eq!(ledger[0].recipient_ids, recipient);
+    assert_eq!(ledger[0].reason, REASON_STORAGE_REJECTED);
 
     tokio::time::sleep(CONSUME_WAIT).await;
     assert_eq!(
         ctx.stack.dead_letters().await.len(),
         1,
         "once traced, the frame is terminated, not redelivered forever"
+    );
+    // then: the marker that had to be silent while the ledger was down now
+    // fires exactly once — the earlier `== 0` is a real absence, not a typo in
+    // a log message nothing would notice
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
+        1,
+        "the abandonment is recorded once, after the ledger came back"
+    );
+    assert_eq!(
+        ctx.instance
+            .metric_or_zero(CONSECUTIVE_TRANSIENT_FAILURES_METRIC, &[])
+            .await,
+        0.0,
+        "storage answered — it refused the row, which ends the hold"
     );
 }
