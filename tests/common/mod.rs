@@ -23,10 +23,13 @@ use uuid::Uuid;
 static PORT_COUNTER: OnceLock<AtomicU16> = OnceLock::new();
 
 // Ok(None) while the table does not exist yet (first run, before migrations);
-// Ok(Some(granted)) once it does.
-async fn ledger_insert_granted(pool: &PgPool) -> Result<Option<bool>, sqlx::Error> {
+// Ok(Some(granted)) once it does. Both grants at once: the ingest role writes the
+// ledger and is also the role the retention pass deletes through, and a scenario
+// that revoked either one must not leave it revoked for the next.
+async fn ledger_grants_held(pool: &PgPool) -> Result<Option<bool>, sqlx::Error> {
     let row: Option<(bool,)> = sqlx::query_as(
         "SELECT has_table_privilege('svc_notifier_ingest', 'dead_letters', 'INSERT')
+            AND has_table_privilege('svc_notifier_ingest', 'dead_letters', 'DELETE')
          WHERE to_regclass('dead_letters') IS NOT NULL",
     )
     .fetch_optional(pool)
@@ -69,6 +72,12 @@ pub const DEAD_LETTER_RECORDED_LOG_MARKER: &str = "recorded as a dead letter and
 pub const DEAD_LETTER_REPEATED_LOG_MARKER: &str = "already on the ledger";
 pub const LEDGER_UNAVAILABLE_LOG_MARKER: &str = "dead-letter ledger unavailable";
 
+// Mirrors the retention pass's failure log in `src/intake.rs`
+// (`purge_dead_letters`). The pass logs its successful passes at INFO, which the
+// fixture's `RUST_LOG=warn` hides on purpose — a scenario reads a successful
+// purge off the table, and only its failure off the logs.
+pub const RETENTION_FAILED_LOG_MARKER: &str = "dead-letter retention pass failed";
+
 // Mirrors `NAK_DELAY` in `src/intake.rs`: the redelivery delay a held frame is
 // NAKed with. A frame the intake terminated never comes back, so waiting out
 // several of these cycles is how a scenario proves a `term()` from outside the
@@ -102,6 +111,7 @@ pub const REASON_RELATIVE_LINK_REJECTED: &str = "relative_link_rejected";
 pub const REASON_PAYLOAD_SHAPE_REJECTED: &str = "payload_shape_rejected";
 pub const REASON_NO_RECIPIENTS: &str = "no_recipients";
 pub const REASON_STORAGE_REJECTED: &str = "storage_rejected";
+pub const REASON_TEMPLATE_REJECTED: &str = "template_rejected";
 
 // The intake logs JetStream's own redelivery counter on both settlement paths a
 // scenario cares about: a held frame (transient failure) and an abandoned one.
@@ -174,7 +184,7 @@ impl TestStack {
         // it here — idempotently, before every scenario — makes the fixture
         // self-healing rather than trusting an unwind. It is a no-op on a fresh
         // database, where the migration issues the grant itself.
-        sqlx::query("GRANT INSERT ON dead_letters TO svc_notifier_ingest")
+        sqlx::query("GRANT INSERT, DELETE ON dead_letters TO svc_notifier_ingest")
             .execute(&owner_pool)
             .await
             .ok();
@@ -183,7 +193,7 @@ impl TestStack {
         // the table; once the table exists, a silently-failed repair would let
         // every ledger scenario pass for the wrong reason (nothing recorded,
         // because nothing could be). Skipped while the table is still absent.
-        match ledger_insert_granted(&owner_pool).await {
+        match ledger_grants_held(&owner_pool).await {
             Ok(Some(granted)) => assert!(
                 granted,
                 "the ingest role must be able to write dead_letters before a scenario starts — \
@@ -333,6 +343,67 @@ impl TestStack {
         .expect("failed to read dead letters (assertion connection)")
     }
 
+    // A connection as the service's own RLS-subject runtime role — the role the
+    // GraphQL edge uses. The owner pool every other assertion uses carries
+    // BYPASSRLS, so it can never observe a policy: reading as the app role is the
+    // only way to prove the database-layer barrier holds on its own, with no
+    // application predicate in the query at all.
+    pub async fn app_role_pool(&self) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&self.app_url)
+            .await
+            .expect("failed to connect the app-role (RLS-subject) pool")
+    }
+
+    // A ledger row with a chosen age, written through the owner (BYPASSRLS)
+    // connection. The retention pass is about rows older than its window, and no
+    // producer can publish into the past — the age has to be planted.
+    pub async fn record_dead_letter_aged(&self, days_old: i32) -> Uuid {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO dead_letters
+                 (id, command_id, source_event_id, recipient_ids, command, reason,
+                  correlation_id, actor_kind, actor_id, recorded_at)
+             VALUES ($1, $2, $3, ARRAY[$4]::uuid[], $5, 'storage_rejected', $6, 'human', $7,
+                     now() - make_interval(days => $8))",
+        )
+        .bind(id)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(serde_json::to_vec(&json!({"aged": days_old})).expect("a command serializes"))
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(days_old)
+        .execute(&self.owner_pool)
+        .await
+        .expect("failed to plant an aged dead letter");
+        id
+    }
+
+    pub async fn revoke_ledger_purges(&self) {
+        sqlx::query("REVOKE DELETE ON dead_letters FROM svc_notifier_ingest")
+            .execute(&self.owner_pool)
+            .await
+            .expect("failed to revoke the ledger DELETE grant");
+    }
+
+    pub async fn restore_ledger_purges(&self) {
+        sqlx::query("GRANT DELETE ON dead_letters TO svc_notifier_ingest")
+            .execute(&self.owner_pool)
+            .await
+            .expect("failed to restore the ledger DELETE grant");
+    }
+
+    pub async fn dead_letter_ids(&self) -> Vec<Uuid> {
+        self.dead_letters()
+            .await
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
     pub async fn revoke_ledger_writes(&self) {
         sqlx::query("REVOKE INSERT ON dead_letters FROM svc_notifier_ingest")
             .execute(&self.owner_pool)
@@ -396,6 +467,62 @@ pub async fn seed_one(ctx: &TestContext, recipient: Uuid, template: &str) -> Uui
         .find(|row| row.template == template)
         .expect("seeded row must exist")
         .id
+}
+
+// The warm-up a liveness proof rides on. It never outlives `subscribe_live`, so
+// it can never be mistaken for a notification a scenario put there itself.
+const LIVENESS_WARM_UP_TEMPLATE: &str = "liveness_warm_up";
+
+// A session, plus the proof that the service really took it into the fan-out —
+// the step every `expect_silence` needs: a stream the service never registered is
+// silent for the wrong reason, and that assertion would keep holding with the
+// isolation it defends removed.
+//
+// It generalises s25, which proves its starved session live by serving it one
+// real delivery before starving it. Here the warm-up is a full round trip —
+// published through the real intake, read off the stream, then deleted through
+// the recipient's own mutation and read off the stream again — so the proof costs
+// two facts and hands the inbox back exactly as it found it. That is what lets
+// the scenarios which count that very inbox (row count, list, unread badge) use
+// it. Where a scenario already sends the watched recipient a notification of its
+// own, it proves liveness with that one instead and never calls this.
+pub async fn subscribe_live(ctx: &TestContext, recipient: Uuid) -> SseSubscription {
+    let passport = make_passport(recipient);
+    let inbox_before = ctx.stack.rows_for(recipient).await.len();
+    let mut session = ctx.instance.subscribe(&passport).await;
+
+    let warm_up = seed_one(ctx, recipient, LIVENESS_WARM_UP_TEMPLATE).await;
+    let added = session
+        .expect_event(
+            "the session is live before its silence is asserted",
+            RECOVERY_TIMEOUT,
+        )
+        .await;
+    assert_eq!(
+        notifier_event(&added)["notification"]["id"],
+        json!(warm_up.to_string()),
+        "the warm-up must reach this very session, or it proves nothing: {added}"
+    );
+
+    let ack = ctx
+        .instance
+        .graphql(&passport, DELETE_ONE, json!({"id": warm_up.to_string()}))
+        .await;
+    br_test_harness::verdict::expect_ack(&ack, "withdrawing the liveness warm-up");
+    let withdrawn = session
+        .expect_event("the warm-up leaves the inbox as it found it", SSE_TIMEOUT)
+        .await;
+    assert_eq!(
+        notifier_event(&withdrawn)["ids"],
+        json!([warm_up.to_string()]),
+        "the withdrawal is the second half of the proof: {withdrawn}"
+    );
+    assert_eq!(
+        ctx.stack.rows_for(recipient).await.len(),
+        inbox_before,
+        "the liveness proof must leave no trace in the inbox the scenario is about to count"
+    );
+    session
 }
 
 pub async fn spawn_against_bare_broker(nats_url: &str) -> BareBootResult {
@@ -741,6 +868,10 @@ pub const LIST_QUERY: &str = r#"query {
 }"#;
 
 pub const UNREAD_QUERY: &str = "{ notifierUnreadCount }";
+
+pub const MARK_AS_READ: &str = "mutation($id: ID!) { notifierMarkAsRead(notificationId: $id) }";
+pub const DELETE_ONE: &str =
+    "mutation($id: ID!) { notifierDeleteNotification(notificationId: $id) }";
 
 // The same list query, cursor-driven. `LIST_QUERY` takes the default page (20)
 // and is the right shape for a scenario with a handful of notifications; an

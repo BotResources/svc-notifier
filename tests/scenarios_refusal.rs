@@ -67,7 +67,7 @@ async fn s22_an_out_of_domain_link_refuses_the_whole_request_and_leaves_a_trace(
     // published — a refusal must be invisible to them on every channel, and an
     // "absent" push is only proven by a session that was there to hear it
     let recipient_passport = make_passport(recipients[0]);
-    let mut session = ctx.instance.subscribe(&recipient_passport).await;
+    let mut session = subscribe_live(&ctx, recipients[0]).await;
 
     // when: a producer publishes a well-formed deliver envelope whose link
     // leaves the product
@@ -231,7 +231,7 @@ async fn s23_a_payload_the_contract_does_not_describe_is_recorded_with_whatever_
     // given: a session for a recipient named by a malformed command — the ids
     // are readable even though the command as a whole is not
     let recipient_passport = make_passport(unreadable_recipient);
-    let mut session = ctx.instance.subscribe(&recipient_passport).await;
+    let mut session = subscribe_live(&ctx, unreadable_recipient).await;
 
     // when: two payloads the contract does not describe are published — one
     // missing a mandatory field entirely, one carrying a wrong-typed field.
@@ -394,7 +394,7 @@ async fn s24_a_command_naming_nobody_is_a_producer_bug_on_the_ledger_not_a_silen
     // given: a session belonging to nobody in particular — a recipient-less
     // command must not become a broadcast either
     let bystander_passport = make_passport(bystander);
-    let mut session = ctx.instance.subscribe(&bystander_passport).await;
+    let mut session = subscribe_live(&ctx, bystander).await;
 
     // when: a producer publishes a well-shaped command that names no recipient
     let source_event_id = Uuid::now_v7();
@@ -505,6 +505,20 @@ async fn s24_a_command_naming_nobody_is_a_producer_bug_on_the_ledger_not_a_silen
         "the replay is logged as already-ledgered, not as a fresh abandonment; logs:\n{}",
         ctx.instance.logs()
     );
+    // then: and the operator's counter did not move either. It counts *committed*
+    // ledger rows, never settlements: a frame replayed a hundred times is one
+    // abandonment, and an alert built on this counter must read a rate of new
+    // dead letters, not of redeliveries.
+    assert_eq!(
+        ctx.instance
+            .metric_or_zero(
+                DEAD_LETTERS_TOTAL_METRIC,
+                &[("reason", REASON_NO_RECIPIENTS)]
+            )
+            .await,
+        1.0,
+        "the no-op on the unique index counts nothing"
+    );
     assert_eq!(ctx.stack.count_rows().await, 0);
     session
         .expect_silence("a replayed refusal is still a refusal", CONSUME_WAIT)
@@ -524,7 +538,7 @@ async fn s21b_a_refused_payload_is_held_while_the_ledger_is_unwritable() {
     // on a log line alone.
     ctx.stack.revoke_ledger_writes().await;
     let recipient_passport = make_passport(recipient);
-    let mut session = ctx.instance.subscribe(&recipient_passport).await;
+    let mut session = subscribe_live(&ctx, recipient).await;
 
     let source_event_id = Uuid::now_v7();
     let payload = out_of_domain_link_payload(source_event_id, &[recipient]);
@@ -649,6 +663,117 @@ async fn s21b_a_refused_payload_is_held_while_the_ledger_is_unwritable() {
             CONSUME_WAIT,
         )
         .await;
+    let count = ctx
+        .instance
+        .graphql(&recipient_passport, UNREAD_QUERY, json!({}))
+        .await;
+    assert_eq!(ServiceInstance::unread_count(&count), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s31_a_template_no_renderer_could_key_on_is_refused_by_name_not_by_sqlstate() {
+    let ctx = TestContext::setup().await;
+    let recipient = Uuid::now_v7();
+
+    // given: the named recipient is listening, on a session proven live
+    let recipient_passport = make_passport(recipient);
+    let mut session = subscribe_live(&ctx, recipient).await;
+
+    // when: a producer publishes commands whose `template` is unusable — one
+    // empty, one carrying the NUL PostgreSQL itself refuses. Before the intake
+    // validated it, the second reached the INSERT and was abandoned as a storage
+    // accident (`storage_rejected`, SQLSTATE 22021) and the first was stored as a
+    // notification no renderer could key on.
+    let unusable = [
+        (Uuid::now_v7(), "", "the empty template"),
+        (Uuid::now_v7(), "poison\u{0}template", "a NUL template"),
+    ];
+    for (command_id, template, what) in unusable {
+        let payload = json!({
+            "source_event_id": Uuid::now_v7(),
+            "recipient_ids": [recipient],
+            "template": template,
+            "payload": {"why": what},
+        });
+        ctx.stack
+            .publish_payload_envelope(command_id, &payload, Trace::fresh())
+            .await;
+    }
+
+    // then: both are on the ledger under the fifth stable reason — a named
+    // refusal decided before any write, not a SQLSTATE the operator has to read
+    // backwards
+    assert!(
+        ctx.stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                ctx.stack.dead_letters().await.len() == 2
+            })
+            .await,
+        "an unusable template must be recorded, never stored and never dropped; logs:\n{}",
+        ctx.instance.logs()
+    );
+    let ledger = ctx.stack.dead_letters().await;
+    for (command_id, _, what) in unusable {
+        let recorded = ledger
+            .iter()
+            .find(|row| row.command_id == command_id)
+            .unwrap_or_else(|| panic!("{what} has its own audit line"));
+        assert_eq!(
+            recorded.reason, REASON_TEMPLATE_REJECTED,
+            "{what} is refused by name, not as a storage accident"
+        );
+        assert_eq!(
+            recorded.sqlstate, None,
+            "{what}: no database refused anything — the intake did, before the write"
+        );
+        assert_eq!(
+            recorded.recipient_ids,
+            vec![recipient],
+            "{what}: the row names the recipient the command would have reached"
+        );
+    }
+
+    // then: the operator counts them under that reason, and nothing was counted
+    // as a storage refusal
+    assert_eq!(
+        ctx.instance
+            .metric_or_zero(
+                DEAD_LETTERS_TOTAL_METRIC,
+                &[("reason", REASON_TEMPLATE_REJECTED)]
+            )
+            .await,
+        2.0
+    );
+    assert_eq!(
+        ctx.instance
+            .metric_or_zero(
+                DEAD_LETTERS_TOTAL_METRIC,
+                &[("reason", REASON_STORAGE_REJECTED)]
+            )
+            .await,
+        0.0,
+        "the refusal is decided in the service, so the storage-refusal series never moves"
+    );
+
+    // then: nothing was stored, and the recipient learned nothing on any channel
+    assert_eq!(
+        ctx.stack.count_rows().await,
+        0,
+        "no notification is created"
+    );
+    session
+        .expect_silence("an unusable template reaches no recipient", CONSUME_WAIT)
+        .await;
+    let listed = ctx
+        .instance
+        .graphql(&recipient_passport, LIST_QUERY, json!({}))
+        .await;
+    assert_eq!(
+        listed["data"]["notifierNotifications"]["nodes"],
+        json!([]),
+        "a refused template must not surface as a blank notification: {listed}"
+    );
     let count = ctx
         .instance
         .graphql(&recipient_passport, UNREAD_QUERY, json!({}))

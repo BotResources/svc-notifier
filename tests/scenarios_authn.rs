@@ -158,10 +158,22 @@ async fn an_ordinary_human_reaching_for_another_humans_notification_is_refused_b
     let intruder_passport = make_passport(intruder);
     let target_passport = make_passport(target);
 
-    // given: the target owns a notification — created through the real intake,
-    // never seeded — and is listening on their own session
-    let targeted = seed_one(&ctx, target, "not_yours").await;
+    // given: the target is listening on their own session, and the notification
+    // the intruder will reach for lands *after* it opens — created through the
+    // real intake, never seeded. Serving it is what proves the session is in the
+    // fan-out at all: a stream the service never registered would be silent below
+    // for the wrong reason, and would stay silent with the isolation this
+    // scenario defends removed.
     let mut target_session = ctx.instance.subscribe(&target_passport).await;
+    let targeted = seed_one(&ctx, target, "not_yours").await;
+    let landed = target_session
+        .expect_event("the target's session is live", RECOVERY_TIMEOUT)
+        .await;
+    assert_eq!(
+        notifier_event(&landed)["notification"]["id"],
+        json!(targeted.to_string()),
+        "the session must carry the target's own notification: {landed}"
+    );
 
     // when: an ordinary human aims the unitary mutations at someone else's id,
     // and at an id that is not an id at all. Every unitary door, both shapes:

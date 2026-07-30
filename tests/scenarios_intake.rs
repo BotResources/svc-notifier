@@ -285,13 +285,17 @@ async fn s15_service_fails_loud_when_the_command_stream_is_absent() {
 }
 
 // A command a compliant producer can emit and the contract accepts, but that
-// PostgreSQL can never store: a NUL character is not permitted in a text column
-// (SQLSTATE 22021), and no redelivery will ever change that.
+// PostgreSQL can never store: a NUL character inside the `payload` is not
+// representable in `jsonb` (SQLSTATE 22P05), and no redelivery will ever change
+// that. The NUL rides the payload and not the `template`, which is where it used
+// to sit: an unusable template is now refused up front as `template_rejected`
+// (s31), before any write — a different path from this one, which is about a
+// write PostgreSQL itself refuses.
 fn poison(recipients: &[Uuid], marker: &str) -> DeliverNotification {
     deliver(
         recipients,
-        &format!("poison\u{0}{marker}"),
-        json!({"why": "nul byte", "marker": marker}),
+        "meeting_scheduled",
+        json!({"why": "nul byte", "marker": format!("poison\u{0}{marker}")}),
     )
 }
 
@@ -306,7 +310,7 @@ async fn s20_the_ledger_keeps_one_line_per_abandoned_command_not_per_source_even
     // anything is published — an abandonment must be silent on every channel a
     // recipient can observe, not merely absent from the table
     let abandoned_recipient = make_passport(early[0]);
-    let mut abandoned_session = ctx.instance.subscribe(&abandoned_recipient).await;
+    let mut abandoned_session = subscribe_live(&ctx, early[0]).await;
 
     // given: one source event fanned out as two distinct deliver commands — the
     // chunked / late-added-recipient shape s14 already exercises. The business
@@ -548,4 +552,90 @@ async fn s21_an_unwritable_ledger_holds_the_command_instead_of_terminating_it() 
         0.0,
         "storage answered — it refused the row, which ends the hold"
     );
+}
+
+// The retention window `src/intake.rs` enforces (`DEAD_LETTER_RETENTION_DAYS`).
+// The ages below straddle it by a day on either side, so a window widened or
+// narrowed by even one day fails the scenario — an approximate bar would let the
+// constant drift silently, and this one is a data-protection commitment, not a
+// disk-space heuristic.
+const RETENTION_DAYS: i32 = 90;
+
+#[tokio::test]
+#[serial_test::serial]
+async fn s32_the_ledger_purges_itself_at_the_retention_edge_without_touching_readiness() {
+    let stack = TestStack::up().await;
+
+    // given: three audit lines planted around the retention edge. A dead letter
+    // carries the producer's command in full, so it may hold personal data — the
+    // ledger is a diagnostic tool with a lifetime, not an archive.
+    let long_expired = stack.record_dead_letter_aged(RETENTION_DAYS * 4).await;
+    let just_expired = stack.record_dead_letter_aged(RETENTION_DAYS + 1).await;
+    let just_inside = stack.record_dead_letter_aged(RETENTION_DAYS - 1).await;
+
+    // when: a service instance starts — the retention pass runs on its first
+    // tick, through the ingest role, never the owner. That role holds the DELETE
+    // grant only because migration 0002 gives it one; without it the pass would
+    // fail on every tick and this scenario is what would say so.
+    let instance = stack.spawn_instance(true).await;
+
+    // then: everything past the window is gone and everything inside it is kept
+    assert!(
+        stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                stack.dead_letter_ids().await == vec![just_inside]
+            })
+            .await,
+        "the retention pass must remove exactly the expired rows, ledger holds {:?} \
+         (long expired {long_expired}, just expired {just_expired}, just inside {just_inside})",
+        stack.dead_letter_ids().await
+    );
+    assert_eq!(
+        instance.log_hits(RETENTION_FAILED_LOG_MARKER),
+        0,
+        "the pass succeeded, so it never logged a failure; logs:\n{}",
+        instance.logs()
+    );
+
+    // when: the ingest role loses the DELETE grant — the shape of a broken
+    // deployment, and the only realistic way this pass fails
+    stack.revoke_ledger_purges().await;
+    let crippled = stack.spawn_instance(true).await;
+
+    // then: the failure is loud in the logs and invisible to readiness. Taking
+    // the pod out of the Service endpoints over a housekeeping failure would cut
+    // the queries and subscriptions that are perfectly healthy — the same reason
+    // a storage outage does not escalate to readiness either.
+    assert!(
+        stack
+            .wait_until(RECOVERY_TIMEOUT, || async {
+                crippled.log_hits(RETENTION_FAILED_LOG_MARKER) >= 1
+            })
+            .await,
+        "a purge it cannot perform must be said out loud; logs:\n{}",
+        crippled.logs()
+    );
+    let (readyz, _) = crippled.get("/readyz").await;
+    assert!(
+        readyz.is_success(),
+        "a failed retention pass must not take readiness DOWN, got {readyz}"
+    );
+
+    // then: and the instance is still serving the surface that has nothing to do
+    // with the ledger — the failure is contained to the pass
+    let recipient = Uuid::now_v7();
+    let passport = make_passport(recipient);
+    let count = crippled.graphql(&passport, UNREAD_QUERY, json!({})).await;
+    assert_eq!(
+        ServiceInstance::unread_count(&count),
+        0,
+        "the read surface is untouched by a failing retention pass"
+    );
+    assert_eq!(
+        stack.dead_letter_ids().await,
+        vec![just_inside],
+        "and nothing was purged behind the missing grant"
+    );
+
+    stack.restore_ledger_purges().await;
 }

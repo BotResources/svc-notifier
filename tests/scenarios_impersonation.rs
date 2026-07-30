@@ -9,9 +9,6 @@ use common::*;
 use serde_json::json;
 use uuid::Uuid;
 
-const MARK_AS_READ: &str = "mutation($id: ID!) { notifierMarkAsRead(notificationId: $id) }";
-const DELETE_ONE: &str = "mutation($id: ID!) { notifierDeleteNotification(notificationId: $id) }";
-
 #[tokio::test]
 #[serial_test::serial]
 async fn s17_impersonation_reads_the_acting_admins_own_notifications_only() {
@@ -91,13 +88,25 @@ async fn s19_impersonated_mutations_act_on_the_acting_admins_own_notifications()
 
     let mine = seed_one(&ctx, admin, "admin_own").await;
     let to_delete = seed_one(&ctx, admin, "admin_disposable").await;
-    let theirs = seed_one(&ctx, impersonated, "impersonated_own").await;
 
     // given: both live streams are open before anything is mutated — the
     // acting administrator's own, and the impersonated user's. A unitary
     // mutation must be announced on the first and be inaudible on the second.
     let mut acting_session = ctx.instance.subscribe(&acting).await;
     let mut impersonated_session = ctx.instance.subscribe(&make_passport(impersonated)).await;
+
+    // given: the impersonated user's own notification lands after their session
+    // opens, and is served on it. That push is the proof the session is really in
+    // the fan-out — its silence below is only worth what that proof is worth.
+    let theirs = seed_one(&ctx, impersonated, "impersonated_own").await;
+    let served = impersonated_session
+        .expect_event("the impersonated user's session is live", RECOVERY_TIMEOUT)
+        .await;
+    assert_eq!(
+        notifier_event(&served)["notification"]["id"],
+        json!(theirs.to_string()),
+        "the impersonated user's own session carries their own notification: {served}"
+    );
 
     // when: the administrator marks their own notification as read while
     // impersonating
@@ -212,13 +221,28 @@ async fn s19b_impersonated_bulk_mutations_never_reach_the_impersonated_users_inb
         seed_one(&ctx, admin, "admin_bulk_one").await,
         seed_one(&ctx, admin, "admin_bulk_two").await,
     ];
+
+    let mut acting_session = ctx.instance.subscribe(&acting).await;
+    let mut impersonated_session = ctx.instance.subscribe(&make_passport(impersonated)).await;
+
+    // given: the impersonated user's half of the stock lands after their session
+    // opens, so the two pushes it is served prove the session is in the fan-out.
+    // Without that proof its silence below would hold even if the service had
+    // never registered it at all.
     let theirs = [
         seed_one(&ctx, impersonated, "impersonated_bulk_one").await,
         seed_one(&ctx, impersonated, "impersonated_bulk_two").await,
     ];
-
-    let mut acting_session = ctx.instance.subscribe(&acting).await;
-    let mut impersonated_session = ctx.instance.subscribe(&make_passport(impersonated)).await;
+    for expected in theirs {
+        let served = impersonated_session
+            .expect_event("the impersonated user's session is live", RECOVERY_TIMEOUT)
+            .await;
+        assert_eq!(
+            notifier_event(&served)["notification"]["id"],
+            json!(expected.to_string()),
+            "the impersonated user's own session carries their own notifications: {served}"
+        );
+    }
 
     // when: the administrator marks everything read while impersonating
     let ack = ctx

@@ -5,16 +5,25 @@ use serde_json::json;
 use std::time::Duration;
 use uuid::Uuid;
 
+// The budget the intake used to enforce: at the sixth delivery it terminated the
+// frame and the request was gone. Kept here only as the thing the bar must clear.
+const RETIRED_REDELIVERY_BUDGET: usize = 5;
+
 // How many broker-counted redeliveries a scenario waits for before it calls the
-// hold "unbounded". The number itself is arbitrary — the property is structural:
-// the Fabric consumer is configured `max_deliver: -1`, so JetStream never gives
-// up on a frame the service keeps NAKing, and that configuration is pinned by
-// the Fabric's own conformance battery, not by this suite. Any value above the
-// five-delivery budget the intake used to enforce demonstrates the budget is
-// gone; the assertion reads JetStream's own counter, so the service cannot
-// satisfy it by logging more often.
-const REDELIVERIES_PROVING_AN_UNBOUNDED_HOLD: usize = 5;
-const OUTAGE_TIMEOUT: Duration = Duration::from_secs(90);
+// hold "unbounded". The Fabric consumer is configured `max_deliver: -1`, so
+// JetStream never gives up on a frame the service keeps NAKing — that part is
+// pinned by the Fabric's own conformance battery, not by this suite.
+//
+// The bar sits at three times the retired budget on purpose. At exactly six
+// redeliveries it would coincide with the old limit, so a *different* bounded
+// budget quietly reintroduced at, say, ten would still satisfy it and the
+// scenario would go green over the very regression it exists to catch. Three
+// times over is far enough that any plausible re-added ceiling shows up as red.
+const REDELIVERIES_PROVING_AN_UNBOUNDED_HOLD: usize = RETIRED_REDELIVERY_BUDGET * 3;
+// A held frame costs one pool-acquire timeout plus one NAK delay per cycle, so
+// clearing the bar above takes on the order of a minute. The ceiling is generous
+// on purpose: it bounds a hang, it is not the thing under test.
+const OUTAGE_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[tokio::test]
 #[serial_test::serial]
@@ -115,10 +124,11 @@ async fn s07c_an_outage_past_the_retired_budget_still_delivers_exactly_once() {
         .publish_deliver(&deliver(&[recipient], "outlives_the_budget", json!({})))
         .await;
 
-    // when: JetStream's own redelivery counter passes the retired five-delivery
-    // budget — the old intake terminated the frame here and lost the request.
-    // The counter comes from the broker, not from our loop, so it cannot be
-    // satisfied by the service merely logging more often.
+    // when: JetStream's own redelivery counter climbs far past the retired
+    // five-delivery budget — the old intake terminated the frame at six and lost
+    // the request. The counter comes from the broker, not from our loop, so the
+    // service cannot satisfy it by logging more often, and the bar is high enough
+    // that a bounded budget re-added at any plausible value stays red.
     let redelivered_past_the_budget = br_test_harness::wait_until(OUTAGE_TIMEOUT, || async {
         ctx.instance.max_delivered_count() > REDELIVERIES_PROVING_AN_UNBOUNDED_HOLD as i64
     })
