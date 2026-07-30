@@ -1,3 +1,8 @@
+// Door scenarios: who gets in, and what a caller who is in may aim at. No
+// Passport at all and a forged one are refused at the transport; a machine
+// identity is refused by code on every field; and an ordinary human reaching for
+// somebody else's notification — or for an id that is not one — is refused by
+// code too, with the target's state untouched on every channel.
 mod common;
 
 use br_test_harness::verdict;
@@ -5,6 +10,9 @@ use common::*;
 use reqwest::StatusCode;
 use serde_json::json;
 use uuid::Uuid;
+
+const MARK_AS_READ: &str = "mutation($id: ID!) { notifierMarkAsRead(notificationId: $id) }";
+const DELETE_ONE: &str = "mutation($id: ID!) { notifierDeleteNotification(notificationId: $id) }";
 
 #[tokio::test]
 #[serial_test::serial]
@@ -57,12 +65,12 @@ async fn service_passport_queries_and_mutations_are_forbidden() {
         ),
         (
             "notifierMarkAsRead",
-            "mutation($id: ID!) { notifierMarkAsRead(notificationId: $id) }",
+            MARK_AS_READ,
             json!({"id": Uuid::now_v7().to_string()}),
         ),
         (
             "notifierDeleteNotification",
-            "mutation($id: ID!) { notifierDeleteNotification(notificationId: $id) }",
+            DELETE_ONE,
             json!({"id": Uuid::now_v7().to_string()}),
         ),
         (
@@ -140,4 +148,114 @@ async fn service_passports_get_no_subscription_events() {
         refused_again["data"]["notifierNotificationEvents"].is_null(),
         "no notification ever reaches a machine identity's stream: {refused_again}"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn an_ordinary_human_reaching_for_another_humans_notification_is_refused_by_code() {
+    let ctx = TestContext::setup().await;
+    let (intruder, target) = (Uuid::now_v7(), Uuid::now_v7());
+    let intruder_passport = make_passport(intruder);
+    let target_passport = make_passport(target);
+
+    // given: the target owns a notification — created through the real intake,
+    // never seeded — and is listening on their own session
+    let targeted = seed_one(&ctx, target, "not_yours").await;
+    let mut target_session = ctx.instance.subscribe(&target_passport).await;
+
+    // when: an ordinary human aims the unitary mutations at someone else's id,
+    // and at an id that is not an id at all. Every unitary door, both shapes:
+    // a table that samples one mutation invites the next one in unguarded.
+    let cases = [
+        (
+            "notifierMarkAsRead",
+            MARK_AS_READ,
+            targeted.to_string(),
+            "NOT_FOUND",
+        ),
+        (
+            "notifierDeleteNotification",
+            DELETE_ONE,
+            targeted.to_string(),
+            "NOT_FOUND",
+        ),
+        (
+            "notifierMarkAsRead",
+            MARK_AS_READ,
+            "not-a-uuid".to_string(),
+            "BAD_USER_INPUT",
+        ),
+        (
+            "notifierDeleteNotification",
+            DELETE_ONE,
+            "not-a-uuid".to_string(),
+            "BAD_USER_INPUT",
+        ),
+    ];
+
+    for (field, mutation, id, expected) in cases {
+        let refused = ctx
+            .instance
+            .graphql(&intruder_passport, mutation, json!({"id": id}))
+            .await;
+        assert_eq!(
+            verdict::expect_code_shaped(&refused, &format!("{field} aimed at {id}")),
+            expected,
+            "{field} aimed at {id}: a foreign notification must be invisible, never \
+             forbidden — telling an intruder the row exists is itself a leak: {refused}"
+        );
+        assert!(
+            refused["data"][field].is_null(),
+            "{field} aimed at {id}: a refused mutation carries no result: {refused}"
+        );
+    }
+
+    // then: the target's row never moved — a refused reach is not a partial one
+    let rows = ctx.stack.rows_for(target).await;
+    assert_eq!(rows.len(), 1, "the target's notification is still there");
+    assert_eq!(rows[0].id, targeted);
+    assert!(rows[0].read_at.is_none(), "and still unread");
+
+    // then: nor did any of the target's own channels notice — no push, list and
+    // badge exactly as before. A failed intrusion is invisible to its victim.
+    target_session
+        .expect_silence(
+            "a refused reach announces nothing to the owner",
+            CONSUME_WAIT,
+        )
+        .await;
+    let listed = ctx
+        .instance
+        .graphql(&target_passport, LIST_QUERY, json!({}))
+        .await;
+    let nodes = listed["data"]["notifierNotifications"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no nodes in {listed}"));
+    assert_eq!(nodes.len(), 1, "the target still has their notification");
+    assert_eq!(nodes[0]["id"], json!(targeted.to_string()));
+    assert!(
+        nodes[0]["readAt"].is_null(),
+        "and it is still unread: {listed}"
+    );
+    let count = ctx
+        .instance
+        .graphql(&target_passport, UNREAD_QUERY, json!({}))
+        .await;
+    assert_eq!(ServiceInstance::unread_count(&count), 1);
+
+    // then: and the intruder gained nothing to look at either
+    let intruder_list = ctx
+        .instance
+        .graphql(&intruder_passport, LIST_QUERY, json!({}))
+        .await;
+    assert_eq!(
+        intruder_list["data"]["notifierNotifications"]["nodes"],
+        json!([]),
+        "the notification the intruder named must not surface in their own list: {intruder_list}"
+    );
+    let intruder_count = ctx
+        .instance
+        .graphql(&intruder_passport, UNREAD_QUERY, json!({}))
+        .await;
+    assert_eq!(ServiceInstance::unread_count(&intruder_count), 0);
 }

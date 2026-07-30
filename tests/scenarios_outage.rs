@@ -89,6 +89,19 @@ async fn s07c_an_outage_past_the_retired_budget_still_delivers_exactly_once() {
     let ctx = TestContext::setup().await;
     let recipient = Uuid::now_v7();
 
+    // given: nothing has failed yet, and the streak gauge already says so — it
+    // reads zero rather than being absent. An alert built on a series that only
+    // appears with the first failure cannot tell "healthy" from "not reporting",
+    // so the series has to exist before the incident does.
+    assert_eq!(
+        ctx.instance
+            .metric(CONSECUTIVE_TRANSIENT_FAILURES_METRIC, &[])
+            .await,
+        Some(0.0),
+        "the held-command gauge must be published from startup, not minted by the first \
+         failure"
+    );
+
     // given: a live subscriber is already listening when the outage starts — the
     // never-lose promise is "the recipient is told", not "the row exists"
     let mut session = ctx.instance.subscribe(&make_passport(recipient)).await;

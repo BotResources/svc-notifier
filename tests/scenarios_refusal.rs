@@ -11,18 +11,32 @@
 // payload, so no raw subject and no new harness affordance is involved.
 //
 // Every scenario walks the channels a refusal can be observed on:
-//   settlement  — the frame is terminated, and only after the ledger row commits
-//                 (proven by waiting out several redelivery cycles: a frame the
-//                 broker still held would come back)
+//   settlement  — the frame is terminated, and only after the ledger row
+//                 commits. Termination is not directly observable from outside
+//                 the process, so it is proven by a pair of facts read after
+//                 several redelivery cycles: JetStream's own delivery counter
+//                 stayed at one (a positive number — a held frame comes back
+//                 with a higher one), AND the redelivery branch's log marker
+//                 fired zero times. The zero alone would be worthless, so it is
+//                 never left alone: s22/s23/s24 drive that very marker above
+//                 zero later in the same run with a deliberate replay, and s21b
+//                 drives its sibling on the same code path (the abandonment
+//                 marker, zero while the ledger is down and one after repair).
 //   ledger      — one dead_letters line, stable `reason`, readable ids, the
-//                 producer's command verbatim, its causality
-//   operator    — the `/metrics` counter the alert is built on
+//                 producer's command verbatim, its causality and its actor
+//   operator    — the `/metrics` counters the alerts are built on
 //   recipient   — absolute silence: no push, no list entry, no unread badge,
 //                 no row in Postgres
 //
 // The ledger scenarios that predate the traced-refusal intake (s20, s21) stay in
 // `scenarios_intake.rs`: their names are quoted in the README and in the
 // service's runbook, and a rename buys nothing.
+//
+// Known scenario gap: an envelope the intake cannot decode *at all* is held
+// forever and counted on `notifier_intake_undecodable_deliveries_total`, and
+// nothing here pins it — putting raw bytes on the typed deliver coordinates
+// needs a harness primitive that does not exist yet, and half an oracle would be
+// worse than none.
 mod common;
 
 use common::*;
@@ -95,6 +109,17 @@ async fn s22_an_out_of_domain_link_refuses_the_whole_request_and_leaves_a_trace(
     assert_eq!(recorded.correlation_id, trace.correlation_id);
     assert_eq!(recorded.causation_id, Some(causing_event_id));
     assert_eq!(
+        recorded.actor_kind.as_deref(),
+        Some("human"),
+        "the ledger says who asked — re-emitting a command verbatim is only half an \
+         audit trail without the actor that produced it"
+    );
+    assert_eq!(
+        recorded.actor_id,
+        Some(trace.actor_id),
+        "and names them, exactly as the envelope's metadata did"
+    );
+    assert_eq!(
         recorded.sqlstate, None,
         "no database refused anything here — the service did"
     );
@@ -112,10 +137,12 @@ async fn s22_an_out_of_domain_link_refuses_the_whole_request_and_leaves_a_trace(
     );
 
     // then: the frame is terminated — after several redelivery cycles it has not
-    // come back. The proof is JetStream's own delivery counter, read out of the
-    // service log: a held frame returns with a higher count, so the expected
-    // value here is one, never zero — an absence stated as a positive number
-    // cannot be greened by a renamed log line.
+    // come back. Two facts prove it together: JetStream's own delivery counter
+    // stayed at one (a positive number, not an absence — a held frame returns
+    // with a higher one), and the branch a returning frame takes never ran. That
+    // second assertion is a zero, so it is only worth what its discriminant is
+    // worth: the very same marker is driven above zero at the end of this
+    // scenario, by a deliberate replay.
     tokio::time::sleep(TERM_OBSERVATION_WINDOW).await;
     assert_eq!(
         ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
@@ -127,6 +154,12 @@ async fn s22_an_out_of_domain_link_refuses_the_whole_request_and_leaves_a_trace(
         ctx.instance.max_delivered_count(),
         1,
         "the frame was settled on its first delivery and never came back; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER),
+        0,
+        "a terminated frame never re-enters triage; logs:\n{}",
         ctx.instance.logs()
     );
     assert_eq!(
@@ -280,7 +313,9 @@ async fn s23_a_payload_the_contract_does_not_describe_is_recorded_with_whatever_
     );
 
     // then: both frames are terminated, not held — each was settled on its
-    // first delivery, as JetStream's own counter says
+    // first delivery, as JetStream's own counter says, and neither ever took
+    // the branch a returning frame takes. The replay at the end of this scenario
+    // is what makes that zero discriminant.
     tokio::time::sleep(TERM_OBSERVATION_WINDOW).await;
     assert_eq!(
         ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
@@ -292,6 +327,12 @@ async fn s23_a_payload_the_contract_does_not_describe_is_recorded_with_whatever_
         ctx.instance.max_delivered_count(),
         1,
         "no refused frame came back for a second delivery; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER),
+        0,
+        "a terminated frame never re-enters triage; logs:\n{}",
         ctx.instance.logs()
     );
     assert_eq!(ctx.stack.dead_letters().await.len(), 2);
@@ -311,6 +352,37 @@ async fn s23_a_payload_the_contract_does_not_describe_is_recorded_with_whatever_
         .graphql(&recipient_passport, UNREAD_QUERY, json!({}))
         .await;
     assert_eq!(ServiceInstance::unread_count(&count), 0);
+
+    // when: one of the two frames comes back — a term() the broker never
+    // registered, or a producer replaying its outbox. The replayed one is the
+    // command naming the listening recipient, so the silence below is theirs.
+    ctx.stack
+        .publish_payload_envelope(missing_id, &missing_field, Trace::fresh())
+        .await;
+    tokio::time::sleep(CONSUME_WAIT).await;
+
+    // then: the ledger is unchanged, and the replay is recognised as
+    // already-ledgered — which is what makes the zero asserted above an
+    // absence rather than a stale log string
+    let ledger = ctx.stack.dead_letters().await;
+    assert_eq!(ledger.len(), 2, "a replayed refusal adds no audit line");
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|row| row.command_id == missing_id)
+            .count(),
+        1,
+        "still exactly one line for the replayed command"
+    );
+    assert!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER) >= 1,
+        "the replay is logged as already-ledgered, not as a fresh abandonment; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(ctx.stack.count_rows().await, 0);
+    session
+        .expect_silence("a replayed refusal is still a refusal", CONSUME_WAIT)
+        .await;
 }
 
 #[tokio::test]
@@ -360,6 +432,7 @@ async fn s24_a_command_naming_nobody_is_a_producer_bug_on_the_ledger_not_a_silen
     );
     assert_eq!(recorded.command(), payload);
     assert_eq!(recorded.correlation_id, trace.correlation_id);
+    let recorded_id = recorded.id;
 
     assert_eq!(
         ctx.instance
@@ -371,7 +444,10 @@ async fn s24_a_command_naming_nobody_is_a_producer_bug_on_the_ledger_not_a_silen
         1.0
     );
 
-    // then: terminated, and nothing was created or announced anywhere
+    // then: terminated, and nothing was created or announced anywhere. The
+    // termination rests on the same pair as its siblings — a delivery counter
+    // still at one, and the returning-frame branch never taken — and the zero is
+    // made discriminant by the replay at the end of this scenario.
     tokio::time::sleep(TERM_OBSERVATION_WINDOW).await;
     assert_eq!(
         ctx.instance.log_hits(DEAD_LETTER_RECORDED_LOG_MARKER),
@@ -385,6 +461,12 @@ async fn s24_a_command_naming_nobody_is_a_producer_bug_on_the_ledger_not_a_silen
         "the frame was settled on its first delivery and never came back; logs:\n{}",
         ctx.instance.logs()
     );
+    assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER),
+        0,
+        "a terminated frame never re-enters triage; logs:\n{}",
+        ctx.instance.logs()
+    );
     assert_eq!(ctx.stack.count_rows().await, 0);
     session
         .expect_silence(
@@ -392,11 +474,41 @@ async fn s24_a_command_naming_nobody_is_a_producer_bug_on_the_ledger_not_a_silen
             CONSUME_WAIT,
         )
         .await;
+    let listed = ctx
+        .instance
+        .graphql(&bystander_passport, LIST_QUERY, json!({}))
+        .await;
+    assert_eq!(
+        listed["data"]["notifierNotifications"]["nodes"],
+        json!([]),
+        "a command naming nobody leaves nobody's list changed: {listed}"
+    );
     let count = ctx
         .instance
         .graphql(&bystander_passport, UNREAD_QUERY, json!({}))
         .await;
     assert_eq!(ServiceInstance::unread_count(&count), 0);
+
+    // when: the same frame comes back
+    ctx.stack
+        .publish_payload_envelope(command_id, &payload, trace)
+        .await;
+    tokio::time::sleep(CONSUME_WAIT).await;
+
+    // then: still one audit line, and the replay is recognised as
+    // already-ledgered — the discriminant for the zero asserted above
+    let ledger = ctx.stack.dead_letters().await;
+    assert_eq!(ledger.len(), 1, "a replayed refusal adds no audit line");
+    assert_eq!(ledger[0].id, recorded_id, "the first trace is kept");
+    assert!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER) >= 1,
+        "the replay is logged as already-ledgered, not as a fresh abandonment; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(ctx.stack.count_rows().await, 0);
+    session
+        .expect_silence("a replayed refusal is still a refusal", CONSUME_WAIT)
+        .await;
 }
 
 #[tokio::test]
@@ -445,6 +557,26 @@ async fn s21b_a_refused_payload_is_held_while_the_ledger_is_unwritable() {
     );
     assert_eq!(ctx.stack.count_rows().await, 0);
 
+    // then: the operator sees the hold on /metrics, and sees it for what it is.
+    // The streak gauge says a command is being held; the ledger's own counter
+    // says why — a lost grant, not a PostgreSQL outage. Reading the two apart is
+    // the difference between "restore the GRANT" and "page the DBA".
+    assert!(
+        ctx.instance
+            .metric_or_zero(CONSECUTIVE_TRANSIENT_FAILURES_METRIC, &[])
+            .await
+            >= 1.0,
+        "a refusal that cannot be traced must be visible as a held command"
+    );
+    assert!(
+        ctx.instance
+            .metric_or_zero(LEDGER_FAILURES_TOTAL_METRIC, &[])
+            .await
+            > 0.0,
+        "the failing write is counted on the ledger's own series, not only on the \
+         transient one — an unwritable ledger must be distinguishable from a storage outage"
+    );
+
     // when: the ledger comes back
     ctx.stack.restore_ledger_writes().await;
 
@@ -475,9 +607,37 @@ async fn s21b_a_refused_payload_is_held_while_the_ledger_is_unwritable() {
         ctx.instance.logs()
     );
     assert_eq!(
+        ctx.instance.log_hits(DEAD_LETTER_REPEATED_LOG_MARKER),
+        0,
+        "and once traced it never re-enters triage — the frame was terminated, not \
+         redelivered into a second look; logs:\n{}",
+        ctx.instance.logs()
+    );
+    assert_eq!(
         ctx.stack.dead_letters().await.len(),
         1,
         "once traced, the frame is terminated, not redelivered forever"
+    );
+
+    // then: the operator's channels close the incident by themselves — the
+    // abandonment is now countable under its own reason, and the held-command
+    // gauge is back to rest
+    assert_eq!(
+        ctx.instance
+            .metric_or_zero(
+                DEAD_LETTERS_TOTAL_METRIC,
+                &[("reason", REASON_RELATIVE_LINK_REJECTED)]
+            )
+            .await,
+        1.0,
+        "the repaired abandonment is counted exactly once, under its stable reason"
+    );
+    assert_eq!(
+        ctx.instance
+            .metric_or_zero(CONSECUTIVE_TRANSIENT_FAILURES_METRIC, &[])
+            .await,
+        0.0,
+        "the ledger answered — the hold is over and the gauge says so"
     );
 
     // then: through the whole hold-and-abandon cycle the recipient learned

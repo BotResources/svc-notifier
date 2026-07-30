@@ -52,7 +52,6 @@ pub const CONSUME_WAIT: Duration = Duration::from_secs(3);
 pub const SSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub const DURABLE_NAME: &str = "svc-notifier";
 pub const LEGACY_SUBJECT: &str = "notify.deliver";
 
 // Mirrors, verbatim, the intake's transient-failure log message in
@@ -92,6 +91,10 @@ pub const DEAD_LETTERS_TOTAL_METRIC: &str = "notifier_intake_dead_letters_total"
 pub const TRANSIENT_FAILURES_TOTAL_METRIC: &str = "notifier_intake_transient_failures_total";
 pub const CONSECUTIVE_TRANSIENT_FAILURES_METRIC: &str =
     "notifier_intake_consecutive_transient_failures";
+// The ledger's own failure counter. It exists so that a lost INSERT grant — one
+// service's broken posture — cannot be read off the transient counter as a
+// PostgreSQL outage: the two conditions have different runbooks.
+pub const LEDGER_FAILURES_TOTAL_METRIC: &str = "notifier_intake_ledger_failures_total";
 
 // The stable dead-letter reason codes (`src/intake.rs`, `DeadLetterReason`).
 // The ledger's `reason` column is an operator contract: a runbook greps these.
@@ -180,12 +183,17 @@ impl TestStack {
         // the table; once the table exists, a silently-failed repair would let
         // every ledger scenario pass for the wrong reason (nothing recorded,
         // because nothing could be). Skipped while the table is still absent.
-        if let Ok(Some(granted)) = ledger_insert_granted(&owner_pool).await {
-            assert!(
+        match ledger_insert_granted(&owner_pool).await {
+            Ok(Some(granted)) => assert!(
                 granted,
                 "the ingest role must be able to write dead_letters before a scenario starts — \
                  the self-healing GRANT did not take"
-            );
+            ),
+            Ok(None) => {}
+            Err(error) => panic!(
+                "could not verify the ledger INSERT grant, so no ledger scenario can be trusted \
+                 in this run: {error}"
+            ),
         }
 
         let nats = FabricTestNats::start().await;
@@ -226,6 +234,12 @@ impl TestStack {
             panic!("svc-notifier did not become healthy on port {port}: {reason}");
         }
         if with_nats {
+            // /readyz answers before the intake consumer is bound, and the bind
+            // is announced at INFO while the fixture runs the service at `warn`
+            // — every scenario that counts log markers depends on that level, so
+            // the wait cannot be turned into a log signal without changing what
+            // the whole suite reads. A settle window it is, until the service
+            // gates readiness on the bind.
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
@@ -311,7 +325,7 @@ impl TestStack {
     pub async fn dead_letters(&self) -> Vec<DeadLetterRecord> {
         sqlx::query_as::<_, DeadLetterRecord>(
             "SELECT id, command_id, source_event_id, recipient_ids, command, reason, sqlstate,
-                    correlation_id, causation_id, recorded_at
+                    correlation_id, causation_id, actor_kind, actor_id, recorded_at
              FROM dead_letters ORDER BY recorded_at, id",
         )
         .fetch_all(&self.owner_pool)
@@ -474,7 +488,13 @@ impl ServiceInstance {
             "a refused subscription is a GraphQL verdict on an open stream, not a transport \
              failure: {status} {body}"
         );
-        let body = body.as_str().unwrap_or_default().to_string();
+        // The refusal rides an SSE body, which `post_raw` hands back as a JSON
+        // string; anything else (a JSON error object, say) is rendered whole so
+        // the panic below shows what actually came back instead of "".
+        let body = body
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| body.to_string());
         let frames: Vec<Value> = body
             .split("\n\n")
             .filter_map(|block| {
@@ -491,6 +511,34 @@ impl ServiceInstance {
             "a refused subscription answers exactly one frame, then ends: {body}"
         );
         frames.into_iter().next().expect("one frame")
+    }
+
+    // The lagging counterpart of `subscribe`. `SseSubscription` is the handle
+    // for a *healthy* stream: it fails loud the moment a frame carries
+    // `errors`, which is exactly the terminal frame a disconnected subscriber
+    // must be served. The request is the one the harness handle makes — POST
+    // /graphql, `Accept: text/event-stream`, forged Passport — and only the
+    // reading discipline differs: nothing is read until the scenario asks, so
+    // the events pile up behind the socket the way they do for a client that
+    // stopped keeping up.
+    pub async fn open_unread_events(&self, passport: &Passport) -> UnreadSseSession {
+        let response = reqwest::Client::new()
+            .post(format!("{}/graphql", self.base_url))
+            .header("X-Passport", passport.to_header().as_str())
+            .header("Accept", "text/event-stream")
+            .json(&json!({ "query": EVENTS_SUBSCRIPTION }))
+            .send()
+            .await
+            .expect("open the notification event stream");
+        assert!(
+            response.status().is_success(),
+            "opening the event stream must succeed, got {}",
+            response.status()
+        );
+        UnreadSseSession {
+            response,
+            buffer: String::new(),
+        }
     }
 
     // Reads one sample out of the Prometheus exposition: the value of `name`
@@ -549,6 +597,129 @@ impl ServiceInstance {
     }
 }
 
+// One SSE frame as it comes off an unread session.
+enum FrameRead {
+    // A `next` frame carrying the GraphQL response payload — data, errors, or
+    // both, exactly as the client would parse it.
+    Payload(Value),
+    // The service closed the stream.
+    Ended,
+    // The window elapsed with the stream still open and silent.
+    Quiet,
+}
+
+// A live SSE session a scenario deliberately does not read while facts pile up
+// behind it — the shape a lagging client takes on the wire. Opened by
+// `ServiceInstance::open_unread_events`. Every read is bounded: a session that
+// is never disconnected must fail the scenario, never hang it.
+pub struct UnreadSseSession {
+    response: reqwest::Response,
+    buffer: String,
+}
+
+impl UnreadSseSession {
+    // Reads the session up to its terminal verdict. Frames served before it are
+    // counted and discarded — a lagged session is served whatever the transport
+    // had already absorbed before the loss — and the first frame carrying
+    // `errors` is returned whole, ready for `verdict::expect_code_shaped`.
+    pub async fn expect_verdict(&mut self, what: &str, window: Duration) -> (usize, Value) {
+        let mut served = 0;
+        loop {
+            match self.read(window).await {
+                FrameRead::Payload(payload) if payload["errors"] != Value::Null => {
+                    return (served, payload);
+                }
+                FrameRead::Payload(_) => served += 1,
+                FrameRead::Ended => panic!(
+                    "{what}: the stream ended without a verdict after {served} event(s) — a \
+                     client cut off in silence cannot tell a lost fact from an empty inbox"
+                ),
+                FrameRead::Quiet => panic!(
+                    "{what}: no verdict within {window:?} after {served} event(s) — the session \
+                     is still open and serving, so nothing was ever lost"
+                ),
+            }
+        }
+    }
+
+    // Reads one served event, failing loud on a verdict, a close or silence.
+    // The step that turns "the session heard nothing" into "the session was
+    // there to hear it" before a scenario starves it.
+    pub async fn expect_event(&mut self, what: &str, window: Duration) -> Value {
+        match self.read(window).await {
+            FrameRead::Payload(payload) if payload["errors"] == Value::Null => payload,
+            FrameRead::Payload(payload) => {
+                panic!("{what}: expected an event, got a verdict: {payload}")
+            }
+            FrameRead::Ended => panic!("{what}: the stream ended instead of serving an event"),
+            FrameRead::Quiet => panic!("{what}: no event within {window:?}"),
+        }
+    }
+
+    // Proves the stream is *closed*, not merely quiet: a disconnection the
+    // client must act on, rather than an idle connection it would keep folding
+    // into.
+    pub async fn expect_end(&mut self, what: &str, window: Duration) {
+        match self.read(window).await {
+            FrameRead::Ended => {}
+            FrameRead::Payload(payload) => {
+                panic!("{what}: the stream served another frame after its verdict: {payload}")
+            }
+            FrameRead::Quiet => panic!(
+                "{what}: the stream stayed open for {window:?} after its verdict — a truncated \
+                 session must be closed, not left dangling"
+            ),
+        }
+    }
+
+    async fn read(&mut self, window: Duration) -> FrameRead {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            if let Some(block) = self.take_block() {
+                match Self::payload(&block) {
+                    Some(payload) => return FrameRead::Payload(payload),
+                    // A keep-alive comment or any non-`next` framing carries no
+                    // fact; it is not an event and not an end.
+                    None => continue,
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return FrameRead::Quiet;
+            }
+            match tokio::time::timeout(remaining, self.response.chunk()).await {
+                Ok(Ok(Some(chunk))) => self.buffer.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(Ok(None)) => return FrameRead::Ended,
+                Ok(Err(error)) => panic!("the event stream errored at the transport: {error}"),
+                Err(_) => return FrameRead::Quiet,
+            }
+        }
+    }
+
+    fn take_block(&mut self) -> Option<String> {
+        let block_end = self.buffer.find("\n\n")?;
+        let block = self.buffer[..block_end].to_string();
+        self.buffer = self.buffer[block_end + 2..].to_string();
+        Some(block)
+    }
+
+    fn payload(block: &str) -> Option<Value> {
+        let mut event_type = None;
+        let mut data = None;
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                event_type = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data = Some(value.trim().to_string());
+            }
+        }
+        if event_type.as_deref() != Some("next") {
+            return None;
+        }
+        serde_json::from_str(&data?).ok()
+    }
+}
+
 pub fn notifier_event(event: &Value) -> &Value {
     &event["notifierNotificationEvents"]
 }
@@ -570,6 +741,63 @@ pub const LIST_QUERY: &str = r#"query {
 }"#;
 
 pub const UNREAD_QUERY: &str = "{ notifierUnreadCount }";
+
+// The same list query, cursor-driven. `LIST_QUERY` takes the default page (20)
+// and is the right shape for a scenario with a handful of notifications; an
+// inbox larger than one page is only readable in full by walking the cursor,
+// which is exactly what a client rebuilding its state after a disconnection
+// does.
+pub const PAGE_QUERY: &str = r#"query($first: Int!, $after: ID) {
+  notifierNotifications(first: $first, after: $after) {
+    nodes { id template payload link readAt createdAt }
+    hasNextPage
+  }
+}"#;
+
+// The largest page the read layer will serve — it clamps `first`, so asking for
+// more than this is not a way around the cursor.
+const MAX_PAGE: usize = 100;
+
+// A bound on the walk itself: a `hasNextPage` that never turns false is a bug
+// the scenario must fail on, not loop on.
+const MAX_PAGES_WALKED: usize = 64;
+
+// Walks the caller's whole inbox the way a client must — page by page, following
+// the cursor until the service says there is no next page — and returns the ids
+// in the order they were served.
+pub async fn listed_ids(instance: &ServiceInstance, passport: &Passport) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..MAX_PAGES_WALKED {
+        let page = instance
+            .graphql(
+                passport,
+                PAGE_QUERY,
+                json!({"first": MAX_PAGE, "after": after}),
+            )
+            .await;
+        let connection = &page["data"]["notifierNotifications"];
+        let nodes = connection["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no nodes in {page}"));
+        ids.extend(nodes.iter().map(|node| {
+            node["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a node carries a string id: {node}"))
+                .to_owned()
+        }));
+        let has_next_page = connection["hasNextPage"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("no hasNextPage in {page}"));
+        if !has_next_page {
+            return ids;
+        }
+        after = ids.last().cloned();
+    }
+    panic!(
+        "the notification list never stopped claiming a next page after {MAX_PAGES_WALKED} pages"
+    )
+}
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct NotificationRecord {
@@ -596,6 +824,12 @@ pub struct DeadLetterRecord {
     pub sqlstate: Option<String>,
     pub correlation_id: Uuid,
     pub causation_id: Option<Uuid>,
+    // Nullable since migration 0004: the columns are additive, so a row written
+    // before the migration carries no actor. A row the current intake writes
+    // always names one — "re-emit the command verbatim" is only half an audit
+    // trail without "and here is who asked for it".
+    pub actor_kind: Option<String>,
+    pub actor_id: Option<Uuid>,
     pub recorded_at: DateTime<Utc>,
 }
 
