@@ -17,6 +17,12 @@ use crate::notification::insert_notifications;
 
 const DURABLE_NAME: &str = "svc-notifier";
 const NAK_DELAY: Duration = Duration::from_secs(1);
+// A frame whose envelope cannot be read is held forever, so its redelivery delay
+// is pure cost: nothing about it changes between two attempts. It gets its own,
+// far longer delay — the retry that matters (a storage outage clearing) is the
+// one NAK_DELAY is tuned for, and mixing the two made an unreadable frame beat a
+// drum once a second in the loop and in the logs for as long as it stayed there.
+const UNDECODABLE_NAK_DELAY: Duration = Duration::from_secs(30);
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 10;
 const PERMANENTLY_INVALID_SQLSTATE_CLASSES: [&str; 2] = ["22", "23"];
 
@@ -28,6 +34,9 @@ const TRANSIENT_FAILURES_TOTAL: &str = "notifier_intake_transient_failures_total
 const CONSECUTIVE_TRANSIENT_FAILURES: &str = "notifier_intake_consecutive_transient_failures";
 const UNDECODABLE_DELIVERIES_TOTAL: &str = "notifier_intake_undecodable_deliveries_total";
 const LEDGER_FAILURES_TOTAL: &str = "notifier_intake_ledger_failures_total";
+const PURGE_PASSES_TOTAL: &str = "notifier_intake_dead_letter_purge_passes_total";
+const DEAD_LETTERS_PURGED_TOTAL: &str = "notifier_intake_dead_letters_purged_total";
+const PURGE_FAILURES_TOTAL: &str = "notifier_intake_dead_letter_purge_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureClass {
@@ -136,7 +145,23 @@ fn describe_intake_metrics() {
         LEDGER_FAILURES_TOTAL,
         "Dead-letter ledger writes that failed, degrading an abandonment to a hold — a lost grant, not a storage outage"
     );
+    describe_counter!(
+        PURGE_PASSES_TOTAL,
+        "Dead-letter retention passes that completed — a flat curve means the pass is not running, whatever the ledger size says"
+    );
+    describe_counter!(
+        DEAD_LETTERS_PURGED_TOTAL,
+        "Dead-letter rows deleted by the retention pass"
+    );
+    describe_counter!(
+        PURGE_FAILURES_TOTAL,
+        "Dead-letter retention passes that failed — rows are kept past their retention until one succeeds"
+    );
     gauge!(CONSECUTIVE_TRANSIENT_FAILURES).set(0.0);
+    // The retention alert reads the *absence* of a passing pass, and an absent
+    // series is not a zero one: without this the alert would stay silent in the
+    // exact case it exists for, a pass that has never once succeeded.
+    counter!(PURGE_PASSES_TOTAL).absolute(0);
 }
 
 pub async fn consume(
@@ -451,16 +476,23 @@ pub async fn purge_dead_letters(pool: PgPool, mut shutdown: watch::Receiver<bool
             biased;
             _ = shutdown.changed() => break,
             _ = ticks.tick() => match delete_expired_dead_letters(&pool).await {
-                Ok(purged) => tracing::info!(
-                    purged,
-                    retention_days = DEAD_LETTER_RETENTION_DAYS,
-                    "dead-letter retention pass completed"
-                ),
-                Err(error) => tracing::error!(
-                    %error,
-                    retention_days = DEAD_LETTER_RETENTION_DAYS,
-                    "dead-letter retention pass failed, retrying at the next tick — the ledger keeps rows past their retention until it succeeds"
-                ),
+                Ok(purged) => {
+                    counter!(PURGE_PASSES_TOTAL).increment(1);
+                    counter!(DEAD_LETTERS_PURGED_TOTAL).increment(purged);
+                    tracing::info!(
+                        purged,
+                        retention_days = DEAD_LETTER_RETENTION_DAYS,
+                        "dead-letter retention pass completed"
+                    );
+                }
+                Err(error) => {
+                    counter!(PURGE_FAILURES_TOTAL).increment(1);
+                    tracing::error!(
+                        %error,
+                        retention_days = DEAD_LETTER_RETENTION_DAYS,
+                        "dead-letter retention pass failed, retrying at the next tick — the ledger keeps rows past their retention until it succeeds"
+                    );
+                }
             },
         }
     }
@@ -485,7 +517,7 @@ fn outcome_for(failure: Option<FailureClass>) -> MessageOutcome {
 }
 
 fn outcome_for_undecodable_envelope() -> MessageOutcome {
-    MessageOutcome::Nak(Some(NAK_DELAY))
+    MessageOutcome::Nak(Some(UNDECODABLE_NAK_DELAY))
 }
 
 fn classify(error: &sqlx::Error) -> FailureClass {
@@ -596,9 +628,18 @@ mod tests {
     fn an_undecodable_envelope_is_held_never_terminated() {
         assert_eq!(
             outcome_for_undecodable_envelope(),
-            MessageOutcome::Nak(Some(NAK_DELAY)),
+            MessageOutcome::Nak(Some(UNDECODABLE_NAK_DELAY)),
             "no frame is destroyed without a committed ledger row, and an envelope we cannot read \
              carries no id to record"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_frame_is_retried_far_more_slowly_than_a_held_one() {
+        assert!(
+            UNDECODABLE_NAK_DELAY >= NAK_DELAY * 30,
+            "nothing about an unreadable frame changes between two attempts, so its redelivery \
+             is pure loop and log cost — it must not share the delay tuned for an outage clearing"
         );
     }
 

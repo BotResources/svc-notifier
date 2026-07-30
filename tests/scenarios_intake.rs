@@ -597,6 +597,31 @@ async fn s32_the_ledger_purges_itself_at_the_retention_edge_without_touching_rea
         instance.logs()
     );
 
+    // then: the operator can see the pass without reading logs. A ledger that
+    // stops shrinking looks exactly like a ledger with nothing to remove, so
+    // "the pass ran" has to be a series of its own, and the count it removed
+    // another.
+    assert_eq!(
+        instance
+            .metric_or_zero(PURGE_PASSES_TOTAL_METRIC, &[])
+            .await,
+        1.0,
+        "one completed pass, countable — this is the series the dead-task alert reads"
+    );
+    assert_eq!(
+        instance
+            .metric_or_zero(DEAD_LETTERS_PURGED_TOTAL_METRIC, &[])
+            .await,
+        2.0,
+        "and it says how much it removed: the two expired rows, never the one inside the window"
+    );
+    assert_eq!(
+        instance
+            .metric_or_zero(PURGE_FAILURES_TOTAL_METRIC, &[])
+            .await,
+        0.0
+    );
+
     // when: the ingest role loses the DELETE grant — the shape of a broken
     // deployment, and the only realistic way this pass fails
     stack.revoke_ledger_purges().await;
@@ -614,6 +639,21 @@ async fn s32_the_ledger_purges_itself_at_the_retention_edge_without_touching_rea
             .await,
         "a purge it cannot perform must be said out loud; logs:\n{}",
         crippled.logs()
+    );
+    assert!(
+        crippled
+            .metric_or_zero(PURGE_FAILURES_TOTAL_METRIC, &[])
+            .await
+            >= 1.0,
+        "the failure is countable, not merely loggable — it is what the operator alerts on"
+    );
+    assert_eq!(
+        crippled
+            .metric_or_zero(PURGE_PASSES_TOTAL_METRIC, &[])
+            .await,
+        0.0,
+        "and the passing series exists at zero rather than being absent: an alert on the absence \
+         of a passing pass must fire when no pass has ever succeeded, which is exactly this case"
     );
     let (readyz, _) = crippled.get("/readyz").await;
     assert!(

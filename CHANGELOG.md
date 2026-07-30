@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ceiling, so a *different* bounded budget reintroduced at, say, ten would have
   satisfied it and the scenario would have gone green over the regression it
   exists to catch.
+- An undecodable envelope is NAKed with its own 30s delay
+  (`UNDECODABLE_NAK_DELAY`) instead of the 1s one a held command uses. Semantics
+  are untouched — the frame is still never terminated — but nothing about an
+  unreadable frame changes between two attempts, so its redelivery was pure loop
+  and log cost at once a second. The documented gap's arithmetic drops by thirty;
+  the short delay stays where it can actually pay off, a storage outage clearing.
 - The poison vehicle in `s20`/`s21` moved from an unstorable `template` to an
   unstorable `payload` (a NUL inside the JSON, which `jsonb` refuses with SQLSTATE
   22P05). Those scenarios are about a write **PostgreSQL** refuses; with the
@@ -234,6 +240,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loud. `notifier_intake_dead_letters_total` is the alertable counter: it counts
   committed ledger rows only, so a replayed frame hitting the `ON CONFLICT` no-op
   never inflates it.
+- Three counters on the retention pass:
+  `notifier_intake_dead_letter_purge_passes_total` (initialised to `0` at bind, so
+  `rate(...[26h]) == 0` fires even when no pass ever succeeded),
+  `notifier_intake_dead_letters_purged_total` and
+  `notifier_intake_dead_letter_purge_failures_total`. Retention was the only
+  promise in this release with no series of its own: its three failure modes — a
+  dead task, a lost `DELETE` grant, a database that will not answer — were visible
+  in the logs alone, and a ledger that stops shrinking is indistinguishable from a
+  ledger with nothing to remove. The README's retention alert pointed at
+  `notifier_intake_dead_letters_total`, which measures *new abandonments arriving*
+  and says nothing about the purge; it now points at the three above.
 - e2e `scenarios_intake::s32` — the retention edge, asserted a day either side of
   the 90-day window, plus the failure posture: with the `DELETE` grant revoked the
   pass says so in the logs, `/readyz` stays UP and the read surface keeps serving.

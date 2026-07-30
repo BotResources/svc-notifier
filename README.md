@@ -157,15 +157,19 @@ contract crate; on the bus it travels as the `payload` of the standard
   What that costs is **intake throughput, not a hard stall**: the loop settles
   every delivery (`ack` / `nak` / `term`) before its next `recv()`, and a `nak` is
   an explicit settlement — it releases the delivery and schedules redelivery after
-  `NAK_DELAY` (1s). So this consumer never holds more than one unsettled delivery,
+  a delay of its own, `UNDECODABLE_NAK_DELAY` (30s), thirty times the `NAK_DELAY`
+  (1s) a *held* command is retried with. Nothing about an unreadable frame changes
+  between two attempts, so its redelivery is pure loop and log cost; the short
+  delay exists for the retry that can actually succeed, a storage outage clearing.
+  So this consumer never holds more than one unsettled delivery,
   and the Fabric's `max_ack_pending` of 256 is **not** the ceiling here: it bounds
   delivered-but-unsettled messages, which a NAKed frame is not. (Stated explicitly
   because the opposite — "256 held frames fill `max_ack_pending` and freeze the
   intake" — is a plausible reading of the same configuration, and acting on it
   would send an operator after the wrong thing.) The actual bound is arithmetic: N
-  stuck envelopes cost N redeliveries per second of loop turns and log volume,
-  interleaved with real work, so a large N delays legitimate commands and can
-  swamp the logs long before anything breaks. `notifier_intake_undecodable_deliveries_total`
+  stuck envelopes cost N redeliveries every 30 seconds of loop turns and log
+  volume, interleaved with real work, so a large N delays legitimate commands and
+  can swamp the logs long before anything breaks. `notifier_intake_undecodable_deliveries_total`
   rising with a flat `..._dead_letters_total` is that condition, and it is the
   alert to wire. Reaching a painful N takes a producer emitting non-JSON at scale,
   which a typed publisher cannot do. Closing it properly needs an operator drain
@@ -218,10 +222,24 @@ contract crate; on the bus it travels as the `payload` of the standard
   same reason a storage outage does not: pulling the pod out of the Service
   endpoints over housekeeping would cut the healthy read and subscription surface
   with it. The task is watched like the live ones, so its death is loud rather than
-  silent — only its consequences differ. What to alert on is
-  `notifier_intake_dead_letters_total`, which counts **committed ledger rows** and
-  nothing else: a replayed frame that hits the `ON CONFLICT DO NOTHING` no-op never
-  increments it, so its rate is a rate of *new* abandonments, not of redeliveries.
+  silent — only its consequences differ.
+
+  **Alert on the pass, not on the ledger.** Retention has three failure modes — the
+  task is dead, the `DELETE` grant is gone, the database will not answer — and none
+  of them is visible from the ledger: a table that stops shrinking looks exactly
+  like a table with nothing to remove. Each mode has its own series:
+
+  | Metric | Type | Meaning |
+  |---|---|---|
+  | `notifier_intake_dead_letter_purge_passes_total` | counter | passes that completed. Initialised to `0` when the consumer binds, so the series exists before the first pass — **`rate(...[26h]) == 0` is the dead-task alert**, and it must fire even when no pass has ever succeeded |
+  | `notifier_intake_dead_letters_purged_total` | counter | rows the pass deleted |
+  | `notifier_intake_dead_letter_purge_failures_total` | counter | passes that failed — **rising means rows are being kept past their retention**; read the error log for which of the three modes it is |
+
+  `notifier_intake_dead_letters_total` is **not** the retention alert: it counts
+  committed ledger rows (a replayed frame hitting the `ON CONFLICT DO NOTHING`
+  no-op never increments it), so it measures *new abandonments arriving*, and it
+  rises and falls with producer behaviour whatever the purge is doing.
+
   Retention is deliberately **not** a deployment knob today: 90 days is one
   operator decision recorded in one constant, and a second knob would only let a
   cluster drift from it silently.
@@ -258,6 +276,7 @@ contract crate; on the bus it travels as the `payload` of the standard
   | `notifier_intake_dead_letters_total{reason}` | counter | abandonments, by stable reason code. Counts **committed ledger rows**: a replayed frame deduplicated by `command_id` adds nothing, so the rate is one of new abandonments, not of redeliveries |
   | `notifier_intake_undecodable_deliveries_total` | counter | **deliveries** of an envelope that cannot be read at all, held on the stream — the same stuck frame counts on every redelivery |
   | `notifier_intake_ledger_failures_total` | counter | dead-letter writes that failed, degrading an abandonment to a hold. A revoked grant or a broken ledger, **not** a storage outage — it would otherwise hide in the transient counter |
+  | `notifier_intake_dead_letter_purge_passes_total` / `..._dead_letters_purged_total` / `..._dead_letter_purge_failures_total` | counters | the retention pass — see "Dead-letter retention" for the alerts to build on them |
 
   Every series carries a HELP description (`describe_counter!` /
   `describe_gauge!`), so `/metrics` documents itself.

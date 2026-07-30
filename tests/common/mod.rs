@@ -104,6 +104,13 @@ pub const CONSECUTIVE_TRANSIENT_FAILURES_METRIC: &str =
 // service's broken posture — cannot be read off the transient counter as a
 // PostgreSQL outage: the two conditions have different runbooks.
 pub const LEDGER_FAILURES_TOTAL_METRIC: &str = "notifier_intake_ledger_failures_total";
+// The retention pass's own series. It is the only promise in the service whose
+// failure modes (a dead task, a lost grant, a database that will not answer) are
+// invisible from the ledger itself: a table that stops shrinking looks exactly
+// like a table with nothing to remove.
+pub const PURGE_PASSES_TOTAL_METRIC: &str = "notifier_intake_dead_letter_purge_passes_total";
+pub const DEAD_LETTERS_PURGED_TOTAL_METRIC: &str = "notifier_intake_dead_letters_purged_total";
+pub const PURGE_FAILURES_TOTAL_METRIC: &str = "notifier_intake_dead_letter_purge_failures_total";
 
 // The stable dead-letter reason codes (`src/intake.rs`, `DeadLetterReason`).
 // The ledger's `reason` column is an operator contract: a runbook greps these.
