@@ -163,6 +163,7 @@ pub struct Page {
 
 pub async fn list_notifications(
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
     first: i64,
     after: Option<Uuid>,
 ) -> Result<Page, sqlx::Error> {
@@ -170,13 +171,16 @@ pub async fn list_notifications(
     let rows = sqlx::query(
         "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
          FROM notifications
-         WHERE $1::uuid IS NULL
-            OR (created_at, id) < (
-                SELECT created_at, id FROM notifications WHERE id = $1
-            )
+         WHERE recipient_id = $1
+           AND ($2::uuid IS NULL
+                OR (created_at, id) < (
+                    SELECT created_at, id FROM notifications
+                    WHERE id = $2 AND recipient_id = $1
+                ))
          ORDER BY created_at DESC, id DESC
-         LIMIT $2",
+         LIMIT $3",
     )
+    .bind(recipient_id)
     .bind(after)
     .bind(limit + 1)
     .fetch_all(&mut **tx)
@@ -195,10 +199,17 @@ pub async fn list_notifications(
     })
 }
 
-pub async fn unread_count(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query("SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL")
-        .fetch_one(&mut **tx)
-        .await?;
+pub async fn unread_count(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM notifications
+         WHERE read_at IS NULL AND recipient_id = $1",
+    )
+    .bind(recipient_id)
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(row.get("n"))
 }
 

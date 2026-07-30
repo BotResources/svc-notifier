@@ -2,6 +2,7 @@ use async_graphql::{Context, ID, Object, SimpleObject, Subscription, Union};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use sqlx::PgPool;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
@@ -39,10 +40,6 @@ fn resolve_recipient(passport: &Passport) -> Option<Recipient> {
 
 fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
     resolve_recipient(passport(ctx)?).ok_or_else(EdgeError::forbidden)
-}
-
-fn require_human(ctx: &Context<'_>) -> Result<()> {
-    recipient(ctx).map(|_| ())
 }
 
 fn db_error(error: sqlx::Error) -> EdgeError {
@@ -116,10 +113,10 @@ impl QueryRoot {
         #[graphql(default = 20)] first: i32,
         after: Option<ID>,
     ) -> Result<NotificationConnection> {
-        require_human(ctx)?;
+        let caller = recipient(ctx)?;
         let after = parse_id(after)?;
         let mut tx = scoped_tx(ctx).await?;
-        let page = list_notifications(&mut tx, first as i64, after)
+        let page = list_notifications(&mut tx, caller.0, first as i64, after)
             .await
             .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
@@ -130,9 +127,9 @@ impl QueryRoot {
     }
 
     async fn notifier_unread_count(&self, ctx: &Context<'_>) -> Result<i32> {
-        require_human(ctx)?;
+        let caller = recipient(ctx)?;
         let mut tx = scoped_tx(ctx).await?;
-        let count = unread_count(&mut tx).await.map_err(db_error)?;
+        let count = unread_count(&mut tx, caller.0).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         Ok(count as i32)
     }
@@ -205,16 +202,27 @@ impl SubscriptionRoot {
     async fn notifier_notification_events(
         &self,
         ctx: &Context<'_>,
-    ) -> impl Stream<Item = NotifierNotificationEvent> + use<> {
-        let receiver = match (ctx.data::<AppState>(), ctx.data::<Passport>()) {
-            (Ok(state), Ok(passport)) => resolve_recipient(passport)
-                .map(|recipient| state.subscribers.subscribe(recipient.0)),
-            _ => None,
-        };
-        futures::stream::iter(receiver)
-            .flat_map(BroadcastStream::new)
-            .filter_map(|event| async move { event.ok().map(into_union) })
+    ) -> Result<impl Stream<Item = NotifierNotificationEvent> + use<>> {
+        let state = ctx
+            .data::<AppState>()
+            .map_err(|_| EdgeError::internal("missing app state in context"))?;
+        let caller = recipient(ctx)?;
+        Ok(until_first_lag(state.subscribers.subscribe(caller.0)))
     }
+}
+
+fn until_first_lag(
+    receiver: broadcast::Receiver<ClientEvent>,
+) -> impl Stream<Item = NotifierNotificationEvent> {
+    BroadcastStream::new(receiver)
+        .take_while(|delivery| {
+            let lagged = delivery.is_err();
+            if lagged {
+                tracing::warn!("subscriber lagged behind the broadcast buffer, ending the stream");
+            }
+            futures::future::ready(!lagged)
+        })
+        .filter_map(|delivery| async move { delivery.ok().map(into_union) })
 }
 
 fn into_union(event: ClientEvent) -> NotifierNotificationEvent {
