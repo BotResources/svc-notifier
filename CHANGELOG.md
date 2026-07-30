@@ -22,31 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **poison** frame — undecodable, or a permanently invalid write (SQLSTATE class
   `22` data exception / `23` integrity constraint violation) — is terminated,
   because retrying it can never succeed. Classification is conservative: anything
-  unrecognised is transient. A sustained outage is now visible to operators —
-  after three consecutive transient failures the service reports `/readyz` DOWN
-  (with an operator-facing reason) and restores readiness on its own, on whichever
-  comes first: the next successful write, or a bounded storage probe (`SELECT 1`
-  every 5s, stops on the first answer, never more than one in flight) armed at
-  escalation so a quiet service does not stay out of rotation waiting for traffic.
-  The probe grants **one** restoration per real write (hysteresis): under a
-  *partial* outage — reads answering while writes fail (statement timeout, disk
-  full, read-only replica, a durably failing ledger write) — a probe-restored
-  readiness that is immediately taken back down by the next failed write does not
-  re-arm the probe, so the endpoints cannot oscillate UP/DOWN on a ~5s period and
-  tear every SSE subscription each cycle. Readiness then stays DOWN until a write
-  actually succeeds.
-  Escalation is idempotent rather than a one-shot at the threshold, so an external
-  `set_ready()` cannot leave the gauge stuck above it; recovery only ever clears a
-  `NotReady` carrying the storage-outage reason, so it can never mask an unrelated
-  fail-loud. The never-lose guarantee is bounded by the `INTEGRATION_CMD`
-  retention declared deployment-side (7 days / 512 MiB in production today) — an
-  outage approaching that is an operator incident the readiness signal raises long
-  in advance.
-- **A terminated command now leaves a durable trace.** Terminating a permanently
-  invalid write destroyed the request — for *every* recipient of the fan-out at
+  unrecognised is transient. A sustained outage is visible to operators through
+  **metrics, not readiness**: `notifier_intake_consecutive_transient_failures`
+  (gauge, reset by the first completed write) plus
+  `notifier_intake_transient_failures_total`. Readiness deliberately stays UP
+  during a storage outage — taking it DOWN removes the pod from the Service
+  endpoints and severs the queries and subscriptions that are still healthy, and
+  since every replica shares one PostgreSQL they would all drop together, turning
+  a write-side outage into a total one. The never-lose guarantee is bounded by the
+  `INTEGRATION_CMD` retention declared deployment-side (7 days / 512 MiB in
+  production today) — an outage approaching that is an operator incident the
+  gauge raises long in advance, provided it is alerted on.
+- **No command is terminated without a committed ledger row — no exception.**
+  Terminating destroyed the request — for *every* recipient of the fan-out at
   once — with nothing but a log line. A new `dead_letters` table records the
-  `source_event_id`, the full `recipient_ids` list, the raw command bytes and the
-  SQLSTATE **before** the frame is terminated; if the ledger write itself fails,
+  abandonment `reason`, the `source_event_id`, the full `recipient_ids` list, the
+  raw command bytes and the SQLSTATE **before** the frame is terminated; if the
+  ledger write itself fails,
   the command is NAKed rather than terminated, so the intake never drops a request
   it cannot account for. The command is stored as `BYTEA` deliberately: the byte
   sequence that made the notification write impossible (a NUL character, say)
@@ -63,11 +55,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrive as several deliver commands (chunked recipients, a late addition). Keyed
   on the source event, the first poison chunk would be recorded and every later
   one terminated with **no trace at all** — the same loss class this release
-  exists to close, moved onto the poison path. Undecodable frames still get no
-  ledger row: the Fabric's `Delivered` exposes no raw bytes, so there is nothing
-  faithful to record; the error log carries the subject and delivery count as a
-  degraded trace. **Retention is deliberately not decided** — no purge ships with
-  this change; it is an operator call recorded as an open question in the README.
+  exists to close, moved onto the poison path. **Retention is deliberately not
+  decided** — no purge ships with this change; it is an operator call recorded as
+  an open question in the README.
+- **A refused payload is traced, not silently destroyed.** The intake used to
+  terminate any frame the contract refused to deserialize on a log line alone —
+  no ledger row, not even the ids in the log. Two real triggers made that a
+  silent-loss hole: an out-of-domain `link` (the spec's first-class business
+  refusal, enforced at deserialization by `RelativeLink`) and any contract skew
+  that made *all* of a producer's frames undecodable. The consumer now
+  deserializes the `IntegrationCommand` envelope with a **raw JSON payload** and
+  validates that payload strictly in the service, so the `command_id`,
+  `correlation_id`, the ids it can read and the verbatim bytes are recovered
+  **before** the frame is judged. A refused payload — unsafe `link`
+  (`relative_link_rejected`), a shape the contract does not describe
+  (`payload_shape_rejected`), or **no recipient at all** (`no_recipients`, until
+  now acked in silence as a no-op) — is recorded on the ledger and terminated
+  only after that row commits, exactly like a SQLSTATE 22/23 poison, with the same
+  degrade-to-transient when the ledger is unwritable. The published contract is
+  unchanged: producers using `br-notifier-publisher` still cannot construct an
+  unsafe link — only the receiver became decode-tolerant, in order to trace what it
+  refuses. The one residual class, an envelope that is not valid JSON at all (a
+  typed publisher cannot emit one), is **NAKed and held forever, never
+  terminated**: it carries no id to key a ledger row on, and a frame that cannot
+  be accounted for is not destroyed. It is counted by
+  `notifier_intake_undecodable_frames_total`.
+- **A large fan-out no longer races its own `ack_wait`.** The intake inserted one
+  row and emitted one `pg_notify` per recipient, serialized inside a single
+  transaction on a one-at-a-time consume loop; at ~1000 recipients that work
+  approached the consumer's 30s `ack_wait` and invited a redelivery *during* the
+  write. The fan-out is now a single set-based
+  `INSERT ... SELECT unnest($1::uuid[]), ...  ON CONFLICT DO NOTHING RETURNING`,
+  and the `Added` announcements ride batched `pg_notify` statements (150 payloads
+  per statement) in the same transaction. Dedup semantics are unchanged: ids stay
+  client-minted UUIDv7, first write wins, a replay alters nothing.
+- **A lagging subscriber is disconnected instead of silently truncated.** The
+  subscription discarded `BroadcastStream`'s `Lagged(n)`, so a client whose buffer
+  overflowed kept folding a stream that had lost facts and diverged from the
+  server forever — against the spec's "a reconnecting client rebuilds state
+  without loss". The stream now **ends** on the first lag, and the client's normal
+  reconnect + snapshot protocol repairs the state. A `Passport::Service` on the
+  subscription is now a `FORBIDDEN` verdict too, like every query and mutation,
+  instead of an empty stream that completes immediately.
 - **Bulk mutations no longer break above ~200 notifications.** `pg_notify` caps
   its payload at 8000 bytes and errors above it — inside the write transaction,
   that error aborted the **whole mutation**, so `notifierMarkAllAsRead` /
@@ -81,7 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaving row-level security as the single barrier. They now carry an explicit
   `recipient_id = $caller` predicate as well (principle 15: enforce at both
   layers), so a loosened policy or a query issued outside a scoped transaction
-  cannot silently become a cross-recipient write.
+  cannot silently become a cross-recipient write. The two **reads** —
+  `notifierNotifications` (including its pagination-cursor lookup) and
+  `notifierUnreadCount` — now carry it too: they were the surfaces the 1.0
+  isolation breach leaked through and were the last statements relying on RLS
+  alone.
 - **The intake task is supervised.** It ran on a detached tokio task: a panic or
   cancellation killed the consumer while the process kept answering `/readyz` 200
   and delivery commands piled up unconsumed — precisely the "healthy probe over a
@@ -105,12 +138,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Migration `0002_dead_letters.sql` — the abandonment ledger for terminated
   delivery commands (RLS forced, ingest-write policy only, unique on
   `command_id`).
+- Migration `0003_dead_letter_reason.sql` — the ledger's stable `reason` code
+  (indexed), and a nullable `source_event_id` for the refused payloads that carry
+  no readable one.
+- Prometheus metrics on the intake, the replacement for the readiness escalation:
+  `notifier_intake_dead_letters_total{reason}`,
+  `notifier_intake_transient_failures_total`,
+  `notifier_intake_consecutive_transient_failures` (gauge) and
+  `notifier_intake_undecodable_frames_total`, on the existing
+  `br-util-observability` `/metrics` wiring.
 - e2e `scenarios_outage::s07c` — an outage held past the retired five-delivery
   budget, gated on **JetStream's own** `delivered_count` rather than on counting
-  service log lines: the frame keeps being NAKed, `/readyz` goes DOWN, and when
-  Postgres returns the notification is delivered exactly once, a subscriber that
-  opened *before* the outage receives the `NotificationAdded`, no dead letter is
-  written, and readiness recovers.
+  service log lines: the frame keeps being NAKed and, when Postgres returns, the
+  notification is delivered exactly once, a subscriber that opened *before* the
+  outage receives the `NotificationAdded`, and no dead letter is written.
 - e2e `scenarios_intake::s20` — two distinct poison commands sharing one
   `source_event_id` (the chunked-recipients shape) leave **two** audit lines, each
   naming its own recipients; the command round-trips verbatim; replaying the same
@@ -124,8 +165,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   impersonated passport.
 - Unit tests on the new intake failure classification (transient never
   terminates; only SQLSTATE `22`/`23` is poison; an unreachable database is
-  transient), on the storage gauge's escalation/hysteresis, on
-  `graphql::resolve_recipient`, and on the `pg_notify` chunk payload bound.
+  transient), on the permissive decode and its refusals (a valid command survives
+  it unchanged; an unsafe link, an undescribed shape and a recipient-less command
+  each map to their stable ledger reason; a refused frame still yields the ids the
+  ledger needs; an unreadable envelope is held, never terminated), on the
+  transient-failure streak, on `graphql::resolve_recipient`, and on the
+  `pg_notify` chunk payload bound.
 
 ## 1.0.2
 
