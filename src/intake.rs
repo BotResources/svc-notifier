@@ -20,6 +20,9 @@ const NAK_DELAY: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 10;
 const PERMANENTLY_INVALID_SQLSTATE_CLASSES: [&str; 2] = ["22", "23"];
 
+const DEAD_LETTER_RETENTION_DAYS: i32 = 90;
+const PURGE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 const DEAD_LETTERS_TOTAL: &str = "notifier_intake_dead_letters_total";
 const TRANSIENT_FAILURES_TOTAL: &str = "notifier_intake_transient_failures_total";
 const CONSECUTIVE_TRANSIENT_FAILURES: &str = "notifier_intake_consecutive_transient_failures";
@@ -44,6 +47,7 @@ enum DeadLetterReason {
     PayloadShapeRejected,
     RelativeLinkRejected,
     NoRecipients,
+    TemplateRejected,
     StorageRejected,
 }
 
@@ -53,6 +57,7 @@ impl DeadLetterReason {
             Self::PayloadShapeRejected => "payload_shape_rejected",
             Self::RelativeLinkRejected => "relative_link_rejected",
             Self::NoRecipients => "no_recipients",
+            Self::TemplateRejected => "template_rejected",
             Self::StorageRejected => "storage_rejected",
         }
     }
@@ -278,6 +283,21 @@ fn validate(payload: &Value) -> Result<DeliverNotification, Rejection> {
             detail: "the command names no recipient".to_owned(),
         });
     }
+    if raw.template.trim().is_empty() {
+        return Err(Rejection {
+            reason: DeadLetterReason::TemplateRejected,
+            detail: "the template is empty".to_owned(),
+        });
+    }
+    if let Some(offending) = raw.template.chars().find(|c| c.is_control()) {
+        return Err(Rejection {
+            reason: DeadLetterReason::TemplateRejected,
+            detail: format!(
+                "the template carries the control character U+{:04X}",
+                offending as u32
+            ),
+        });
+    }
     Ok(DeliverNotification {
         source_event_id: raw.source_event_id,
         recipient_ids: raw.recipient_ids,
@@ -422,6 +442,38 @@ async fn record_dead_letter(
     .await?
     .map(|row| row.get("id"));
     Ok(recorded)
+}
+
+pub async fn purge_dead_letters(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
+    let mut ticks = tokio::time::interval(PURGE_INTERVAL);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = ticks.tick() => match delete_expired_dead_letters(&pool).await {
+                Ok(purged) => tracing::info!(
+                    purged,
+                    retention_days = DEAD_LETTER_RETENTION_DAYS,
+                    "dead-letter retention pass completed"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    retention_days = DEAD_LETTER_RETENTION_DAYS,
+                    "dead-letter retention pass failed, retrying at the next tick — the ledger keeps rows past their retention until it succeeds"
+                ),
+            },
+        }
+    }
+}
+
+async fn delete_expired_dead_letters(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let deleted = sqlx::query(
+        "DELETE FROM dead_letters WHERE recorded_at < now() - make_interval(days => $1)",
+    )
+    .bind(DEAD_LETTER_RETENTION_DAYS)
+    .execute(pool)
+    .await?;
+    Ok(deleted.rows_affected())
 }
 
 fn outcome_for(failure: Option<FailureClass>) -> MessageOutcome {
@@ -580,6 +632,59 @@ mod tests {
         }
     }
 
+    fn wire_template(template: Value) -> Value {
+        json!({
+            "source_event_id": "0196a000-0000-7000-8000-000000000001",
+            "recipient_ids": ["0196a000-0000-7000-8000-000000000002"],
+            "template": template,
+            "payload": {},
+        })
+    }
+
+    #[test]
+    fn a_template_no_renderer_could_key_on_is_refused_before_the_write() {
+        // The NUL is the one PostgreSQL itself refuses (SQLSTATE 22021, the
+        // abandonment this rule replaces); the rest of the control range and the
+        // empty template are refused with it, because a rendering key made of
+        // nothing, or carrying a newline, is a producer bug either way and the
+        // ledger owes it the same named reason rather than a storage accident.
+        for unusable in [
+            "",
+            "   ",
+            "\t",
+            "poison\u{0}template",
+            "line\nbreak",
+            "bell\u{7}",
+        ] {
+            let rejection = validate(&wire_template(json!(unusable)))
+                .err()
+                .unwrap_or_else(|| panic!("{unusable:?} must be refused"));
+            assert_eq!(
+                rejection.reason,
+                DeadLetterReason::TemplateRejected,
+                "a clean refusal beats an abandonment on the write: {unusable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_that_merely_looks_unusual_is_still_accepted() {
+        for accepted in [
+            "meeting_scheduled",
+            "meeting.scheduled.v2",
+            "réunion_planifiée",
+            "会議",
+            "  padded_but_not_empty  ",
+        ] {
+            let command = validate(&wire_template(json!(accepted)))
+                .unwrap_or_else(|error| panic!("{accepted:?} must be accepted: {error:?}"));
+            assert_eq!(
+                command.template, accepted,
+                "the intake refuses a key nothing could render, it does not police naming"
+            );
+        }
+    }
+
     #[test]
     fn a_payload_the_contract_does_not_describe_is_a_traceable_rejection() {
         for shape in [
@@ -620,6 +725,7 @@ mod tests {
                 "relative_link_rejected",
             ),
             (DeadLetterReason::NoRecipients, "no_recipients"),
+            (DeadLetterReason::TemplateRejected, "template_rejected"),
             (DeadLetterReason::StorageRejected, "storage_rejected"),
         ] {
             assert_eq!(reason.as_str(), code);

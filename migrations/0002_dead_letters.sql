@@ -27,4 +27,4 @@ CREATE POLICY dead_letters_ingest_write ON dead_letters
     USING (true)
     WITH CHECK (true);
 
-GRANT SELECT, INSERT ON dead_letters TO svc_notifier_ingest;
+GRANT SELECT, INSERT, DELETE ON dead_letters TO svc_notifier_ingest;
