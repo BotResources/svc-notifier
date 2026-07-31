@@ -57,57 +57,114 @@ pub enum NotificationSignal {
     },
 }
 
+impl NotificationSignal {
+    pub const fn recipient_id(&self) -> Uuid {
+        match self {
+            Self::Added { recipient_id, .. }
+            | Self::Read { recipient_id, .. }
+            | Self::Deleted { recipient_id, .. } => *recipient_id,
+        }
+    }
+}
+
 pub const NOTIFY_CHANNEL: &str = "notification_events";
 
-async fn signal<'e, E>(executor: E, signal: &NotificationSignal) -> Result<(), sqlx::Error>
+pub const SIGNAL_ID_CHUNK: usize = 150;
+
+pub const SIGNALS_PER_STATEMENT: usize = 150;
+
+async fn signal<'e, E>(executor: E, signals: &[NotificationSignal]) -> Result<(), sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let payload = serde_json::to_string(signal).expect("signal serialization cannot fail");
-    sqlx::query("SELECT pg_notify($1, $2)")
+    let payloads: Vec<String> = signals
+        .iter()
+        .map(|signal| serde_json::to_string(signal).expect("signal serialization cannot fail"))
+        .collect();
+    sqlx::query("SELECT pg_notify($1, payload) FROM unnest($2::text[]) AS payload")
         .bind(NOTIFY_CHANNEL)
-        .bind(payload)
+        .bind(&payloads)
         .execute(executor)
         .await?;
     Ok(())
 }
 
-pub async fn insert_notification(
+async fn signal_all(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    signals: &[NotificationSignal],
+) -> Result<(), sqlx::Error> {
+    for batch in signals.chunks(SIGNALS_PER_STATEMENT) {
+        signal(&mut **tx, batch).await?;
+    }
+    Ok(())
+}
+
+async fn signal_read(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
+    ids: &[Uuid],
+    read_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let signals: Vec<NotificationSignal> = ids
+        .chunks(SIGNAL_ID_CHUNK)
+        .map(|chunk| NotificationSignal::Read {
+            recipient_id,
+            ids: chunk.to_vec(),
+            read_at,
+        })
+        .collect();
+    signal_all(tx, &signals).await
+}
+
+async fn signal_deleted(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
+    ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    let signals: Vec<NotificationSignal> = ids
+        .chunks(SIGNAL_ID_CHUNK)
+        .map(|chunk| NotificationSignal::Deleted {
+            recipient_id,
+            ids: chunk.to_vec(),
+        })
+        .collect();
+    signal_all(tx, &signals).await
+}
+
+pub async fn insert_notifications(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     source_event_id: Uuid,
-    recipient_id: Uuid,
+    recipient_ids: &[Uuid],
     template: &str,
     payload: &serde_json::Value,
     link: Option<&RelativeLink>,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let id = Uuid::now_v7();
-    let inserted: Option<Uuid> = sqlx::query(
+) -> Result<usize, sqlx::Error> {
+    let ids: Vec<Uuid> = recipient_ids.iter().map(|_| Uuid::now_v7()).collect();
+    let rows = sqlx::query(
         "INSERT INTO notifications (id, source_event_id, recipient_id, template, payload, link)
-         VALUES ($1, $2, $3, $4, $5, $6)
+         SELECT fan_out.id, $2, fan_out.recipient_id, $4, $5, $6
+         FROM unnest($1::uuid[], $3::uuid[]) AS fan_out(id, recipient_id)
          ON CONFLICT (source_event_id, recipient_id) DO NOTHING
-         RETURNING id",
+         RETURNING id, recipient_id",
     )
-    .bind(id)
+    .bind(&ids)
     .bind(source_event_id)
-    .bind(recipient_id)
+    .bind(recipient_ids)
     .bind(template)
     .bind(payload)
     .bind(link.map(RelativeLink::as_str))
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(|row| row.get("id"));
+    .fetch_all(&mut **tx)
+    .await?;
 
-    if let Some(new_id) = inserted {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Added {
-                recipient_id,
-                id: new_id,
-            },
-        )
-        .await?;
-    }
-    Ok(inserted)
+    let signals: Vec<NotificationSignal> = rows
+        .iter()
+        .map(|row| NotificationSignal::Added {
+            recipient_id: row.get("recipient_id"),
+            id: row.get("id"),
+        })
+        .collect();
+    signal_all(tx, &signals).await?;
+    Ok(signals.len())
 }
 
 pub struct Page {
@@ -117,20 +174,34 @@ pub struct Page {
 
 pub async fn list_notifications(
     tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
     first: i64,
     after: Option<Uuid>,
-) -> Result<Page, sqlx::Error> {
+) -> Result<Option<Page>, sqlx::Error> {
+    if let Some(cursor) = after {
+        let anchor = sqlx::query("SELECT 1 FROM notifications WHERE id = $1 AND recipient_id = $2")
+            .bind(cursor)
+            .bind(recipient_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if anchor.is_none() {
+            return Ok(None);
+        }
+    }
     let limit = first.clamp(1, 100);
     let rows = sqlx::query(
         "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
          FROM notifications
-         WHERE $1::uuid IS NULL
-            OR (created_at, id) < (
-                SELECT created_at, id FROM notifications WHERE id = $1
-            )
+         WHERE recipient_id = $1
+           AND ($2::uuid IS NULL
+                OR (created_at, id) < (
+                    SELECT created_at, id FROM notifications
+                    WHERE id = $2 AND recipient_id = $1
+                ))
          ORDER BY created_at DESC, id DESC
-         LIMIT $2",
+         LIMIT $3",
     )
+    .bind(recipient_id)
     .bind(after)
     .bind(limit + 1)
     .fetch_all(&mut **tx)
@@ -143,50 +214,66 @@ pub async fn list_notifications(
         .map(Notification::from_row)
         .collect::<Result<Vec<_>, _>>()
         .map_err(corrupt)?;
-    Ok(Page {
+    Ok(Some(Page {
         nodes,
         has_next_page,
-    })
+    }))
 }
 
-pub async fn unread_count(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query("SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL")
-        .fetch_one(&mut **tx)
-        .await?;
+pub async fn unread_count(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    recipient_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM notifications
+         WHERE read_at IS NULL AND recipient_id = $1",
+    )
+    .bind(recipient_id)
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(row.get("n"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    Transitioned,
+    AlreadyRead,
 }
 
 pub async fn mark_as_read(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     recipient_id: Uuid,
     id: Uuid,
-) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+) -> Result<Option<ReadOutcome>, sqlx::Error> {
     let row = sqlx::query(
-        "UPDATE notifications
-         SET read_at = COALESCE(read_at, now())
-         WHERE id = $1
-         RETURNING read_at",
+        "WITH before AS (
+             SELECT id, read_at FROM notifications
+             WHERE id = $1 AND recipient_id = $2
+         ), transitioned AS (
+             UPDATE notifications SET read_at = now()
+             WHERE id = $1 AND recipient_id = $2 AND read_at IS NULL
+             RETURNING id, read_at
+         )
+         SELECT COALESCE(transitioned.read_at, before.read_at) AS read_at,
+                transitioned.id IS NOT NULL AS transitioned
+         FROM before LEFT JOIN transitioned ON transitioned.id = before.id",
     )
     .bind(id)
+    .bind(recipient_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let read_at: Option<DateTime<Utc>> = match row {
-        Some(row) => row.get("read_at"),
-        None => return Ok(None),
+    let Some(row) = row else {
+        return Ok(None);
     };
-    if let Some(read_at) = read_at {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Read {
-                recipient_id,
-                ids: vec![id],
-                read_at,
-            },
-        )
-        .await?;
-        return Ok(Some(read_at));
+    let transitioned: bool = row.get("transitioned");
+    let read_at: Option<DateTime<Utc>> = row.get("read_at");
+    match read_at {
+        Some(read_at) if transitioned => {
+            signal_read(tx, recipient_id, &[id], read_at).await?;
+            Ok(Some(ReadOutcome::Transitioned))
+        }
+        _ => Ok(Some(ReadOutcome::AlreadyRead)),
     }
-    Ok(None)
 }
 
 pub async fn mark_all_as_read(
@@ -197,23 +284,16 @@ pub async fn mark_all_as_read(
     let rows = sqlx::query(
         "UPDATE notifications
          SET read_at = $1
-         WHERE read_at IS NULL
+         WHERE read_at IS NULL AND recipient_id = $2
          RETURNING id",
     )
     .bind(read_at)
+    .bind(recipient_id)
     .fetch_all(&mut **tx)
     .await?;
     let ids: Vec<Uuid> = rows.iter().map(|row| row.get("id")).collect();
     if !ids.is_empty() {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Read {
-                recipient_id,
-                ids: ids.clone(),
-                read_at,
-            },
-        )
-        .await?;
+        signal_read(tx, recipient_id, &ids, read_at).await?;
     }
     Ok((ids, read_at))
 }
@@ -226,20 +306,16 @@ pub async fn delete_notifications(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query("DELETE FROM notifications WHERE id = ANY($1) RETURNING id")
-        .bind(ids)
-        .fetch_all(&mut **tx)
-        .await?;
+    let rows = sqlx::query(
+        "DELETE FROM notifications WHERE id = ANY($1) AND recipient_id = $2 RETURNING id",
+    )
+    .bind(ids)
+    .bind(recipient_id)
+    .fetch_all(&mut **tx)
+    .await?;
     let deleted: Vec<Uuid> = rows.iter().map(|row| row.get("id")).collect();
     if !deleted.is_empty() {
-        signal(
-            &mut **tx,
-            &NotificationSignal::Deleted {
-                recipient_id,
-                ids: deleted.clone(),
-            },
-        )
-        .await?;
+        signal_deleted(tx, recipient_id, &deleted).await?;
     }
     Ok(deleted)
 }
@@ -256,9 +332,10 @@ pub async fn read_notification_for(
         .await?;
     let row = sqlx::query(
         "SELECT id, source_event_id, recipient_id, template, payload, link, read_at, created_at
-         FROM notifications WHERE id = $1",
+         FROM notifications WHERE id = $1 AND recipient_id = $2",
     )
     .bind(id)
+    .bind(recipient_id)
     .fetch_optional(&mut *tx)
     .await?;
     let notification = match row {
@@ -304,5 +381,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["type"], "deleted");
+    }
+
+    const PG_NOTIFY_PAYLOAD_LIMIT: usize = 8000;
+
+    #[test]
+    fn a_full_signal_chunk_stays_under_the_pg_notify_payload_limit() {
+        let recipient_id = Uuid::now_v7();
+        let ids: Vec<Uuid> = (0..SIGNAL_ID_CHUNK).map(|_| Uuid::now_v7()).collect();
+
+        let read = serde_json::to_string(&NotificationSignal::Read {
+            recipient_id,
+            ids: ids.clone(),
+            read_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            read.len() < PG_NOTIFY_PAYLOAD_LIMIT,
+            "a bulk read signal of {SIGNAL_ID_CHUNK} ids serialises to {} bytes — over the limit \
+             the whole transaction is aborted by PostgreSQL",
+            read.len()
+        );
+
+        let deleted =
+            serde_json::to_string(&NotificationSignal::Deleted { recipient_id, ids }).unwrap();
+        assert!(
+            deleted.len() < PG_NOTIFY_PAYLOAD_LIMIT,
+            "a bulk delete signal of {SIGNAL_ID_CHUNK} ids serialises to {} bytes",
+            deleted.len()
+        );
     }
 }

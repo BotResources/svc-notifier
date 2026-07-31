@@ -51,23 +51,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_url = std::env::var("DATABASE_URL")?;
     let app_pool = br_util_postgres::init_pool(&app_url).await?;
 
-    let subscribers = Subscribers::default();
-    tokio::spawn(run_listener(app_pool.clone(), subscribers.clone()));
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let subscribers = Subscribers::default();
+    let listener_task = tokio::spawn(run_listener(app_pool.clone(), subscribers.clone()));
+    tokio::spawn(supervise(
+        listener_task,
+        "realtime-listener",
+        readiness.clone(),
+        shutdown_tx.clone(),
+    ));
+
     if let Some(nats_url) = std::env::var("NATS_URL").ok().filter(|url| !url.is_empty()) {
         let ingest_url = std::env::var("DATABASE_URL_INGEST")
             .map_err(|_| "DATABASE_URL_INGEST is required when NATS_URL is set")?;
         let ingest_pool = ingest_pool(&ingest_url).await?;
         let fabric = connect_fabric(&nats_url).await?;
         let consumer = intake::bind(&fabric).await?;
-        tokio::spawn(intake::consume(
+        let intake = tokio::spawn(intake::consume(
             consumer,
-            ingest_pool,
+            ingest_pool.clone(),
             readiness.clone(),
             shutdown_tx.clone(),
             shutdown_rx.clone(),
         ));
+        tokio::spawn(supervise(
+            intake,
+            "intake",
+            readiness.clone(),
+            shutdown_tx.clone(),
+        ));
+        let retention = tokio::spawn(intake::purge_dead_letters(ingest_pool, shutdown_rx.clone()));
+        tokio::spawn(watch_maintenance(retention, "dead-letter-retention"));
     }
 
     let schema = schema_builder()
@@ -97,19 +112,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     readiness.set_ready();
     tracing::info!(port, "svc-notifier listening");
-    let intake_failed = shutdown_rx.clone();
+    let live_task_failed = shutdown_rx.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown_rx))
         .await?;
-    let intake_terminated_abnormally = *intake_failed.borrow();
+    let terminated_abnormally = *live_task_failed.borrow();
     let _ = shutdown_tx.send(true);
-    if intake_terminated_abnormally {
-        return Err("intake terminated abnormally — exiting non-zero so K8s reschedules".into());
+    if terminated_abnormally {
+        return Err(
+            "a live task terminated abnormally — exiting non-zero so K8s reschedules".into(),
+        );
     }
     Ok(())
 }
 
-async fn shutdown_signal(mut intake_down: tokio::sync::watch::Receiver<bool>) {
+async fn supervise(
+    task: tokio::task::JoinHandle<()>,
+    name: &'static str,
+    readiness: ReadinessHandle,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let Some((error, ending)) = abnormal_ending(task).await else {
+        return;
+    };
+    let reason = format!("{name} task {ending}");
+    tracing::error!(%error, task = name, reason, "live task died — failing loud so K8s reschedules");
+    readiness.set_not_ready(reason);
+    let _ = shutdown_tx.send(true);
+}
+
+async fn watch_maintenance(task: tokio::task::JoinHandle<()>, name: &'static str) {
+    let Some((error, ending)) = abnormal_ending(task).await else {
+        return;
+    };
+    tracing::error!(
+        %error,
+        task = name,
+        ending,
+        "maintenance task died — its work stops until the next restart. Readiness stays UP: nothing it does is on a request path, and taking the pod out of the endpoints would turn a housekeeping failure into an outage"
+    );
+}
+
+async fn abnormal_ending(
+    task: tokio::task::JoinHandle<()>,
+) -> Option<(tokio::task::JoinError, &'static str)> {
+    match task.await {
+        Ok(()) => None,
+        Err(error) if error.is_panic() => Some((error, "panicked")),
+        Err(error) => Some((error, "was cancelled")),
+    }
+}
+
+async fn shutdown_signal(mut live_task_down: tokio::sync::watch::Receiver<bool>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -123,13 +177,13 @@ async fn shutdown_signal(mut intake_down: tokio::sync::watch::Receiver<bool>) {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
-    let intake_failed = async {
-        let _ = intake_down.wait_for(|down| *down).await;
+    let live_task_failed = async {
+        let _ = live_task_down.wait_for(|down| *down).await;
     };
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
-        _ = intake_failed => {},
+        _ = live_task_failed => {},
     }
 }
 

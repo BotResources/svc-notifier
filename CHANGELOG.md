@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.3
+
+Two breaches were declared, this patch fixes both, plus everything the reviews found on the way.
+
+### Fixed
+
+- src/intake.rs : the "retry 5 times then throw away" rule is gone. A temporary failure means retry forever, the queue keeps the command until storage comes back. Impossible content means drop, but only after writing a trace in the new dead_letters audit table, and if the trace itself cannot be written we keep retrying. Also carries the 90 days retention purge and the template validation
+- src/intake.rs + src/main.rs : during a storage outage the service stays "ready" and reports through metrics instead of leaving the rotation. The outage is shared by every pod, removing them all would make a partial failure total
+- migrations/0002 to 0004 (new) : the dead_letters audit table, write-only for the intake role, keyed by command so a trace can never be swallowed
+- src/main.rs : the background tasks are supervised, if one dies the service exits loudly instead of looking healthy
+- src/graphql.rs : the recipient is resolved in one single place that prefers the real acting human when impersonating, feeding both the API and the database security. A lagging live stream now gets a clear "re-sync" code instead of being silently truncated
+- src/notification.rs : every query filters by recipient on top of the database security, mark-as-read only announces real transitions, and the bulk actions no longer break above ~200 notifications
+- src/realtime.rs : live channels clean themselves up when nobody listens
+- tests/common/mod.rs : the harness learned to forge impersonated passports, read as the restricted role, prove a session alive before asserting silence, and repair its own grants between runs
+- tests/scenarios_impersonation.rs + scenarios_refusal.rs (new) : impersonation across list, badge, stream and bulks, and every refusal path with its audit line
+- tests/scenarios_outage.rs + scenarios_intake.rs : outage far beyond the old budget with the subscriber warned after recovery, one audit line per abandoned command, audit table unavailable means retry never drop
+- tests/scenarios_authn.rs + realtime + surface : newest-first finally asserted, API surface pinned as a closed world, database security proven alone, retention purge covered
+- README.md : intake semantics, retention decision, metrics to alert on, known gaps
+- Cargo.toml : 1.0.3
+
 ## 1.0.2
 
 ### Changed

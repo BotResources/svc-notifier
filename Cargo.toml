@@ -4,7 +4,7 @@ default-members = [".", "crates/br-notifier-contract", "crates/br-notifier-publi
 
 [package]
 name = "svc-notifier"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 publish = false
 rust-version = "1.94"
@@ -16,6 +16,7 @@ repository = "https://github.com/BotResources/svc-notifier"
 br-notifier-contract = { path = "crates/br-notifier-contract" }
 br-notifier-publisher = { path = "crates/br-notifier-publisher" }
 br-core-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-auth", tag = "v1.2.0", version = "1.2.0" }
+br-core-events = { git = "https://github.com/BotResources/br-rust-common", package = "br-core-events", tag = "v1.2.0", version = "1.2.0" }
 br-util-axum-auth = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-auth", tag = "v1.2.0", version = "1.2.0" }
 br-util-axum-readiness = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-axum-readiness", tag = "v1.2.0", version = "1.2.0" }
 br-util-graphql = { git = "https://github.com/BotResources/br-rust-common", package = "br-util-graphql", tag = "v1.2.0", version = "1.2.0", features = ["graphql"] }
@@ -26,6 +27,7 @@ async-graphql = { version = "7", features = ["chrono", "uuid"] }
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+metrics = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "json", "uuid", "chrono", "macros", "migrate"] }

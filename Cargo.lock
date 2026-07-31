@@ -3479,11 +3479,12 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svc-notifier"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "async-graphql",
  "axum",
  "br-core-auth",
+ "br-core-events",
  "br-core-integration",
  "br-notifier-contract",
  "br-notifier-publisher",
@@ -3497,6 +3498,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures",
+ "metrics",
  "reqwest",
  "serde",
  "serde_json",

@@ -2,15 +2,17 @@ use async_graphql::{Context, ID, Object, SimpleObject, Subscription, Union};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use sqlx::PgPool;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use uuid::Uuid;
 
 use br_core_auth::Passport;
 use br_util_graphql::EdgeError;
 
 use crate::notification::{
-    Notification, delete_notifications, list_notifications, mark_all_as_read, mark_as_read,
-    unread_count,
+    Notification, ReadOutcome, delete_notifications, list_notifications, mark_all_as_read,
+    mark_as_read, unread_count,
 };
 use crate::realtime::{ClientEvent, Subscribers};
 
@@ -28,15 +30,17 @@ fn passport<'a>(ctx: &Context<'a>) -> Result<&'a Passport> {
         .map_err(|_| EdgeError::internal("missing passport in context"))
 }
 
-fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
-    match passport(ctx)? {
-        Passport::Human { user_id, .. } => Ok(Recipient(*user_id)),
-        Passport::Service { .. } => Err(EdgeError::forbidden()),
+fn resolve_recipient(passport: &Passport) -> Option<Recipient> {
+    match passport {
+        Passport::Human { user_id, .. } => {
+            Some(Recipient(passport.impersonator_id().unwrap_or(*user_id)))
+        }
+        Passport::Service { .. } => None,
     }
 }
 
-fn require_human(ctx: &Context<'_>) -> Result<()> {
-    recipient(ctx).map(|_| ())
+fn recipient(ctx: &Context<'_>) -> Result<Recipient> {
+    resolve_recipient(passport(ctx)?).ok_or_else(EdgeError::forbidden)
 }
 
 fn db_error(error: sqlx::Error) -> EdgeError {
@@ -110,13 +114,14 @@ impl QueryRoot {
         #[graphql(default = 20)] first: i32,
         after: Option<ID>,
     ) -> Result<NotificationConnection> {
-        require_human(ctx)?;
+        let caller = recipient(ctx)?;
         let after = parse_id(after)?;
         let mut tx = scoped_tx(ctx).await?;
-        let page = list_notifications(&mut tx, first as i64, after)
+        let page = list_notifications(&mut tx, caller.0, first as i64, after)
             .await
             .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
+        let page = page.ok_or_else(EdgeError::not_found)?;
         Ok(NotificationConnection {
             nodes: page.nodes.iter().map(NotificationNode::from).collect(),
             has_next_page: page.has_next_page,
@@ -124,9 +129,9 @@ impl QueryRoot {
     }
 
     async fn notifier_unread_count(&self, ctx: &Context<'_>) -> Result<i32> {
-        require_human(ctx)?;
+        let caller = recipient(ctx)?;
         let mut tx = scoped_tx(ctx).await?;
-        let count = unread_count(&mut tx).await.map_err(db_error)?;
+        let count = unread_count(&mut tx, caller.0).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         Ok(count as i32)
     }
@@ -144,8 +149,11 @@ impl MutationRoot {
             .await
             .map_err(db_error)?
         {
-            Some(_) => {
+            Some(outcome) => {
                 tx.commit().await.map_err(db_error)?;
+                if outcome == ReadOutcome::AlreadyRead {
+                    tracing::debug!(%id, "mark-as-read replayed on an already-read notification");
+                }
                 Ok(true)
             }
             None => Err(EdgeError::not_found()),
@@ -199,17 +207,39 @@ impl SubscriptionRoot {
     async fn notifier_notification_events(
         &self,
         ctx: &Context<'_>,
-    ) -> impl Stream<Item = NotifierNotificationEvent> + use<> {
-        let receiver = match (ctx.data::<AppState>(), ctx.data::<Passport>()) {
-            (Ok(state), Ok(Passport::Human { user_id, .. })) => {
-                Some(state.subscribers.subscribe(*user_id))
-            }
-            _ => None,
-        };
-        futures::stream::iter(receiver)
-            .flat_map(BroadcastStream::new)
-            .filter_map(|event| async move { event.ok().map(into_union) })
+    ) -> Result<impl Stream<Item = Result<NotifierNotificationEvent>> + use<>> {
+        let state = ctx
+            .data::<AppState>()
+            .map_err(|_| EdgeError::internal("missing app state in context"))?;
+        let caller = recipient(ctx)?;
+        Ok(until_first_lag(state.subscribers.subscribe(caller.0)))
     }
+}
+
+const SUBSCRIPTION_LAGGED: &str = "subscription_lagged";
+
+fn until_first_lag(
+    receiver: broadcast::Receiver<ClientEvent>,
+) -> impl Stream<Item = Result<NotifierNotificationEvent>> {
+    futures::stream::unfold(Some(BroadcastStream::new(receiver)), |open| async move {
+        let mut deliveries = open?;
+        match deliveries.next().await? {
+            Ok(event) => Some((Ok(into_union(event)), Some(deliveries))),
+            Err(BroadcastStreamRecvError::Lagged(lost_events)) => {
+                tracing::warn!(
+                    lost_events,
+                    "subscriber lagged behind the broadcast buffer, ending the stream on a lagged verdict"
+                );
+                Some((Err(lagged(lost_events)), None))
+            }
+        }
+    })
+}
+
+fn lagged(lost_events: u64) -> EdgeError {
+    EdgeError::invalid_state()
+        .with_reason(SUBSCRIPTION_LAGGED)
+        .with_param("lost_events", lost_events.to_string())
 }
 
 fn into_union(event: ClientEvent) -> NotifierNotificationEvent {
@@ -256,4 +286,84 @@ fn parse_id(id: Option<ID>) -> Result<Option<Uuid>> {
 
 fn require_id(id: &ID) -> Result<Uuid> {
     Uuid::parse_str(id.as_str()).map_err(|_| EdgeError::bad_user_input())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use br_core_auth::{AuthMethod, PassportClaims};
+
+    fn human(user_id: Uuid, impersonator: Option<Uuid>) -> Passport {
+        Passport::human(
+            user_id,
+            false,
+            true,
+            AuthMethod::Jwt,
+            impersonator,
+            PassportClaims::new(),
+        )
+    }
+
+    #[test]
+    fn a_direct_human_is_their_own_recipient() {
+        let user_id = Uuid::now_v7();
+        let resolved = resolve_recipient(&human(user_id, None)).expect("a human is a recipient");
+        assert_eq!(resolved.0, user_id);
+    }
+
+    #[test]
+    fn an_impersonating_admin_stays_their_own_recipient() {
+        let admin_id = Uuid::now_v7();
+        let impersonated_id = Uuid::now_v7();
+        let resolved = resolve_recipient(&human(impersonated_id, Some(admin_id)))
+            .expect("an impersonating admin is a recipient");
+        assert_eq!(
+            resolved.0, admin_id,
+            "the acting human owns the notifications, never the impersonated user"
+        );
+    }
+
+    #[test]
+    fn a_lagged_stream_ends_on_a_verdict_the_client_can_key_on() {
+        let verdict = lagged(12);
+        assert_eq!(
+            verdict.code().as_str(),
+            "INVALID_STATE",
+            "a truncated stream is an unusable session, not a client mistake nor a server bug"
+        );
+        assert_eq!(verdict.reason_code(), Some(SUBSCRIPTION_LAGGED));
+        assert_eq!(
+            verdict.params().get("lost_events").map(String::as_str),
+            Some("12"),
+            "the client is told how much it lost before it resnapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overflowed_stream_serves_the_verdict_and_then_ends() {
+        let (sender, receiver) = broadcast::channel(2);
+        for _ in 0..3 {
+            sender
+                .send(ClientEvent::Deleted { ids: Vec::new() })
+                .expect("the receiver is open");
+        }
+
+        let served: Vec<_> = until_first_lag(receiver).collect().await;
+
+        assert_eq!(
+            served.len(),
+            1,
+            "a truncated stream must stop, never keep serving a fold that lost facts"
+        );
+        let Some(Err(verdict)) = served.into_iter().next() else {
+            panic!("the lag must surface as a verdict the client can read");
+        };
+        assert_eq!(verdict.reason_code(), Some(SUBSCRIPTION_LAGGED));
+    }
+
+    #[test]
+    fn a_service_is_never_a_recipient() {
+        let passport = Passport::service(Uuid::now_v7(), PassportClaims::new());
+        assert!(resolve_recipient(&passport).is_none());
+    }
 }
