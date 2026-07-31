@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 1.0.3
 
-Two breaches were declared on version 1.0, this patch fixes both, plus everything the reviews found on the way.
+Two breaches were declared, this patch fixes both, plus everything the reviews found on the way.
 
 ### Fixed
 
