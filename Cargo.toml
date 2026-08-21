@@ -46,7 +46,7 @@ br-util-nats-fabric = { git = "https://github.com/BotResources/br-rust-common", 
 br-test-harness = { git = "https://github.com/BotResources/br-e2e-harness", package = "br-test-harness", tag = "v1.1.2", version = "1.1.2", default-features = false, features = ["passport", "graphql", "sse", "nats-fabric", "spawned-nats"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 serde_json = "1"
 serial_test = "3"
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "json", "uuid", "chrono", "macros", "migrate"] }

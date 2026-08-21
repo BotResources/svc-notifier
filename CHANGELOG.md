@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - h2 0.4.13 -> 0.4.16 (RUSTSEC-2026-0258: unbounded queuing of empty DATA frames)
+- reqwest dev-dependency aligned on the fleet norm (`default-features = false` + `rustls-tls`), removing h2 from the lock entirely — the release binary never linked it (axum stays http1-only)
 
 ### Added
 
