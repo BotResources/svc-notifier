@@ -36,12 +36,12 @@ struct HttpState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging("svc-notifier");
-
     if std::env::args().nth(1).as_deref() == Some("schema") {
         println!("{}", schema_builder().finish().sdl());
         return Ok(());
     }
+
+    init_logging("svc-notifier");
 
     let metrics = init_metrics("svc-notifier")?;
     let readiness = ReadinessHandle::not_ready("starting up");

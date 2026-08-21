@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Services-registry release integration: `scripts/registry-gate.sh` (sealed-and-not-implemented gate at PR time, pre-build and pre-push), `scripts/registry-docs.sh` (SDL + DB schema photographed from the built artifacts and posed on the patch before the image push), `scripts/registry-implement.sh` (image record + advisory implemented-flip probe after publish), with `registry.toml` + `scripts/service-meta.sh` carrying the committed service coordinate. Wired into ci.yml (new required check `registry gate (bumped version sealed in the registry)`) and cd.yml
+- src/main.rs : the `schema` argument is answered first, before logging init, so `svc-notifier schema` prints the bare SDL under an empty environment (ships with the next release)
+
 ## 1.0.3
 
 Two breaches were declared, this patch fixes both, plus everything the reviews found on the way.

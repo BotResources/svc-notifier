@@ -1,7 +1,5 @@
 name: CI
 
-# CI gates the PR, not the commit: `pull_request` is the only trigger
-# (plus manual re-runs). CD owns pushes to main.
 on:
   pull_request:
     branches: [main]
@@ -96,8 +94,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Postgres runs as a plain container (not a `services:` block) so the
-      # DB-outage scenarios can `docker pause` it by name.
       - name: Start Postgres
         run: |
           docker run -d --name postgres --network host \
@@ -137,6 +133,48 @@ jobs:
           RUST_LOG: info
         run: cargo test --tests --no-fail-fast -- --test-threads=1
 
+  registry-gate:
+    name: registry gate (bumped version sealed in the registry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gate a bumped service version against the Services registry
+        env:
+          BR_REGISTRY_KEY: ${{ secrets.BR_REGISTRY_KEY }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          read_version() {
+              awk '
+                  /^\[package\]/           { in_pkg = 1; next }
+                  /^\[/ && !/^\[package\]/ { in_pkg = 0 }
+                  in_pkg && /^version *=/  { gsub(/[" ]/, "", $3); print $3; exit }'
+          }
+
+          git fetch -q origin "${BASE_REF}"
+
+          version="$(read_version <Cargo.toml)"
+          base_version="$(git show "origin/${BASE_REF}:Cargo.toml" | read_version || true)"
+
+          if [[ "${version}" == "${base_version}" ]]; then
+              echo "svc-notifier ${version}: not bumped — nothing to gate."
+              exit 0
+          fi
+          case "${version}" in
+            *-dev*|*-rc*|*-pre*)
+              echo "svc-notifier ${version}: non-release — not gated."
+              exit 0
+              ;;
+          esac
+
+          echo "svc-notifier: ${base_version:-<absent>} -> ${version} — gating against the registry."
+          scripts/registry-gate.sh svc-notifier "${version}"
+
   audit:
     name: cargo audit (RustSec)
     needs: fmt
@@ -149,14 +187,6 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # Ignores: upstream transitive advisories not actionable from this
-          # crate. Revisit whenever sqlx-postgres migrates off the `rsa`
-          # crate.
-          #   RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel; no patch
-          #     available. Pulled transitively by sqlx-postgres for SCRAM
-          #     auth.
-          #   RUSTSEC-2026-0097 — rand unsound under custom-logger + ThreadRng
-          #     reseed scenario we do not hit.
           ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0097
 
   deny:
@@ -271,8 +301,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      # --severity=warning: SC1091 (info) fires on every variable-based
-      # `source` path and cannot be resolved statically — pure noise here.
       - run: shellcheck --severity=warning scripts/*.sh scripts/lib/*.sh
 
   secrets:

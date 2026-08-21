@@ -685,10 +685,11 @@ Release flow — image-first, tag-after, per crate:
 1. Bump the crate's version in its `Cargo.toml` and add the matching heading
    to its `CHANGELOG.md` (Keep a Changelog) in the same PR.
 2. CI gates the PR (`pull_request` is the only CI trigger): fmt auto-fix gate,
-   clippy + unit tests, the e2e scenario suite, cargo-audit, cargo-deny,
-   cargo-machete, semver-checks on the contract crate, per-crate changelog
-   presence, shellcheck, secret scan. All of them are required checks on
-   `main`, managed declaratively by
+   clippy + unit tests, the e2e scenario suite, the Services-registry gate on a
+   bumped service version, cargo-audit, cargo-deny, cargo-machete,
+   semver-checks on the contract crate, per-crate changelog presence,
+   shellcheck, secret scan. All of them are required checks on `main`, managed
+   declaratively by
    [`scripts/setup-branch-protection.sh`](scripts/setup-branch-protection.sh).
 3. On merge, CD detects the version bump per crate, publishes the service
    image + chart **first**, then creates the tag `{crate}/v{version}` and the
@@ -698,6 +699,49 @@ Release flow — image-first, tag-after, per crate:
    tag, created when the crate's version bumps on `main`.
 
 No manual tagging, no manual image/chart push.
+
+### Services-registry integration
+
+A service release must exist in the BotResources Services registry
+(`https://botresources.ai/graphql`) as a **sealed, not-yet-implemented**
+PatchVersion before it can ship. Three scripts enforce and record that, all
+addressing the patch by the coordinate quadruple (`service-id` from
+[`registry.toml`](registry.toml), cross-checked against
+[`scripts/service-meta.sh`](scripts/service-meta.sh), plus the three version
+numbers):
+
+- [`scripts/registry-gate.sh`](scripts/registry-gate.sh) — refuses to
+  build/publish a version the registry has not sealed. Runs at PR time on a
+  bumped version (where an already-implemented version is version reuse and
+  fails), before the CD build, and again immediately before the push (where
+  the image-ref argument marks the caller as the CD run for that version, so
+  an already-implemented verdict becomes an idempotent re-run instead of a
+  refusal).
+- [`scripts/registry-docs.sh`](scripts/registry-docs.sh) — photographs the
+  realization between build and push: the SDL from the freshly built binary
+  (`svc-notifier schema`), the DB schema recomposed from this commit's
+  migrations on an ephemeral Postgres 17, both posed on the patch with
+  `procedural: true`. A failure blocks the push.
+- [`scripts/registry-implement.sh`](scripts/registry-implement.sh) — after
+  the push, records the published image ref (hard failure), then observes the
+  automatic implemented flip (advisory warnings only).
+
+Why table:
+
+| Thing | Why it is the way it is |
+|---|---|
+| No pass-by-default in any registry script | A release law a missing secret or a network blip can switch off is not a law — missing key, transport failure, unknown query field all fail the caller. |
+| `curl` as the only transport | The registry sits behind Cloudflare, which 403s other user agents. |
+| GraphQL payloads go through files, never argv | An SDL or DB document can exceed the 128 KiB per-argument kernel limit. |
+| `env -i` around `svc-notifier schema` | The SDL must not depend on the environment — and CD's environment carries the registry key. The binary answers `schema` before any logging/env init so stdout is the document and nothing else. |
+| Service addressed by committed UUID, never by name | A rename would silently retarget the release; the registry's by-name entry point is closed to machine keys. The id is committed twice (`registry.toml` + `service-meta.sh`) and cross-checked, so a copy/paste error cannot reach another service's patch. |
+| `sqlx-cli` pinned to the exact `sqlx` in `Cargo.lock` | sqlx owns the `_sqlx_migrations` DDL that lands in the posed dump; a drifting migrator would silently change the document. Move the pin in `cd.yml` in the same commit as any `Cargo.lock` sqlx bump. |
+| Postgres major pinned to 17 in `registry-docs.sh` | `pg_dump` output changes across majors; the document must stay byte-comparable across recomposes. |
+| Prerequisite roles created `NOLOGIN` before migrating | The migrations reference `svc_notifier_app` / `svc_notifier_ingest` unconditionally (`CREATE POLICY … TO role`); the roles only need to exist so the policies and GRANTs land in the dump. |
+| Docs posed between build and push | The documents are photos of the artifact that ships, not of a developer tree; if the photo or the pose fails, the image is never pushed. |
+| `registry-implement` flip probe is advisory and inverted | The machine key cannot read the patch back, so it re-asks the eligibility question — a `patch_already_implemented` refusal is the success signal. By then the image is on GHCR, so a red job would report a failed release that succeeded. |
+| Version cross-checked against `Cargo.toml` | The documents are photographed from the checked-out tree; posing them onto another version's patch would describe the wrong release. |
+| `REQUIRED_CHECKS` entries match ci.yml job `name:` verbatim | A mismatched context blocks every PR forever, waiting for a check that never reports. |
 
 Local pipeline: `./scripts/publish.sh --check-only` (fmt, clippy, unit tests, helm
 lint), `--local-image`, `--dry-run` — see the script header.

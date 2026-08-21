@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Declarative branch protection for main — the single source of truth for
-# which CI checks gate a merge. Each entry must match the `name:` of a job
-# in .github/workflows/ci.yml VERBATIM, or the PR blocks forever waiting for
-# a check that never reports.
-#
-# Usage:
-#   scripts/setup-branch-protection.sh --dry-run   # print the payload
-#   scripts/setup-branch-protection.sh             # apply via gh api
 
 set -euo pipefail
 
@@ -17,6 +9,7 @@ REQUIRED_CHECKS=(
     "cargo fmt (auto-fix)"
     "cargo clippy + test"
     "integration (e2e)"
+    "registry gate (bumped version sealed in the registry)"
     "cargo audit (RustSec)"
     "cargo-deny check"
     "cargo-machete (unused deps)"
