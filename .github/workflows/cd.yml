@@ -1,16 +1,5 @@
 name: CD
 
-# Image-first, tag-after. CD owns pushes to main:
-#   detect-bump → publish (image + chart) → tag + GitHub Release
-# A tag is a receipt that the version shipped — it is created only after the
-# image is on GHCR. The contract crate has no artifact: its release IS the
-# tag (consumers pull it as a git dependency), created when its version bumps.
-#
-# Three entry points, converging on the same publish chain:
-#   - push to main          → detect-bump decides per crate
-#   - push tag svc-notifier/v*  → operator override / recovery, version from the tag
-#   - workflow_dispatch     → recovery, version from input (falls back to Cargo.toml)
-
 on:
   push:
     branches: [main]
@@ -33,6 +22,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  IMAGE_REF: ghcr.io/botresources/br-svc-notifier
 
 jobs:
   detect-bump:
@@ -68,7 +58,6 @@ jobs:
             git ls-remote --tags origin "refs/tags/$1" | grep -q .
           }
 
-          # --- service ---------------------------------------------------
           service_version="$(crate_version Cargo.toml)"
           publish_service=false
           case "${GITHUB_REF}" in
@@ -97,7 +86,6 @@ jobs:
               ;;
           esac
 
-          # --- contract (tag-only release, main pushes only) ---------------
           contract_version="$(crate_version crates/br-notifier-contract/Cargo.toml)"
           tag_contract=false
           if [ "${GITHUB_REF}" = "refs/heads/main" ] \
@@ -112,7 +100,6 @@ jobs:
             echo "br-notifier-contract ${contract_version}: already tagged or not applicable"
           fi
 
-          # --- publisher (tag-only release, main pushes only) -------------
           publisher_version="$(crate_version crates/br-notifier-publisher/Cargo.toml)"
           tag_publisher=false
           if [ "${GITHUB_REF}" = "refs/heads/main" ] \
@@ -136,6 +123,12 @@ jobs:
             echo "publisher_version=${publisher_version}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Registry gate (pre-build)
+        if: steps.detect.outputs.publish_service == 'true'
+        env:
+          BR_REGISTRY_KEY: ${{ secrets.BR_REGISTRY_KEY }}
+        run: scripts/registry-gate.sh svc-notifier "${{ steps.detect.outputs.service_version }}" "${IMAGE_REF}"
+
   publish:
     name: Publish image + chart
     needs: detect-bump
@@ -150,15 +143,6 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # Static-musl cross-compile via cargo-zigbuild (Zig as the C
-      # compiler). Two reasons we are here and not on `*-unknown-linux-gnu`:
-      #   1. A glibc-linked binary's runtime libc must stay >= the libc the
-      #      binary was built against. The runner image's GLIBC has bumped
-      #      past debian:bookworm-slim's GLIBC_2.36 in the past, shipping
-      #      CrashLoop releases.
-      #   2. Static-musl decouples the binary from the runtime image's libc
-      #      *entirely* — a future runner bump cannot reintroduce the skew
-      #      because the binary no longer depends on the runtime libc at all.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
@@ -173,9 +157,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # buildx is needed for `docker build --provenance=false` in publish.sh.
-      # NO `setup-qemu-action`: the Dockerfile has no `RUN` instructions, so
-      # buildx never has to exec foreign-arch code.
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR (Docker)
@@ -185,16 +166,58 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Registry gate (pre-publish re-check)
+        env:
+          BR_REGISTRY_KEY: ${{ secrets.BR_REGISTRY_KEY }}
+        run: scripts/registry-gate.sh svc-notifier "${{ needs.detect-bump.outputs.service_version }}" "${IMAGE_REF}"
+
+      - name: Build amd64 binary (SDL source, reused by publish.sh)
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Install sqlx-cli (pinned — it shapes the posed document)
+        run: >
+          cargo install sqlx-cli
+          --version 0.8.6
+          --locked
+          --no-default-features
+          --features rustls,postgres
+
+      - name: Registry docs (pose SDL + DB schema before the push)
+        env:
+          BR_REGISTRY_KEY: ${{ secrets.BR_REGISTRY_KEY }}
+        run: >
+          scripts/registry-docs.sh
+          svc-notifier
+          "${{ needs.detect-bump.outputs.service_version }}"
+          --binary target/x86_64-unknown-linux-musl/release/svc-notifier
+
       - name: Publish image + chart
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
         run: ./scripts/publish.sh --skip-checks
 
+  registry-implement:
+    name: Registry implement svc-notifier
+    needs: [detect-bump, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.detect-bump.outputs.publish_service == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record image + observe the implemented flip
+        env:
+          BR_REGISTRY_KEY: ${{ secrets.BR_REGISTRY_KEY }}
+        run: >
+          scripts/registry-implement.sh
+          svc-notifier
+          "${{ needs.detect-bump.outputs.service_version }}"
+          "${IMAGE_REF}:${{ needs.detect-bump.outputs.service_version }}"
+
   tag-service:
     name: Tag + Release svc-notifier
     needs: [detect-bump, publish]
-    if: needs.detect-bump.outputs.publish_service == 'true' && github.ref == 'refs/heads/main'
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.detect-bump.outputs.publish_service == 'true' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
