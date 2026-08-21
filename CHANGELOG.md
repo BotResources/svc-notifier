@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.4
+
+### Security
+
+- h2 0.4.13 -> 0.4.16 (RUSTSEC-2026-0258: unbounded queuing of empty DATA frames)
+
 ### Added
 
 - Services-registry release integration: `scripts/registry-gate.sh` (sealed-and-not-implemented gate at PR time, pre-build and pre-push), `scripts/registry-docs.sh` (SDL + DB schema photographed from the built artifacts and posed on the patch before the image push), `scripts/registry-implement.sh` (image record + advisory implemented-flip probe after publish), with `registry.toml` + `scripts/service-meta.sh` carrying the committed service coordinate. Wired into ci.yml (new required check `registry gate (bumped version sealed in the registry)`) and cd.yml
