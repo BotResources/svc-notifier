@@ -2,8 +2,8 @@ apiVersion: v2
 name: br-svc-notifier
 description: Portable notification service — NATS intake, GraphQL API over Postgres with user-scoped RLS, SSE subscriptions.
 type: application
-version: 1.0.1
-appVersion: "1.0.1"
+version: 1.0.5
+appVersion: "1.0.5"
 home: https://github.com/BotResources/svc-notifier
 sources:
   - https://github.com/BotResources/svc-notifier

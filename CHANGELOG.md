@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.5 - 2026-09-08
+
+### Changed
+
+- Dependency-only patch, no wire or behaviour change for consumers. The
+  br-rust-common workspace pins move `v1.2.0` → **`v1.3.0`** across every
+  crate (prod and dev-deps: `br-core-auth`, `br-core-events`,
+  `br-core-integration`, `br-util-axum-auth`, `br-util-axum-readiness`,
+  `br-util-graphql`, `br-util-nats-fabric`, `br-util-observability`,
+  `br-util-postgres`), and the `br-test-harness` dev-dependency moves
+  `v1.1.2` → **`v1.2.0`**. Each git pin keeps the matching `version = "…"`
+  next to its tag. The bump is compile-compatible: the intake durable keeps
+  binding through `ensure_command_consumer` (unaffected by the
+  `verify_*_durable` behaviour change in br-rust-common 1.3.0, which the
+  service never calls), and its app-side poison budget + `ack_wait` 30s are
+  untouched. The e2e suite tracks the br-e2e-harness 1.2.0 SSE handles:
+  `expect_silence` now panics on a *closed* stream rather than folding it into
+  silence — the notifier holds its SSE sessions open, so every silence window
+  reads as a timeout and the oracle stays honest.
+- `charts/br-svc-notifier`: chart `version` and `appVersion` realigned
+  `1.0.1` → **`1.0.5`** (release lockstep — the chart had drifted behind the
+  crate).
+
 ## 1.0.4
 
 ### Security

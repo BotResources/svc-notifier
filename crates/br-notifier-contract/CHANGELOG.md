@@ -8,6 +8,18 @@ It is versioned independently of the `svc-notifier` service crate.
 
 ## [Unreleased]
 
+## 0.4.0 - 2026-09-08
+
+### Changed
+
+- **Bump `br-core-integration` `v1.2.0` → `v1.3.0`** (with the matching
+  `version = "1.3.0"` next to the tag). `deliver_coords()` returns
+  `br_core_integration::CommandCoords` in its public signature, so the library
+  version that coordinate type resolves to is part of this crate's public API —
+  a MINOR bump, not a patch. No wire or source change: the deliver command
+  shape and the `integration.cmd.notifier.notification.deliver.v1` subject are
+  unchanged.
+
 ## 0.3.1
 
 ### Changed
