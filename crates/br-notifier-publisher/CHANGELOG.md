@@ -8,6 +8,19 @@ It is versioned independently of the `svc-notifier` service crate.
 
 ## [Unreleased]
 
+## 0.3.0 - 2026-09-08
+
+### Changed
+
+- **Bump `br-util-nats-fabric` `v1.2.0` → `v1.3.0`** (and the
+  `br-core-integration` / `br-test-harness` dev-deps to `v1.3.0` / `v1.2.0`),
+  with the matching `version = "…"` next to each tag. `NotifierPublisher`
+  exposes `br_util_nats_fabric::Fabric` and `EventMetadata` in its public
+  signatures and `PublishError` re-exports `FabricError`, so the library
+  version those types resolve to is part of this crate's public API — a MINOR
+  bump, not a patch. `br-notifier-contract` path dep moves `0.3.1` → `0.4.0`.
+  No source or wire change.
+
 ## 0.2.1
 
 ### Changed
