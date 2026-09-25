@@ -147,9 +147,18 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.13.0
+      # Zig (cargo-zigbuild's linker) is copied out of the org runner image rather
+      # than fetched by mlugg/setup-zig, whose community-mirror download has no
+      # timeout and once held a publish job for 2h (BotResources/infra.botresources.ai#241).
+      # The job itself stays on the bare VM (not `container:`): registry-docs.sh reaches
+      # its ephemeral Postgres on the VM's 127.0.0.1, which a job container can't see.
+      - name: zig (from br-arc-runner)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${RUNNER_TEMP}:/out" ghcr.io/botresources/br-arc-runner:stable \
+            sh -c 'cp -a "$(dirname "$(readlink -f "$(command -v zig)")")" /out/zig'
+          echo "${RUNNER_TEMP}/zig" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/zig/zig" version
 
       - uses: taiki-e/install-action@v2
         with:
