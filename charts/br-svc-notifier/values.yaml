@@ -100,11 +100,22 @@ service:
   type: ClusterIP
   annotations: {}
   # Extra labels merged onto the Service's metadata.labels, on top of the
-  # standard chart labels (which are never overridden). Use this when an
-  # external controller discovers this Service by label — e.g. labels matched
-  # by a service-discovery selector such as a federation gateway composer that
-  # enumerates subgraph Services. Default empty = only the standard labels.
-  labels: {}
+  # standard chart labels (which are never overridden).
+  #
+  # Default: the subgraph-discovery label of the BR gateway composer
+  # (br-graphql-gateway, crates/composer/src/k8s.rs). The composer lists the
+  # Services that carry `graphql-federation/component=subgraph` in its own
+  # namespace and names each subgraph after its Service, so this Service
+  # joins the supergraph as the subgraph `<fullname>` with no extra object.
+  # The label is part of the notifier's topology (it IS a GraphQL subgraph),
+  # so it ships with the chart and not with a deploy repo.
+  #
+  # Helm merges maps: to drop the default label (a gateway that does not
+  # discover by label), set it to null —
+  #   service.labels: {graphql-federation/component: null}
+  # Extra keys are added beside it.
+  labels:
+    graphql-federation/component: subgraph
 
 serviceAccount:
   create: true

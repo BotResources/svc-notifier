@@ -27,6 +27,10 @@
 #   GHCR_USER   — optional, defaults to git user name
 #   IMAGE       — optional, override image name (default: ghcr.io/botresources/br-svc-notifier)
 #   CHART_REPO  — optional, override chart OCI repo (default: oci://ghcr.io/botresources/charts)
+#
+# The chart is packaged at the service version (lockstep). A chart-only
+# release (Chart.yaml `version` bumped, Cargo unchanged) does NOT go through
+# this script: CD's `publish-chart` job pushes Chart.yaml as committed.
 
 set -euo pipefail
 
@@ -42,6 +46,25 @@ source "$SCRIPT_DIR/lib/build-cross-arm64.sh"
 
 MODE="publish"
 SKIP_CHECKS=false
+
+CHART_REPO="${CHART_REPO:-oci://ghcr.io/botresources/charts}"
+
+# Fails unless the chart br-svc-notifier:${VERSION} is absent from GHCR
+# (scripts/oci-tag-status.sh: present | absent, any other answer fails).
+ensure_chart_version_free() {
+    case "$CHART_REPO" in
+        oci://ghcr.io/*) ;;
+        *) warn "CHART_REPO ${CHART_REPO} is not on ghcr.io — chart version not checked"; return 0 ;;
+    esac
+    local status
+    status="$(REGISTRY_TOKEN="${GHCR_TOKEN:?GHCR_TOKEN must be set}" \
+        GITHUB_ACTOR="${GHCR_USER:-$(git config user.name)}" \
+        "$SCRIPT_DIR/oci-tag-status.sh" "${CHART_REPO#oci://ghcr.io/}/br-svc-notifier" "$VERSION")" \
+        || error "could not read chart br-svc-notifier:${VERSION} from GHCR"
+    if [ "$status" != "absent" ]; then
+        error "chart br-svc-notifier:${VERSION} is already published (chart-only release?) — refusing to push it again; release the service at a version whose chart is free"
+    fi
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -115,6 +138,12 @@ if [ "$MODE" = "publish" ]; then
         info "${IMAGE_NAME}:${VERSION} already on GHCR — nothing to do"
         exit 0
     fi
+
+    # The chart version is free (a chart-only release can take a version the
+    # service has not used yet). This script pushes the chart at the service
+    # version, and an OCI tag is mutable: never push a chart version twice.
+    # Checked here, before any build, and again just before `helm push`.
+    ensure_chart_version_free
 fi
 
 info "${CRATE_NAME} ${VERSION} → ${IMAGE_NAME}:${VERSION}"
@@ -205,7 +234,6 @@ docker manifest push "${IMAGE_NAME}:${VERSION}"
 # Step 7: package + push Helm chart
 # ---------------------------------------------------------------------------
 CHART_DIR="$REPO_ROOT/charts/br-svc-notifier"
-CHART_REPO="${CHART_REPO:-oci://ghcr.io/botresources/charts}"
 
 if [ ! -d "$CHART_DIR" ]; then
     error "Helm chart not found at $CHART_DIR"
@@ -227,6 +255,9 @@ helm package "$CHART_DIR" \
 
 CHART_TGZ="$CHART_OUT/br-svc-notifier-${VERSION}.tgz"
 [ -f "$CHART_TGZ" ] || error "chart tgz not produced at $CHART_TGZ"
+
+info "Re-checking chart ${VERSION} is still unpublished"
+ensure_chart_version_free
 
 info "Pushing chart to $CHART_REPO"
 helm push "$CHART_TGZ" "$CHART_REPO"
