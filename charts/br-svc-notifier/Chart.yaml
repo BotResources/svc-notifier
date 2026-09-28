@@ -2,7 +2,11 @@ apiVersion: v2
 name: br-svc-notifier
 description: Portable notification service — NATS intake, GraphQL API over Postgres with user-scoped RLS, SSE subscriptions.
 type: application
-version: 1.0.5
+# Chart version is free (workspace principle 31): a topology-only change is
+# a chart-only release that keeps `appVersion` on the published image. An
+# image release publishes the chart at the Cargo version (lockstep, see
+# scripts/publish.sh). CD refuses to push a chart version twice.
+version: 1.0.6
 appVersion: "1.0.5"
 home: https://github.com/BotResources/svc-notifier
 sources:

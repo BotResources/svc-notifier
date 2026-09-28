@@ -23,6 +23,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   IMAGE_REF: ghcr.io/botresources/br-svc-notifier
+  CHART_REPO: oci://ghcr.io/botresources/charts
+  CHART_DIR: charts/br-svc-notifier
 
 jobs:
   detect-bump:
@@ -129,6 +131,138 @@ jobs:
           BR_REGISTRY_KEY: ${{ secrets.BR_REGISTRY_KEY }}
         run: scripts/registry-gate.sh svc-notifier "${{ steps.detect.outputs.service_version }}" "${IMAGE_REF}"
 
+  # The chart has its own version (workspace principle 31: a topology fix is
+  # a chart release, never a service release). This job reads
+  # charts/br-svc-notifier/Chart.yaml and asks GHCR which chart version
+  # exists. It runs only on a push to main that makes NO service release
+  # (a service release publishes the chart at the Cargo version, lockstep,
+  # through scripts/publish.sh). When the Chart.yaml version is not on the
+  # registry yet, `publish-chart` pushes the chart ONLY: no image, no
+  # svc-notifier/v* tag, no GitHub Release, no Services-registry step.
+  # Its own job, so a registry probe failure never blocks the contract and
+  # publisher tags that detect-bump decides.
+  detect-chart:
+    name: detect-chart
+    needs: detect-bump
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.detect-bump.outputs.publish_service != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      chart_publish: ${{ steps.chart.outputs.chart_publish }}
+      chart_version: ${{ steps.chart.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect a chart-only release (Chart.yaml <-> chart registry)
+        id: chart
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE_VERSION: ${{ needs.detect-bump.outputs.service_version }}
+        run: |
+          set -euo pipefail
+          chart_field() {
+            awk -v key="$1" '$1 == key":" { v = $2; gsub(/"/, "", v); print v; exit }' "${CHART_DIR}/Chart.yaml"
+          }
+          chart_name="$(chart_field name)"
+          chart_version="$(chart_field version)"
+          app_version="$(chart_field appVersion)"
+          if [[ -z "${chart_name}" || -z "${chart_version}" || -z "${app_version}" ]]; then
+            echo "::error::could not parse name/version/appVersion from ${CHART_DIR}/Chart.yaml"
+            exit 1
+          fi
+          echo "${CHART_DIR}/Chart.yaml: ${chart_name} ${chart_version} (appVersion ${app_version})"
+
+          if [[ ! "${chart_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "chart ${chart_version} is not a release version (x.y.z) — skipping."
+            echo "chart_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The Cargo version belongs to the service release path (lockstep),
+          # never to a chart-only release.
+          if [[ "${chart_version}" == "${SERVICE_VERSION}" ]]; then
+            echo "chart ${chart_version} == service version: the service release path owns it — skipping."
+            echo "chart_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          chart_path="${CHART_REPO#oci://ghcr.io/}/${chart_name}"
+          image_path="${IMAGE_REF#ghcr.io/}"
+          # oci-tag-status.sh prints present|absent and fails on any other
+          # registry answer (an unknown state is never "absent").
+          # Assign first: a failed probe inside `[[ ]]` would not stop the
+          # script (set -e ignores it) and would read as "not present".
+          chart_status="$(scripts/oci-tag-status.sh "${chart_path}" "${chart_version}")"
+          if [[ "${chart_status}" == "present" ]]; then
+            echo "chart ${chart_name}:${chart_version} is already published — nothing to do."
+            echo "chart_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `## Chart x.y.z`, never `## x.y.z`: the service release detector
+          # (detect-bump) and scripts/lib/validate.sh read `## x.y.z` only.
+          if ! grep -qE "^## Chart ${chart_version}( |$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## Chart ${chart_version}' heading — refusing to publish the chart."
+            exit 1
+          fi
+          image_status="$(scripts/oci-tag-status.sh "${image_path}" "${app_version}")"
+          if [[ "${image_status}" != "present" ]]; then
+            echo "::error::appVersion ${app_version}: image ${IMAGE_REF}:${app_version} is not published — refusing to publish a chart for a missing image."
+            exit 1
+          fi
+
+          {
+            echo "chart_publish=true"
+            echo "chart_version=${chart_version}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Chart-only release: ${chart_name} ${chart_version} (image ${app_version}, unchanged)"
+
+  publish-chart:
+    name: Publish chart only (no image, no tag, no registry)
+    needs: detect-chart
+    if: needs.detect-chart.outputs.chart_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: helm package + push (Chart.yaml as committed)
+        shell: bash
+        env:
+          CHART_VERSION: ${{ needs.detect-chart.outputs.chart_version }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # No version rewrite: the committed Chart.yaml is the release.
+          grep -E '^(name|version|appVersion):' "${CHART_DIR}/Chart.yaml"
+          helm lint "${CHART_DIR}"
+          helm package "${CHART_DIR}" --destination dist/
+          tgz="dist/br-svc-notifier-${CHART_VERSION}.tgz"
+          if [[ ! -f "${tgz}" ]]; then
+            echo "::error::expected ${tgz}; helm package produced: $(ls dist/)"
+            exit 1
+          fi
+          # Re-check just before the push: an OCI tag is mutable, a second
+          # push would replace a chart that environments pin.
+          chart_path="${CHART_REPO#oci://ghcr.io/}/br-svc-notifier"
+          chart_status="$(scripts/oci-tag-status.sh "${chart_path}" "${CHART_VERSION}")"
+          if [[ "${chart_status}" != "absent" ]]; then
+            echo "::error::chart br-svc-notifier:${CHART_VERSION} was published during this run — refusing to push it again."
+            exit 1
+          fi
+          echo "${REGISTRY_TOKEN}" \
+            | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm push "${tgz}" "${CHART_REPO}"
+
   publish:
     name: Publish image + chart
     needs: detect-bump
@@ -142,6 +276,50 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+
+      # Chart guard, first, before any Services-registry call, build or push,
+      # for every trigger (push to main, svc-notifier/v* tag, dispatch).
+      # scripts/publish.sh pushes the chart at the service version. Since the
+      # chart version is free, that version can already be taken by a
+      # chart-only release (an OCI tag is mutable: a second push would replace
+      # a chart that environments pin). A refusal moves nothing.
+      #   1. The image is already published: publish.sh is an idempotent no-op
+      #      (unchanged behaviour for a re-run); no chart check needed.
+      #   2. Else the chart at the service version must be free.
+      #   3. Else a Chart.yaml version that differs from the service version
+      #      must already be published: it would never ship as written
+      #      (publish.sh packages the chart at the service version).
+      - name: Chart guard (a chart version is never pushed twice)
+        env:
+          VERSION: ${{ needs.detect-bump.outputs.service_version }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chart_version="$(awk '$1 == "version:" { v = $2; gsub(/"/, "", v); print v; exit }' "${CHART_DIR}/Chart.yaml")"
+          chart_path="${CHART_REPO#oci://ghcr.io/}/br-svc-notifier"
+          image_path="${IMAGE_REF#ghcr.io/}"
+          # Assign each probe first: a failed probe inside `[[ ]]` would not
+          # stop the script (set -e ignores it) and would read as "not present".
+          image_status="$(scripts/oci-tag-status.sh "${image_path}" "${VERSION}")"
+          if [[ "${image_status}" == "present" ]]; then
+            echo "image ${IMAGE_REF}:${VERSION} already published — publish.sh is a no-op, no chart push."
+            exit 0
+          fi
+          chart_status="$(scripts/oci-tag-status.sh "${chart_path}" "${VERSION}")"
+          if [[ "${chart_status}" == "present" ]]; then
+            echo "::error::service ${VERSION}: chart br-svc-notifier:${VERSION} is already published (a chart-only release took it). Refusing to push it again. Release the service at a version whose chart is free."
+            exit 1
+          fi
+          if [[ "${chart_version}" != "${VERSION}" ]]; then
+            committed_status="$(scripts/oci-tag-status.sh "${chart_path}" "${chart_version}")"
+          else
+            committed_status="present"
+          fi
+          if [[ "${committed_status}" != "present" ]]; then
+            echo "::error::service ${VERSION}: ${CHART_DIR}/Chart.yaml version ${chart_version} is not published and is not the service version. One merge makes one release: set Chart.yaml version and appVersion to ${VERSION} (lockstep), or release the chart alone first."
+            exit 1
+          fi
+          echo "chart br-svc-notifier:${VERSION} is free — the image and the chart can ship."
 
       - uses: dtolnay/rust-toolchain@stable
         with:

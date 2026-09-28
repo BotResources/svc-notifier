@@ -52,11 +52,11 @@ recipients ◀──GraphQL: queries / mutations / subscription stream──┘
 - **Truth (PostgreSQL)** — notifications live in one table, deduplicated by
   `(source_event_id, recipient_id)`, protected by forced row-level security.
 - **Surface (GraphQL subgraph)** — recipient-facing, composed behind a gateway.
-  Root fields are prefixed `notifier*`. When a gateway composer discovers
-  subgraphs by enumerating Kubernetes Services by label, set the discovery
-  labels via the chart key `service.labels` (a generic map merged onto the
-  Service's `metadata.labels`); the chart never hard-codes any specific
-  selector.
+  Root fields are prefixed `notifier*`. The chart key `service.labels` (a map
+  merged onto the Service's `metadata.labels`) defaults to
+  `graphql-federation/component: subgraph`, the label the BR gateway composer
+  discovers subgraphs by (it names the subgraph after the Service). Add keys
+  for another discovery selector; set the default key to `null` to drop it.
 - **Realtime** — every push derives from committed PostgreSQL state via
   `LISTEN/NOTIFY` (see "Realtime architecture"); no in-process broadcast from the
   writer.
@@ -672,6 +672,13 @@ Three independently versioned crates:
 - `svc-notifier` — the service. Released as an image + chart:
   `ghcr.io/botresources/br-svc-notifier:{version}` and
   `oci://ghcr.io/botresources/charts/br-svc-notifier:{version}`.
+- `charts/br-svc-notifier` — the chart also has its own releases. Its version
+  is free (a topology fix is a chart release, never a service release): a
+  chart-only release bumps `Chart.yaml` `version` only (`appVersion` names a
+  published image), adds a `## Chart {version}` heading to `CHANGELOG.md`,
+  and on merge CD (`detect-chart` → `publish-chart`) pushes only the chart —
+  no image, no tag, no Services-registry step. A published chart version is
+  never pushed again, on either path.
 - `br-notifier-contract` — the published language, consumed by producers as a git
   dependency. A change here is a contract change and follows semver strictly.
   Released as the `br-notifier-contract/v{version}` tag.

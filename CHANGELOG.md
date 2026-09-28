@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CD publishes a chart-only release** (workspace principle 31: the chart
+  version is free, a topology fix is a chart release, never a service
+  release). On a push to `main` that makes no service release, the new
+  `detect-chart` job reads `charts/br-svc-notifier/Chart.yaml`; when its
+  `version` is absent from `oci://ghcr.io/botresources/charts` and differs
+  from the Cargo version, `publish-chart` packages and pushes the chart as
+  committed — no image build, no `svc-notifier/v*` tag, no GitHub Release,
+  no Services-registry step. It refuses when `CHANGELOG.md` has no
+  `## Chart x.y.z` heading, or when `appVersion` names an image that is not
+  published. Chart headings are `## Chart x.y.z`, never `## x.y.z`, so the
+  service release detector and `scripts/lib/validate.sh` never read them as a
+  service release.
+- **The service release path refuses to push a chart version twice.** A new
+  first step of the `publish` job (before any registry call, build or push,
+  for every trigger) and `scripts/publish.sh` (before the build and again
+  just before `helm push`) refuse when the chart at the service version is
+  already published (an OCI tag is mutable: a second push would replace a
+  chart that environments pin), and the `publish` job refuses a `Chart.yaml`
+  version that differs from the service version and is not published (it
+  would never ship as written). A re-run for an image that is already
+  published stays a no-op, as before. Registry probe:
+  `scripts/oci-tag-status.sh` (present / absent; any other answer fails).
+  Consequence: the next service release cannot be 1.0.6 (chart 1.0.6 is
+  taken); it is 1.0.7 or later.
+
+## Chart 1.0.6 - 2026-09-28
+
+Chart-only release. `appVersion` stays `1.0.5`: the image is
+`ghcr.io/botresources/br-svc-notifier:1.0.5`, unchanged. No service release.
+
+### Changed
+
+- `service.labels` defaults to `{graphql-federation/component: subgraph}`,
+  the subgraph-discovery label of the BR gateway composer
+  (br-graphql-gateway `crates/composer/src/k8s.rs`: it lists the Services
+  with this label in its namespace and names each subgraph after its
+  Service). The chart's own Service now joins the supergraph as the subgraph
+  `<fullname>` (`notifier` with `fullnameOverride: notifier`). Until now
+  `dp-botresources.ai` rendered a second, labelled Service
+  (`notifier-subgraph`) from a wrapper template — topology in the deploy
+  repo. That template is deleted in the same dp commit that lets chart 1.0.6
+  in (one labelled Service at all times). To drop the label, set
+  `service.labels: {graphql-federation/component: null}` (Helm merges
+  maps).
+- Default render vs 1.0.5: the Service gains the label, and the
+  `helm.sh/chart` label of the ServiceAccount, Service and Deployment
+  metadata reads `br-svc-notifier-1.0.6`. The pod template does not change,
+  so the pods do not roll.
+
 ## 1.0.5 - 2026-09-08
 
 ### Changed
