@@ -7,7 +7,7 @@ type: application
 # image release publishes the chart at the Cargo version (lockstep, see
 # scripts/publish.sh). CD refuses to push a chart version twice.
 version: 1.0.6
-appVersion: "1.0.5"
+appVersion: "1.0.6"
 home: https://github.com/BotResources/svc-notifier
 sources:
   - https://github.com/BotResources/svc-notifier
