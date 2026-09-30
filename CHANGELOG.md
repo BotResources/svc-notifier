@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.7 - 2026-09-28
+
+Security release. Lockstep: image `ghcr.io/botresources/br-svc-notifier:1.0.7`
+and chart `oci://ghcr.io/botresources/charts/br-svc-notifier:1.0.7`
+(`appVersion: "1.0.7"`). Services-registry patch 1.0.7 (security, no contract
+change). The image differs from 1.0.6 only by the lockfile. The chart is
+republished at 1.0.7 with unchanged templates and values (only `version` and
+`appVersion` in `Chart.yaml` move, lockstep).
+
+### Security
+
+- event-listener 5.4.1 → **5.4.2** (RUSTSEC-2026-0221, unsound: `!Send` tags
+  can cross thread boundaries via `StackSlot`; path `sqlx-core →
+  event-listener`).
+- rand 0.8.5 → **0.8.8** (RUSTSEC-2026-0097, unsound with a custom logger;
+  paths `async-nats → nkeys / nuid / tokio-websockets`, `sqlx-postgres`). The
+  `RUSTSEC-2026-0097` ignore leaves the `cargo audit` job in `ci.yml` and
+  `deny.toml`.
+- chacha20 0.10.0 → **0.10.2** and spin 0.9.8 → **0.9.9** (both yanked; paths
+  `async-nats → rand 0.10 → chacha20`, `async-graphql → multer → spin`).
+- anyhow 1.0.102 → **1.0.104** (RUSTSEC-2026-0190, unsound). Lockfile-only: no
+  crate of the build graph links it (`cargo tree -i anyhow -e normal` prints
+  nothing); bumped for a clean audit.
+- Lockfile only (`cargo update -p event-listener -p rand@0.8.5 -p chacha20
+  -p spin -p anyhow`): no manifest range change and no source change.
+- Not changed, documented in `deny.toml` (checked 2026-09-28):
+  - scc 2.4.0 (RUSTSEC-2026-0205, unsound) stays: dev-only through
+    `serial_test` 3.4.0 (`cargo tree -i scc -e normal` prints nothing), so it
+    is not in the release binary.
+  - rsa 0.9.10 (RUSTSEC-2023-0071) stays ignored: lockfile-only through
+    `sqlx-macros-core → sqlx-mysql` (the mysql backend is not enabled), and
+    no fixed rsa exists. The `deny.toml` entry now names the correct path and
+    carries a dated re-check.
+- Not in this release (deferred): the SIGTERM / SSE shutdown fix, the
+  plain-text 401 body, configuration keys.
+
 ## 1.0.6 - 2026-09-28
 
 Lockstep release: image `ghcr.io/botresources/br-svc-notifier:1.0.6` and
