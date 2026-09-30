@@ -10,7 +10,7 @@ use br_core_integration::{Actor, EventMetadata, UserId};
 use br_notifier_contract::DeliverNotification;
 use br_notifier_publisher::NotifierPublisher;
 use br_test_harness::{
-    FabricTestNats, FixedStream, GraphqlClient, SpawnedProcess, SseSubscription,
+    FabricTestNats, FixedStream, GraphqlClient, SpawnedNats, SpawnedProcess, SseSubscription,
 };
 use br_util_nats_fabric::IntegrationCommand;
 use chrono::Utc;
@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-use super::{DELTAS_SUBSCRIPTION, RECOVERY_TIMEOUT, SSE_TIMEOUT};
+use super::{DELTAS_SUBSCRIPTION, RECOVERY_TIMEOUT, SSE_TIMEOUT, engine_nats};
 
 static PORT_COUNTER: OnceLock<AtomicU16> = OnceLock::new();
 
@@ -27,6 +27,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 // The durable consumer the service binds on the command stream (src/intake.rs).
 const INTAKE_DURABLE: &str = "svc-notifier";
+
+// The one runtime role of the engine build (see `spawn_instance`).
+const APP_ROLE: &str = "svc_notifier_ingest";
 
 fn next_port() -> u16 {
     PORT_COUNTER
@@ -50,8 +53,9 @@ pub struct TestStack {
     // previous scenario (see `up`); no notification is ever written through it.
     pub owner_pool: PgPool,
     nats: FabricTestNats,
+    // Kept for its lifetime: the broker dies with the stack.
+    _server: SpawnedNats,
     service_owner_url: String,
-    app_url: String,
     ingest_url: String,
 }
 
@@ -80,26 +84,39 @@ impl TestStack {
             .await
             .expect("failed to connect the owner (assertion) pool");
 
+        // ENGINE ACCOMMODATION: the engine's first migration creates its own schema
+        // (`service_engine`), which needs CREATE on the database. The 1.0 provisioning
+        // (scripts/init-db.sql) gives the migration owner CREATE on `public` only; in
+        // production the CNPG owner owns the database, so this is a fixture-only gap.
+        sqlx::query(
+            "DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO svc_notifier_owner', \
+             current_database()); END $$",
+        )
+        .execute(&owner_pool)
+        .await
+        .expect("failed to let the migration owner create the engine schema");
+
         // A clean slate between scenarios, best effort: the table only exists once
         // a first run has migrated. Every scenario also scopes its assertions to
         // the ids it minted itself, so a leftover row can never make one pass.
-        // GAP: names the 1.0 storage table; the storage of the engine version is
-        // unknown, so this reset (and `storage.rs`) is the one place to adapt.
+        // (The engine build stores notifications in the same 1.0 table.)
         sqlx::query("DELETE FROM notifications")
             .execute(&owner_pool)
             .await
             .ok();
 
+        // ENGINE ACCOMMODATION: the streams the engine binds carry a bounded max_age (see
+        // `engine_nats`); the harness provisioner alone would create them unbounded.
+        let server = SpawnedNats::start().await;
+        engine_nats::provision(&server.url()).await;
+
         Self {
             owner_pool,
-            nats: FabricTestNats::start().await,
+            nats: FabricTestNats::connect(&server.url()).await,
+            _server: server,
             service_owner_url: dsn(
                 "DATABASE_URL_SERVICE_OWNER",
                 "postgres://svc_notifier_owner:svc_notifier_owner@localhost:5432/svc_notifier_test",
-            ),
-            app_url: dsn(
-                "DATABASE_URL",
-                "postgres://svc_notifier_app:svc_notifier_app@localhost:5432/svc_notifier_test",
             ),
             ingest_url: dsn(
                 "DATABASE_URL_INGEST",
@@ -114,28 +131,52 @@ impl TestStack {
         let port_str = port.to_string();
         let nats_url = self.nats.url();
 
-        // The service runs on its RLS-subject runtime roles; the owner DSN is the
-        // migration DSN only.
+        // ENGINE OPS CONTRACT (adaptation of the axum boot): the engine binary runs
+        // `migrate` to completion under the owner DSN, then `serve` on ONE runtime role
+        // (`APP_ROLE` / `DATABASE_URL`). The 1.0 app and ingest roles collapse to one:
+        // the ingest role, whose 1.0 policy already admits every row. Migrations are
+        // idempotent, so each spawn re-runs them.
+        let migrate_envs: Vec<(&str, &str)> = vec![
+            ("DATABASE_URL_OWNER", &self.service_owner_url),
+            ("APP_ROLE", APP_ROLE),
+            ("RUST_LOG", "warn"),
+        ];
+        let migrated = br_test_harness::run_once(
+            env!("CARGO_BIN_EXE_svc-notifier"),
+            &["migrate"],
+            &migrate_envs,
+            STARTUP_TIMEOUT,
+        )
+        .await
+        .expect("the migrate command could not run");
+        assert!(
+            migrated.status.success(),
+            "migrate failed: {}{}",
+            String::from_utf8_lossy(&migrated.stdout),
+            String::from_utf8_lossy(&migrated.stderr)
+        );
+
         let envs: Vec<(&str, &str)> = vec![
             ("PORT", &port_str),
-            ("DATABASE_URL_OWNER", &self.service_owner_url),
-            ("DATABASE_URL", &self.app_url),
-            ("DATABASE_URL_INGEST", &self.ingest_url),
+            ("DATABASE_URL", &self.ingest_url),
+            ("APP_ROLE", APP_ROLE),
             ("NATS_URL", &nats_url),
+            ("ENGINE_CHANNEL", "notifier_engine"),
+            ("HOSTNAME", "notifier-test-pod"),
             ("RUST_LOG", "warn"),
         ];
 
-        let mut process = SpawnedProcess::spawn(env!("CARGO_BIN_EXE_svc-notifier"), &[], &envs);
+        let mut process =
+            SpawnedProcess::spawn(env!("CARGO_BIN_EXE_svc-notifier"), &["serve"], &envs);
         if let Err(reason) = process
             .wait_for_http_ok(&format!("{base_url}/readyz"), STARTUP_TIMEOUT)
             .await
         {
             panic!("svc-notifier did not become healthy on port {port}: {reason}");
         }
-        // No settle window: the service binds its durable delivery consumer before
-        // it opens the HTTP listener and before it turns ready (src/main.rs), and
-        // the command stream retains anything published from then on — a request
-        // sent right after /readyz can be delayed, never missed.
+        // No settle window: the command stream retains anything published from the
+        // moment the intake durable is bound, so a request sent right after /readyz can
+        // be delayed, never missed.
 
         ServiceInstance {
             base_url: base_url.clone(),
@@ -235,8 +276,8 @@ impl ServiceInstance {
     // live stream and fails loud on an error frame, so the refusal is read from the
     // raw response. A subscription that was *accepted* holds the connection open
     // forever, so the bounded read is part of the assertion.
-    // GAP: the harness has no handle for a refused subscription (and no WebSocket
-    // handle is enabled); the transport of the engine version is not known yet.
+    // The engine answers a refused subscription the same way over SSE: exactly one
+    // `next` frame carrying the error, then `complete`.
     pub async fn subscribe_refused(&self, passport: &Passport) -> Value {
         let response = tokio::time::timeout(
             SSE_TIMEOUT,

@@ -2,6 +2,7 @@
 // binary, so a helper looks dead from every binary that skips it.
 #![allow(dead_code, unused_imports)]
 
+mod engine_nats;
 mod outage;
 mod stack;
 mod storage;

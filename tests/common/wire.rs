@@ -19,8 +19,8 @@ pub const DELETE_MANY: &str =
     "mutation($ids: [ID!]!) { notifierDeleteNotifications(ids: $ids) { success } }";
 
 // Reset first (the whole list, newest first), then Upsert / Remove deltas.
-// GAP: the delta type names come from the target SDL, which calls them
-// illustrative — the engine may name them differently.
+// The delta type names are the ones the engine build declares with
+// `subscription_union!` (src/slices/notifications/graphql.rs): they match this document.
 pub const DELTAS_SUBSCRIPTION: &str = r#"subscription {
   notifierNotificationDeltas {
     __typename

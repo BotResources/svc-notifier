@@ -1,8 +1,8 @@
 // Storage assertions: what Postgres holds after a scenario. Read through the
 // harness assertion connection, never written — every state is built by the
 // producer's deliver command or by the recipient's own mutations.
-// GAP: this file names the 1.0 table and columns (`notifications`). The engine
-// version may store notifications differently; this is the one place to adapt.
+// This file names the 1.0 table and columns (`notifications`). The engine build
+// keeps that table and its 8 columns as the aggregate store, unchanged.
 use br_notifier_contract::DeliverNotification;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
