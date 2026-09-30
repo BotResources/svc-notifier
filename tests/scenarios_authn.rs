@@ -1,273 +1,178 @@
-// Door scenarios: who gets in, and what a caller who is in may aim at. No
-// Passport at all and a forged one are refused at the transport; a machine
-// identity is refused by code on every field; and an ordinary human reaching for
-// somebody else's notification — or for an id that is not one — is refused by
-// code too, with the target's state untouched on every channel.
+// Door scenarios: who gets in. A caller with no readable identity is refused at
+// the transport; a machine identity is refused by code on every door — the list,
+// the stream and the four mark / delete actions — and its refusal leaves the
+// notification of the person exactly as it was.
 mod common;
 
-use br_test_harness::verdict;
 use common::*;
 use reqwest::StatusCode;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
-const MARK_AS_READ: &str = "mutation($id: ID!) { notifierMarkAsRead(notificationId: $id) }";
-const DELETE_ONE: &str = "mutation($id: ID!) { notifierDeleteNotification(notificationId: $id) }";
-
+// registry test 01a0f2a8-e19c-792c-89fa-f45b0af4ec24
+// Only a valid identity gets in
+//
+// Given a caller with no identity, a caller with a garbled identity, and a caller
+// with an empty identity.
+// When each caller asks for the notification list, each request is refused and no
+// data comes back.
+// The liveness check of the service still answers a caller with no identity.
 #[tokio::test]
 #[serial_test::serial]
-async fn graphql_without_passport_returns_401() {
+async fn only_a_valid_identity_gets_in() {
     let ctx = TestContext::setup().await;
-    let (status, _body) = ctx.instance.graphql_unauthenticated(UNREAD_QUERY).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Given a person who owns a notification — so that a refusal is a refusal to
+    // hand something over, not an empty answer to an empty inbox
+    let owner = Uuid::now_v7();
+    let owned = deliver_to(
+        &ctx,
+        owner,
+        "owned",
+        json!({"secret": "for-the-owner-only"}),
+    )
+    .await;
+
+    let list = "{ notifierNotifications { id template payload link readAt createdAt } }";
+
+    // When a caller with no identity asks for the list
+    let (status, body) = ctx.instance.graphql_unauthenticated(list).await;
+    // Then it is refused and no data comes back
+    assert_refused_without_data("no identity", status, &body, owned.id);
+
+    // When a caller with a garbled identity asks for the list
+    let (status, body) = ctx
+        .instance
+        .graphql_with_header("not-valid-base64!!!", list)
+        .await;
+    assert_refused_without_data("a garbled identity", status, &body, owned.id);
+
+    // When a caller with an empty identity asks for the list
+    let (status, body) = ctx.instance.graphql_with_header("", list).await;
+    assert_refused_without_data("an empty identity", status, &body, owned.id);
+
+    // And the liveness check answers a caller with no identity
+    let (status, _) = ctx.instance.get("/livez").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the liveness check needs no identity"
+    );
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn graphql_with_malformed_passport_returns_401() {
-    let ctx = TestContext::setup().await;
-    for bad_header in ["not-valid-base64!!!", ""] {
-        let status = ctx
-            .instance
-            .graphql_bad_passport(UNREAD_QUERY, bad_header)
-            .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "header: {bad_header:?}");
-    }
+fn assert_refused_without_data(who: &str, status: StatusCode, body: &Value, owned_id: Uuid) {
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "{who}: the request must be refused: {body}"
+    );
+    assert!(
+        body.get("data").is_none_or(Value::is_null),
+        "{who}: no data may come back: {body}"
+    );
+    assert!(
+        !body.to_string().contains(&owned_id.to_string()),
+        "{who}: a refusal must not leak the notification: {body}"
+    );
 }
 
+// registry test 01a0f2a8-e994-70fd-9c2c-b4b033f0febd
+// A machine identity gets nothing
+//
+// Given a platform service that uses its own machine identity, and a person who
+// has one notification.
+// When the service asks for the list, subscribes to the stream, or tries to mark
+// or delete the notification, each attempt is refused with a forbidden error and
+// no data.
+// The notification of the person does not change. A notification delivered to
+// that person never reaches the service.
 #[tokio::test]
 #[serial_test::serial]
-async fn liveness_is_accessible_without_passport() {
+async fn a_machine_identity_gets_nothing() {
     let ctx = TestContext::setup().await;
-    let resp = reqwest::Client::new()
-        .get(format!("{}/livez", ctx.instance.base_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-}
+    let service = make_service_passport(Uuid::now_v7());
 
-#[tokio::test]
-#[serial_test::serial]
-async fn service_passport_queries_and_mutations_are_forbidden() {
-    let ctx = TestContext::setup().await;
-    let service_passport = make_service_passport(Uuid::now_v7());
+    // Given a person with one unread notification, and her own stream as control
+    let person = Uuid::now_v7();
+    let person_passport = make_passport(person);
+    let owned = deliver_to(&ctx, person, "humans_only", json!({})).await;
+    let n = owned.id.to_string();
+    let mut control = Session::open(&ctx.instance, &person_passport).await;
+    control
+        .settle("the person holds her notification", |view| view.len() == 1)
+        .await;
+    assert_eq!(control.get(&n).expect("held")["readAt"], Value::Null);
 
-    // Every door, not a sample of them: a refusal table that omits a mutation is
-    // an invitation to add the next one without a guard.
-    let cases = [
-        ("notifierUnreadCount", UNREAD_QUERY, json!({})),
-        ("notifierNotifications", LIST_QUERY, json!({})),
-        (
-            "notifierMarkAllAsRead",
-            "mutation { notifierMarkAllAsRead }",
-            json!({}),
-        ),
-        (
-            "notifierMarkAsRead",
-            MARK_AS_READ,
-            json!({"id": Uuid::now_v7().to_string()}),
-        ),
-        (
-            "notifierDeleteNotification",
-            DELETE_ONE,
-            json!({"id": Uuid::now_v7().to_string()}),
-        ),
+    // When the service asks for the list
+    let response = ctx.instance.graphql(&service, LIST_QUERY, json!({})).await;
+    // Then it is refused with FORBIDDEN and gets no data
+    expect_forbidden(&response, "notifierNotifications");
+
+    // When the service tries to mark or delete the notification
+    let attempts = [
+        ("notifierMarkAsRead", MARK_AS_READ, json!({ "id": n })),
+        ("notifierMarkAllAsRead", MARK_ALL_AS_READ, json!({})),
+        ("notifierDeleteNotification", DELETE_ONE, json!({ "id": n })),
         (
             "notifierDeleteNotifications",
-            "mutation($ids: [ID!]!) { notifierDeleteNotifications(ids: $ids) }",
-            json!({"ids": [Uuid::now_v7().to_string()]}),
+            DELETE_MANY,
+            json!({ "ids": [n] }),
         ),
     ];
-
-    for (field, query, vars) in cases {
-        let response = ctx.instance.graphql(&service_passport, query, vars).await;
-        assert!(
-            response["data"][field].is_null(),
-            "{field}: a service passport must not get a result: {response}"
-        );
-        let code = verdict::expect_code_shaped(
-            &response,
-            &format!("{field}: a service passport must be rejected before any work"),
-        );
-        assert_eq!(
-            code, "FORBIDDEN",
-            "{field}: a service passport must be rejected with FORBIDDEN: {response}"
-        );
-    }
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn service_passports_get_no_subscription_events() {
-    let ctx = TestContext::setup().await;
-    let service_passport = make_service_passport(Uuid::now_v7());
-    let recipient = Uuid::now_v7();
-
-    // given: a machine identity opens the live stream. The subscription is a
-    // door like any other and answers a verdict — it used to hand back a
-    // silently empty stream, which reads to a client exactly like "you have no
-    // notifications" rather than "you may not have any".
-    let refused = ctx.instance.subscribe_refused(&service_passport).await;
-    assert_eq!(
-        verdict::expect_code_shaped(
-            &refused,
-            "notifierNotificationEvents with a service passport"
-        ),
-        "FORBIDDEN",
-        "a machine identity must be refused by code, not by an empty stream: {refused}"
-    );
-    assert!(
-        refused["data"]["notifierNotificationEvents"].is_null(),
-        "a refused subscription carries no data: {refused}"
-    );
-
-    // when: deliveries actually flow to a human while the machine keeps knocking
-    ctx.stack
-        .publish_deliver(&deliver(&[recipient], "humans_only", json!({})))
-        .await;
-    assert!(
-        ctx.stack
-            .wait_until(RECOVERY_TIMEOUT, || async {
-                ctx.stack.count_rows().await == 1
-            })
-            .await
-    );
-
-    // then: it hears nothing — the refusal is the same verdict, still no event,
-    // with live notification traffic in flight
-    let refused_again = ctx.instance.subscribe_refused(&service_passport).await;
-    assert_eq!(
-        verdict::expect_code_shaped(
-            &refused_again,
-            "notifierNotificationEvents while traffic flows"
-        ),
-        "FORBIDDEN"
-    );
-    assert!(
-        refused_again["data"]["notifierNotificationEvents"].is_null(),
-        "no notification ever reaches a machine identity's stream: {refused_again}"
-    );
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn an_ordinary_human_reaching_for_another_humans_notification_is_refused_by_code() {
-    let ctx = TestContext::setup().await;
-    let (intruder, target) = (Uuid::now_v7(), Uuid::now_v7());
-    let intruder_passport = make_passport(intruder);
-    let target_passport = make_passport(target);
-
-    // given: the target is listening on their own session, and the notification
-    // the intruder will reach for lands *after* it opens — created through the
-    // real intake, never seeded. Serving it is what proves the session is in the
-    // fan-out at all: a stream the service never registered would be silent below
-    // for the wrong reason, and would stay silent with the isolation this
-    // scenario defends removed.
-    let mut target_session = ctx.instance.subscribe(&target_passport).await;
-    let targeted = seed_one(&ctx, target, "not_yours").await;
-    let landed = target_session
-        .expect_event("the target's session is live", RECOVERY_TIMEOUT)
-        .await;
-    assert_eq!(
-        notifier_event(&landed)["notification"]["id"],
-        json!(targeted.to_string()),
-        "the session must carry the target's own notification: {landed}"
-    );
-
-    // when: an ordinary human aims the unitary mutations at someone else's id,
-    // and at an id that is not an id at all. Every unitary door, both shapes:
-    // a table that samples one mutation invites the next one in unguarded.
-    let cases = [
-        (
-            "notifierMarkAsRead",
-            MARK_AS_READ,
-            targeted.to_string(),
-            "NOT_FOUND",
-        ),
-        (
-            "notifierDeleteNotification",
-            DELETE_ONE,
-            targeted.to_string(),
-            "NOT_FOUND",
-        ),
-        (
-            "notifierMarkAsRead",
-            MARK_AS_READ,
-            "not-a-uuid".to_string(),
-            "BAD_USER_INPUT",
-        ),
-        (
-            "notifierDeleteNotification",
-            DELETE_ONE,
-            "not-a-uuid".to_string(),
-            "BAD_USER_INPUT",
-        ),
-    ];
-
-    for (field, mutation, id, expected) in cases {
-        let refused = ctx
-            .instance
-            .graphql(&intruder_passport, mutation, json!({"id": id}))
-            .await;
-        assert_eq!(
-            verdict::expect_code_shaped(&refused, &format!("{field} aimed at {id}")),
-            expected,
-            "{field} aimed at {id}: a foreign notification must be invisible, never \
-             forbidden — telling an intruder the row exists is itself a leak: {refused}"
-        );
-        assert!(
-            refused["data"][field].is_null(),
-            "{field} aimed at {id}: a refused mutation carries no result: {refused}"
-        );
+    for (field, query, vars) in attempts {
+        let response = ctx.instance.graphql(&service, query, vars).await;
+        // Then each attempt is refused with FORBIDDEN and gets no data
+        expect_forbidden(&response, field);
     }
 
-    // then: the target's row never moved — a refused reach is not a partial one
-    let rows = ctx.stack.rows_for(target).await;
-    assert_eq!(rows.len(), 1, "the target's notification is still there");
-    assert_eq!(rows[0].id, targeted);
-    assert!(rows[0].read_at.is_none(), "and still unread");
+    // When the service subscribes to the stream
+    let refused = ctx.instance.subscribe_refused(&service).await;
+    // Then the subscription is refused with FORBIDDEN and no data — not opened
+    // with an empty first payload, which would read as "you have no notifications"
+    // rather than "you may not have any"
+    expect_forbidden(&refused, "notifierNotificationDeltas");
 
-    // then: nor did any of the target's own channels notice — no push, list and
-    // badge exactly as before. A failed intrusion is invisible to its victim.
-    target_session
-        .expect_silence(
-            "a refused reach announces nothing to the owner",
-            CONSUME_WAIT,
-        )
+    // Then the notification of the person did not change: in storage, on her
+    // stream, and on demand
+    let row = ctx
+        .stack
+        .row(owned.id)
+        .await
+        .expect("the row is still stored");
+    assert_eq!(
+        row.read_at, None,
+        "the refused attempts must not mark it read"
+    );
+    control
+        .expect_no_delta("the refused attempts change nothing for the person")
         .await;
+    assert_eq!(control.get(&n).expect("still held")["readAt"], Value::Null);
     let listed = ctx
         .instance
-        .graphql(&target_passport, LIST_QUERY, json!({}))
+        .graphql(&person_passport, LIST_QUERY, json!({}))
         .await;
-    let nodes = listed["data"]["notifierNotifications"]["nodes"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no nodes in {listed}"));
-    assert_eq!(nodes.len(), 1, "the target still has their notification");
-    assert_eq!(nodes[0]["id"], json!(targeted.to_string()));
-    assert!(
-        nodes[0]["readAt"].is_null(),
-        "and it is still unread: {listed}"
-    );
-    let count = ctx
-        .instance
-        .graphql(&target_passport, UNREAD_QUERY, json!({}))
-        .await;
-    assert_eq!(ServiceInstance::unread_count(&count), 1);
+    assert_eq!(listed_ids(&listed), vec![n.clone()]);
 
-    // then: and the intruder gained nothing to look at either
-    let intruder_list = ctx
-        .instance
-        .graphql(&intruder_passport, LIST_QUERY, json!({}))
+    // When a notification is delivered to the person, the delivery is live: her
+    // stream gets it
+    let second = deliver_to(&ctx, person, "humans_only_2", json!({})).await;
+    control
+        .settle("the second notification reaches the person", |view| {
+            view.contains_key(&second.id.to_string())
+        })
         .await;
-    assert_eq!(
-        intruder_list["data"]["notifierNotifications"]["nodes"],
-        json!([]),
-        "the notification the intruder named must not surface in their own list: {intruder_list}"
-    );
-    let intruder_count = ctx
-        .instance
-        .graphql(&intruder_passport, UNREAD_QUERY, json!({}))
-        .await;
-    assert_eq!(ServiceInstance::unread_count(&intruder_count), 0);
+
+    // Then a machine identity that subscribes now is refused the same way: one
+    // FORBIDDEN frame and the stream ends, so nothing is left open to receive what
+    // is delivered (`subscribe_refused` reads the answer under a bound and demands
+    // exactly one frame)
+    let refused_again = ctx.instance.subscribe_refused(&service).await;
+    expect_forbidden(&refused_again, "notifierNotificationDeltas");
+}
+
+fn listed_ids(response: &Value) -> Vec<String> {
+    listed(response)
+        .iter()
+        .map(|node| node["id"].as_str().expect("a string id").to_owned())
+        .collect()
 }
