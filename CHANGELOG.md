@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 1.0.7 - 2026-09-28
+
+Security release. Lockstep: image `ghcr.io/botresources/br-svc-notifier:1.0.7`
+and chart `oci://ghcr.io/botresources/charts/br-svc-notifier:1.0.7`
+(`appVersion: "1.0.7"`). Services-registry patch 1.0.7 (security, no contract
+change). The image differs from 1.0.6 only by the lockfile. The chart is
+republished at 1.0.7 with unchanged templates and values (only `version` and
+`appVersion` in `Chart.yaml` move, lockstep).
+
+### Security
+
+- event-listener 5.4.1 → **5.4.2** (RUSTSEC-2026-0221, unsound: `!Send` tags
+  can cross thread boundaries via `StackSlot`; path `sqlx-core →
+  event-listener`).
+- rand 0.8.5 → **0.8.8** (RUSTSEC-2026-0097, unsound with a custom logger;
+  paths `async-nats → nkeys / nuid / tokio-websockets`, `sqlx-postgres`). The
+  `RUSTSEC-2026-0097` ignore leaves the `cargo audit` job in `ci.yml` and
+  `deny.toml`.
+- chacha20 0.10.0 → **0.10.2** and spin 0.9.8 → **0.9.9** (both yanked; paths
+  `async-nats → rand 0.10 → chacha20`, `async-graphql → multer → spin`).
+- anyhow 1.0.102 → **1.0.104** (RUSTSEC-2026-0190, unsound). Lockfile-only: no
+  crate of the build graph links it (`cargo tree -i anyhow -e normal` prints
+  nothing); bumped for a clean audit.
+- Lockfile only (`cargo update -p event-listener -p rand@0.8.5 -p chacha20
+  -p spin -p anyhow`): no manifest range change and no source change.
+- Not changed, documented in `deny.toml` (checked 2026-09-28):
+  - scc 2.4.0 (RUSTSEC-2026-0205, unsound) stays: dev-only through
+    `serial_test` 3.4.0 (`cargo tree -i scc -e normal` prints nothing), so it
+    is not in the release binary.
+  - rsa 0.9.10 (RUSTSEC-2023-0071) stays ignored: lockfile-only through
+    `sqlx-macros-core → sqlx-mysql` (the mysql backend is not enabled), and
+    no fixed rsa exists. The `deny.toml` entry now names the correct path and
+    carries a dated re-check.
+- Not in this release (deferred): the SIGTERM / SSE shutdown fix, the
+  plain-text 401 body, configuration keys.
+
+## 1.0.6 - 2026-09-28
+
+Lockstep release: image `ghcr.io/botresources/br-svc-notifier:1.0.6` and
+chart `oci://ghcr.io/botresources/charts/br-svc-notifier:1.0.6`
+(`appVersion: "1.0.6"`). Services-registry patch 1.0.6 (maintenance, no
+contract change). The image differs from 1.0.5 only by the lockfile.
+
+### Security
+
+- rustls 0.23.38 → **0.23.45** (RUSTSEC-2026-0285: TLS 1.3 handshake
+  messages accepted across encryption-level boundaries; patched `>= 0.23.45`),
+  with rustls-webpki 0.103.13 → **0.103.15** (rustls 0.23.45 requires
+  `^0.103.14`). Lockfile only (`cargo update -p rustls-webpki -p rustls`): no
+  manifest range and no source change.
+
+### Changed
+
+- Chart: `service.labels` defaults to
+  `{graphql-federation/component: subgraph}`, the subgraph-discovery label of
+  the BR gateway composer (br-graphql-gateway `crates/composer/src/k8s.rs`:
+  it lists the Services with this label in its namespace and names each
+  subgraph after its Service). The chart's own Service now joins the
+  supergraph as the subgraph `<fullname>` (`notifier` with
+  `fullnameOverride: notifier`). Until now `dp-botresources.ai` rendered a
+  second, labelled Service (`notifier-subgraph`) from a wrapper template —
+  topology in the deploy repo. That template is deleted in the same dp commit
+  that lets 1.0.6 in (one labelled Service at all times). To drop the label,
+  set `service.labels: {graphql-federation/component: null}` (Helm merges
+  maps). Default render vs 1.0.5: the Service gains the label; the
+  `helm.sh/chart` and `app.kubernetes.io/version` labels read 1.0.6; the pod
+  image tag reads 1.0.6.
+- CD publishes a chart-only release (workspace principle 31: the chart
+  version is free, a topology fix is a chart release, never a service
+  release). On a push to `main` that makes no service release, the new
+  `detect-chart` job reads `charts/br-svc-notifier/Chart.yaml`; when its
+  `version` is absent from `oci://ghcr.io/botresources/charts` and differs
+  from the Cargo version, `publish-chart` packages and pushes the chart as
+  committed — no image build, no `svc-notifier/v*` tag, no GitHub Release,
+  no Services-registry step. It refuses when `CHANGELOG.md` has no
+  `## Chart x.y.z` heading, or when `appVersion` names an image that is not
+  published. Chart-only headings are `## Chart x.y.z`, never `## x.y.z`, so
+  the service release detector and `scripts/lib/validate.sh` never read them
+  as a service release. A service release (this one included) skips
+  `detect-chart`: `scripts/publish.sh` pushes the chart at the service
+  version, once.
+- The service release path refuses to push a chart version twice. A new
+  first step of the `publish` job (before any registry call, build or push,
+  for every trigger) and `scripts/publish.sh` (before the build and again
+  just before `helm push`) refuse when the chart at the service version is
+  already published (an OCI tag is mutable: a second push would replace a
+  chart that environments pin), and the `publish` job refuses a `Chart.yaml`
+  version that differs from the service version and is not published (it
+  would never ship as written). A re-run for an image that is already
+  published stays a no-op, as before. Registry probe:
+  `scripts/oci-tag-status.sh` (present / absent; any other answer fails).
+- CI: the Postgres wait loop in `ci.yml` no longer names an unused variable
+  (shellcheck SC2034 through actionlint).
+
 ## 1.0.5 - 2026-09-08
 
 ### Changed

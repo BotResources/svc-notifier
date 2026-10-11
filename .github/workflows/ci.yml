@@ -101,7 +101,7 @@ jobs:
             -e POSTGRES_USER=owner \
             -e POSTGRES_PASSWORD=owner \
             postgres:17
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if docker exec postgres pg_isready -U owner -d svc_notifier_test >/dev/null 2>&1; then
               echo "Postgres up"; exit 0
             fi
@@ -187,7 +187,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0097
+          ignore: RUSTSEC-2023-0071
 
   deny:
     name: cargo-deny check

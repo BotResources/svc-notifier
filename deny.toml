@@ -2,12 +2,38 @@
 all-features = true
 
 [advisories]
-# Same ignore set as the cargo-audit job (belt-and-braces overlap intended):
-#   RUSTSEC-2023-0071 — `rsa` Marvin timing side-channel; no patch available.
-#     Pulled transitively by sqlx-postgres for SCRAM auth.
-#   RUSTSEC-2026-0097 — rand unsound under a custom-logger + ThreadRng reseed
-#     scenario we do not hit.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0097"]
+# Same ignore set as the cargo-audit job (belt-and-braces overlap intended).
+# Resolve advisories by bumping, not by ignoring them. An entry here says which
+# crate pulls the code in, why that path is unreachable, the upstream status
+# with the date it was checked, and what retires it.
+ignore = [
+    # RUSTSEC-2023-0071 — rsa (Marvin Attack: timing side-channel in RSA key
+    # operations).
+    #
+    # Why: rsa enters Cargo.lock through sqlx-macros-core → sqlx-mysql, an
+    # optional sqlx dependency. The manifest enables the postgres backend only
+    # (no mysql feature), so cargo never resolves sqlx-mysql or rsa into the
+    # build graph: `cargo tree -i rsa --target all -e all --workspace
+    # --all-features` prints nothing. rsa is not compiled into the binary.
+    #
+    # Re-checked 2026-09-28: still lockfile-only; no fixed rsa version (the
+    # newest stable rsa is still 0.9.10, 0.10 has only release candidates).
+    # Retire this ignore when rsa ships a fix, or when sqlx-mysql leaves
+    # Cargo.lock.
+    #
+    # Tools: cargo audit reads Cargo.lock, so it reports the advisory and needs
+    # the CI ignore. cargo deny reads the resolved graph, so it does not see
+    # rsa and warns `advisory-not-detected` for this entry; that is expected.
+    "RUSTSEC-2023-0071",
+]
+# Not ignored, documented (checked 2026-09-28):
+#   RUSTSEC-2026-0205 — scc 2.4.0, unsound (`Array::insert` exception safety).
+#     Dev-only: `cargo tree -i scc` → serial_test 3.4.0 [dev-dependencies]
+#     only; `-e normal` prints nothing, so scc is not in the release binary.
+#     cargo audit reports it as a warning (not an error); cargo deny does not
+#     report it. Upstream: serial_test 3.5.0 (inside the "3" range) no longer
+#     depends on scc; `cargo update -p serial_test` retires this note. Kept out
+#     of the 1.0.7 security patch, which is limited to the runtime advisories.
 
 [licenses]
 allow = [
