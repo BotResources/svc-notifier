@@ -333,7 +333,7 @@ jobs:
       - name: zig (from br-arc-runner)
         run: |
           set -euo pipefail
-          docker run --rm -v "${RUNNER_TEMP}:/out" ghcr.io/botresources/br-arc-runner:stable \
+          docker run --rm -v "${RUNNER_TEMP}:/out" ghcr.io/botresources/br-arc-runner:latest \
             sh -c 'cp -a "$(dirname "$(readlink -f "$(command -v zig)")")" /out/zig'
           echo "${RUNNER_TEMP}/zig" >> "$GITHUB_PATH"
           "${RUNNER_TEMP}/zig/zig" version
