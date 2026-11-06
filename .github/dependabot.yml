@@ -1,0 +1,14 @@
+# Dependabot — keeps the GitHub Actions in .github/ on current releases, in
+# one grouped PR a month. Each ref keeps its pin style: a SHA pin gets the new
+# SHA and its version comment, a tag gets the new tag.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
