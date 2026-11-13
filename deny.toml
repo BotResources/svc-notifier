@@ -16,24 +16,39 @@ ignore = [
     # build graph: `cargo tree -i rsa --target all -e all --workspace
     # --all-features` prints nothing. rsa is not compiled into the binary.
     #
-    # Re-checked 2026-09-28: still lockfile-only; no fixed rsa version (the
-    # newest stable rsa is still 0.9.10, 0.10 has only release candidates).
-    # Retire this ignore when rsa ships a fix, or when sqlx-mysql leaves
+    # Re-checked 2026-11-13: still lockfile-only. rsa 0.10.0 is patched, but
+    # sqlx-mysql 0.8.6 (the newest 0.8) requires rsa ^0.9, so no lockfile
+    # update reaches it; sqlx-mysql 0.9.0 requires rsa 0.10. Both
+    # svc-notifier and br-util-postgres depend on sqlx 0.8. Retire this ignore
+    # when every sqlx in Cargo.lock is 0.9 or later, or when sqlx-mysql leaves
     # Cargo.lock.
     #
     # Tools: cargo audit reads Cargo.lock, so it reports the advisory and needs
     # the CI ignore. cargo deny reads the resolved graph, so it does not see
     # rsa and warns `advisory-not-detected` for this entry; that is expected.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0459 — libsqlite3-sys 0.30.1 (bundled C SQLite,
+    # CVE-2026-119375; patched in libsqlite3-sys >= 0.39.0).
+    #
+    # Why: libsqlite3-sys enters Cargo.lock the same way as rsa above, through
+    # sqlx and sqlx-macros-core → sqlx-sqlite, an optional sqlx dependency. The
+    # manifest enables no sqlite feature, so cargo never resolves sqlx-sqlite or
+    # libsqlite3-sys into the build graph: `cargo tree -i libsqlite3-sys
+    # --target all -e all --workspace --all-features` prints nothing. No SQLite
+    # code is compiled into the binary, and there is no feature to drop.
+    #
+    # Checked 2026-11-13: no sqlx release accepts a patched libsqlite3-sys.
+    # sqlx-sqlite 0.8.6 (the newest 0.8) requires ^0.30.1 and sqlx-sqlite 0.9.0
+    # requires >=0.30.1, <0.38.0, so neither a lockfile update nor a move to
+    # sqlx 0.9 clears it. Retire this ignore when Cargo.lock can take
+    # libsqlite3-sys >= 0.39.0 through a sqlx release, or when sqlx-sqlite
+    # leaves Cargo.lock.
+    #
+    # Tools: same as rsa above. cargo audit needs the CI ignore; cargo deny
+    # warns `advisory-not-detected` for this entry; that is expected.
+    "RUSTSEC-2026-0459",
 ]
-# Not ignored, documented (checked 2026-09-28):
-#   RUSTSEC-2026-0205 — scc 2.4.0, unsound (`Array::insert` exception safety).
-#     Dev-only: `cargo tree -i scc` → serial_test 3.4.0 [dev-dependencies]
-#     only; `-e normal` prints nothing, so scc is not in the release binary.
-#     cargo audit reports it as a warning (not an error); cargo deny does not
-#     report it. Upstream: serial_test 3.5.0 (inside the "3" range) no longer
-#     depends on scc; `cargo update -p serial_test` retires this note. Kept out
-#     of the 1.0.7 security patch, which is limited to the runtime advisories.
 
 [licenses]
 allow = [
