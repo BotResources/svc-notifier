@@ -36,9 +36,11 @@ ignore = [
     # build graph: `cargo tree -i rsa --target all -e all --workspace
     # --all-features` prints nothing. rsa is not compiled into the binary.
     #
-    # Re-checked 2026-09-28: still lockfile-only; no fixed rsa version (the
-    # newest stable rsa is still 0.9.10, 0.10 has only release candidates).
-    # Retire this ignore when rsa ships a fix, or when sqlx-mysql leaves
+    # Re-checked 2026-11-13: still lockfile-only. rsa 0.10.0 is patched, but
+    # sqlx-mysql 0.8.6 (the newest 0.8) requires rsa ^0.9, so no lockfile
+    # update reaches it; sqlx-mysql 0.9.0 requires rsa 0.10. Both
+    # svc-notifier and br-util-postgres depend on sqlx 0.8. Retire this ignore
+    # when every sqlx in Cargo.lock is 0.9 or later, or when sqlx-mysql leaves
     # Cargo.lock.
     #
     # Tools: cargo audit reads Cargo.lock, so it reports the advisory and needs
@@ -67,14 +69,6 @@ ignore = [
     # warns `advisory-not-detected` for this entry; that is expected.
     "RUSTSEC-2026-0459",
 ]
-# Not ignored, documented (checked 2026-09-28):
-#   RUSTSEC-2026-0205 — scc 2.4.0, unsound (`Array::insert` exception safety).
-#     Dev-only: `cargo tree -i scc` → serial_test 3.4.0 [dev-dependencies]
-#     only; `-e normal` prints nothing, so scc is not in the release binary.
-#     cargo audit reports it as a warning (not an error); cargo deny does not
-#     report it. Upstream: serial_test 3.5.0 (inside the "3" range) no longer
-#     depends on scc; `cargo update -p serial_test` retires this note. Kept out
-#     of the 1.0.7 security patch, which is limited to the runtime advisories.
 
 [licenses]
 allow = [
