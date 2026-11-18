@@ -7,6 +7,26 @@ all-features = true
 # crate pulls the code in, why that path is unreachable, the upstream status
 # with the date it was checked, and what retires it.
 ignore = [
+    # RUSTSEC-2026-0543 — chrono is unmaintained (informational, no
+    # vulnerability reported).
+    #
+    # Why: svc-notifier and br-notifier-publisher use chrono directly, and
+    # br-rust-common (br-core-events, br-core-integration,
+    # br-util-observability), async-graphql and sqlx (their chrono
+    # features) pull it in (`cargo tree -i chrono -e normal`, checked
+    # 2026-11-18).
+    # No upstream fix exists as of 2026-11-18: the advisory covers every
+    # version, the locked 0.4.44 included. Waived by ID, never by crate, so
+    # chrono's next advisory, a vulnerability included, still fails this
+    # check.
+    # Not mirrored in ci.yml's `cargo audit`: it only warns on an
+    # unmaintained crate, so it passes and keeps showing this one.
+    # Remove once chrono leaves this build graph, with the move to jiff
+    # tracked across every Rust repo in the epic
+    # https://github.com/BotResources/botresources.ai-claude-workspace/issues/341
+    # Review by 2027-02-17.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, every version affected, no fixed release; move to jiff; review by 2027-02-17" },
+
     # RUSTSEC-2023-0071 — rsa (Marvin Attack: timing side-channel in RSA key
     # operations).
     #
@@ -25,6 +45,27 @@ ignore = [
     # the CI ignore. cargo deny reads the resolved graph, so it does not see
     # rsa and warns `advisory-not-detected` for this entry; that is expected.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0459 — libsqlite3-sys 0.30.1 (bundled C SQLite,
+    # CVE-2026-119375; patched in libsqlite3-sys >= 0.39.0).
+    #
+    # Why: libsqlite3-sys enters Cargo.lock the same way as rsa above, through
+    # sqlx and sqlx-macros-core → sqlx-sqlite, an optional sqlx dependency. The
+    # manifest enables no sqlite feature, so cargo never resolves sqlx-sqlite or
+    # libsqlite3-sys into the build graph: `cargo tree -i libsqlite3-sys
+    # --target all -e all --workspace --all-features` prints nothing. No SQLite
+    # code is compiled into the binary, and there is no feature to drop.
+    #
+    # Checked 2026-11-13: no sqlx release accepts a patched libsqlite3-sys.
+    # sqlx-sqlite 0.8.6 (the newest 0.8) requires ^0.30.1 and sqlx-sqlite 0.9.0
+    # requires >=0.30.1, <0.38.0, so neither a lockfile update nor a move to
+    # sqlx 0.9 clears it. Retire this ignore when Cargo.lock can take
+    # libsqlite3-sys >= 0.39.0 through a sqlx release, or when sqlx-sqlite
+    # leaves Cargo.lock.
+    #
+    # Tools: same as rsa above. cargo audit needs the CI ignore; cargo deny
+    # warns `advisory-not-detected` for this entry; that is expected.
+    "RUSTSEC-2026-0459",
 ]
 # Not ignored, documented (checked 2026-09-28):
 #   RUSTSEC-2026-0205 — scc 2.4.0, unsound (`Array::insert` exception safety).
