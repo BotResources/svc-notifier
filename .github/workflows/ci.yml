@@ -187,8 +187,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
+      # Same ignore set as deny.toml [advisories].ignore, which documents why
+      # each entry is unreachable and what retires it.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 
   deny:
     name: cargo-deny check
