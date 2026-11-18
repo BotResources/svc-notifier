@@ -7,6 +7,26 @@ all-features = true
 # crate pulls the code in, why that path is unreachable, the upstream status
 # with the date it was checked, and what retires it.
 ignore = [
+    # RUSTSEC-2026-0543 — chrono is unmaintained (informational, no
+    # vulnerability reported).
+    #
+    # Why: svc-notifier and br-notifier-publisher use chrono directly, and
+    # br-rust-common (br-core-events, br-core-integration,
+    # br-util-observability), async-graphql and sqlx (their chrono
+    # features) pull it in (`cargo tree -i chrono -e normal`, checked
+    # 2026-11-18).
+    # No upstream fix exists as of 2026-11-18: the advisory covers every
+    # version, the locked 0.4.44 included. Waived by ID, never by crate, so
+    # chrono's next advisory, a vulnerability included, still fails this
+    # check.
+    # Not mirrored in ci.yml's `cargo audit`: it only warns on an
+    # unmaintained crate, so it passes and keeps showing this one.
+    # Remove once chrono leaves this build graph, with the move to jiff
+    # tracked across every Rust repo in the epic
+    # https://github.com/BotResources/botresources.ai-claude-workspace/issues/341
+    # Review by 2027-02-17.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, every version affected, no fixed release; move to jiff; review by 2027-02-17" },
+
     # RUSTSEC-2023-0071 — rsa (Marvin Attack: timing side-channel in RSA key
     # operations).
     #
